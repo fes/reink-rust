@@ -1,0 +1,12 @@
+[package]
+name = "reink-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only terminal user interface for ReInk"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+reink-core = { path = "../reink-core" }

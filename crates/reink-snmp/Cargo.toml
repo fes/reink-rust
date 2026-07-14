@@ -1,0 +1,12 @@
+[package]
+name = "reink-snmp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronous SNMP control channel for ReInk Epson printers"
+
+[dependencies]
+reink-core = { path = "../reink-core" }
+reink-platform = { path = "../reink-platform" }
+snmp2 = { version = "=0.5.2", default-features = false, features = ["crypto-rust"] }

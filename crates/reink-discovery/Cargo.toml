@@ -1,0 +1,11 @@
+[package]
+name = "reink-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mDNS printer discovery for ReInk"
+
+[dependencies]
+mdns-sd = "0.20.1"
+reink-platform = { path = "../reink-platform" }

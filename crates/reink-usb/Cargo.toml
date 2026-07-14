@@ -1,0 +1,14 @@
+[package]
+name = "reink-usb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linux libusb transport for ReInk printer interfaces"
+
+[dependencies]
+reink-platform = { path = "../reink-platform" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rusb = "0.9"
+

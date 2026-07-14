@@ -1,0 +1,15 @@
+[package]
+name = "reink-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protocol-independent ReInk identity, Epson model, and command logic"
+
+[dependencies]
+reink-platform = { path = "../reink-platform" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+reink-platform-test = { path = "../reink-platform-test" }

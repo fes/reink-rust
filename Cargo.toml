@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/reink-app",
+    "crates/reink-cli",
+    "crates/reink-core",
+    "crates/reink-d4",
+    "crates/reink-discovery",
+    "crates/reink-platform",
+    "crates/reink-platform-test",
+    "crates/reink-snmp",
+    "crates/reink-tui",
+    "crates/reink-usb",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://codeberg.org/atufi/reinkpy"

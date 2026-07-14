@@ -1,0 +1,14 @@
+[package]
+name = "reink-d4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IEEE 1284.4 packet and transaction protocol for ReInk"
+
+[dependencies]
+reink-platform = { path = "../reink-platform" }
+
+[dev-dependencies]
+reink-platform-test = { path = "../reink-platform-test" }
+

@@ -1,0 +1,15 @@
+[package]
+name = "reink-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Application services that compose ReInk protocol layers"
+
+[dependencies]
+reink-core = { path = "../reink-core" }
+reink-d4 = { path = "../reink-d4" }
+reink-platform = { path = "../reink-platform" }
+
+[dev-dependencies]
+reink-platform-test = { path = "../reink-platform-test" }
