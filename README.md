@@ -238,6 +238,11 @@ device, sends traffic, or changes a driver binding.
 `reink-cli` contains only read-only commands. It does not accept write keys,
 reset counters, or send EEPROM write requests.
 
+`parse-id`, `snmp-id`, and `usb-id` report the parsed IEEE 1284 fields together
+with a detected model candidate and any match in the built-in model database.
+This model resolution is local metadata lookup; it neither opens a device for
+`parse-id` nor grants write capability to any command.
+
 ```powershell
 cargo run -p reink-cli -- models
 cargo run -p reink-cli -- model C90

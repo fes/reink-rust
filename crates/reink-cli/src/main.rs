@@ -13,7 +13,7 @@ use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
 #[cfg(target_os = "linux")]
 use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
-use serde_json::{Map, Value, json};
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(name = "reink", version, about = "Read-only ReInk printer inspection")]
@@ -110,7 +110,8 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::ParseId { identifier } => {
             let identity =
                 PrinterIdentity::parse(&identifier).map_err(|error| error.to_string())?;
-            render_identity(&identity, cli.json)
+            let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+            render_identity(&identity, &database, cli.json)
         }
         Command::Discover { timeout_seconds } => {
             let discovery = MdnsDiscovery;
@@ -127,7 +128,8 @@ fn run(cli: Cli) -> Result<(), String> {
             let identity = channel
                 .printer_identity()
                 .map_err(|error| error.to_string())?;
-            render_identity(&identity, cli.json)
+            let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+            render_identity(&identity, &database, cli.json)
         }
         Command::UsbId {
             vendor_id,
@@ -230,7 +232,8 @@ fn usb_identity_output(
     let identifier =
         std::str::from_utf8(&bytes).map_err(|_| "USB printer device ID is not UTF-8".to_owned())?;
     let identity = PrinterIdentity::parse(identifier).map_err(|error| error.to_string())?;
-    Ok(render_identity(&identity, as_json))
+    let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+    Ok(render_identity(&identity, &database, as_json))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -303,21 +306,34 @@ fn render_model(
     }
 }
 
-fn render_identity(identity: &PrinterIdentity, as_json: bool) -> String {
+fn render_identity(identity: &PrinterIdentity, database: &ModelDatabase, as_json: bool) -> String {
+    let detected_model = identity.detected_model();
+    let resolved_model = database
+        .resolve_identity(identity)
+        .map(|spec| spec.model.as_str());
     if as_json {
-        let fields = identity
-            .fields()
-            .iter()
-            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-            .collect::<Map<_, _>>();
-        Value::Object(fields).to_string()
+        json!({
+            "identity": identity.fields(),
+            "detected_model": detected_model,
+            "resolved_model": resolved_model,
+        })
+        .to_string()
     } else {
-        identity
+        let mut output = identity
             .fields()
             .iter()
             .map(|(key, value)| format!("{key}: {value}"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        output.push_str(&format!(
+            "\ndetected-model: {}",
+            detected_model.unwrap_or("unavailable")
+        ));
+        output.push_str(&format!(
+            "\nresolved-model: {}",
+            resolved_model.unwrap_or("no built-in match")
+        ));
+        output
     }
 }
 
@@ -363,6 +379,8 @@ fn write_stdout(output: &str) -> Result<(), String> {
 mod tests {
     use clap::Parser;
 
+    use reink_core::ModelDatabase;
+
     use super::{Cli, Command, render_identity, render_models};
 
     #[test]
@@ -405,9 +423,21 @@ mod tests {
     fn renders_json_without_credentials() {
         assert_eq!(render_models(&["C90"], true), r#"{"models":["C90"]}"#);
         let identity = reink_core::PrinterIdentity::parse("MFG:EPSON;MDL:C90;").unwrap();
+        let database = ModelDatabase::builtin().unwrap();
         assert_eq!(
-            render_identity(&identity, true),
-            r#"{"MDL":"C90","MFG":"EPSON"}"#
+            render_identity(&identity, &database, true),
+            r#"{"detected_model":"C90","identity":{"MDL":"C90","MFG":"EPSON"},"resolved_model":"C90"}"#
+        );
+    }
+
+    #[test]
+    fn reports_an_unmatched_identity_without_enabling_device_actions() {
+        let identity = reink_core::PrinterIdentity::parse("MFG:EPSON;MDL:Unknown;").unwrap();
+        let database = ModelDatabase::builtin().unwrap();
+
+        assert_eq!(
+            render_identity(&identity, &database, false),
+            "MDL: Unknown\nMFG: EPSON\ndetected-model: Unknown\nresolved-model: no built-in match"
         );
     }
 
