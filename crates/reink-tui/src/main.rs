@@ -16,7 +16,7 @@ use ratatui::{
     text::{Line, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use reink_core::ModelDatabase;
+use reink_core::{ModelDatabase, PrinterIdentity};
 
 fn main() {
     if let Err(error) = run() {
@@ -113,6 +113,7 @@ enum View {
     Home,
     Models,
     ModelDetail,
+    IdentityInspection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +126,7 @@ struct Application {
     view: View,
     models: Vec<String>,
     selected_model: usize,
+    identity_input: String,
 }
 
 impl Application {
@@ -133,6 +135,7 @@ impl Application {
             view: View::Home,
             models,
             selected_model: 0,
+            identity_input: String::new(),
         }
     }
 
@@ -147,6 +150,9 @@ impl Application {
         match self.view {
             View::Home if matches!(key.code, KeyCode::Enter | KeyCode::Char('m')) => {
                 self.view = View::Models;
+            }
+            View::Home if matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I')) => {
+                self.view = View::IdentityInspection;
             }
             View::Models => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -163,6 +169,16 @@ impl Application {
             {
                 self.view = View::Models;
             }
+            View::IdentityInspection => match key.code {
+                KeyCode::Esc => self.view = View::Home,
+                KeyCode::Backspace => {
+                    self.identity_input.pop();
+                }
+                KeyCode::Char(character) if self.identity_input.len() < 1024 => {
+                    self.identity_input.push(character);
+                }
+                _ => {}
+            },
             _ => {}
         }
         Navigation::Continue
@@ -183,6 +199,7 @@ impl Application {
             View::Home => self.draw_home(frame),
             View::Models => self.draw_models(frame),
             View::ModelDetail => self.draw_model_detail(frame, database),
+            View::IdentityInspection => self.draw_identity_inspection(frame, database),
         }
     }
 
@@ -195,7 +212,7 @@ impl Application {
             Line::from("Browse the built-in Epson model database."),
             Line::from("No device is opened and no printer state can be changed."),
             Line::from(""),
-            Line::from("Enter or M: models     Q or Esc: quit"),
+            Line::from("Enter or M: models     I: inspect a device ID     Q or Esc: quit"),
         ]);
         frame.render_widget(
             Paragraph::new(text)
@@ -273,6 +290,64 @@ impl Application {
             frame.area(),
         );
     }
+
+    fn draw_identity_inspection(&self, frame: &mut ratatui::Frame<'_>, database: &ModelDatabase) {
+        let lines = identity_inspection_lines(&self.identity_input, database)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Local IEEE 1284 identity inspection "),
+                )
+                .wrap(Wrap { trim: true }),
+            frame.area(),
+        );
+    }
+}
+
+fn identity_inspection_lines(input: &str, database: &ModelDatabase) -> Vec<String> {
+    let mut lines = vec![
+        "Type an IEEE 1284 device ID to inspect local model metadata.".to_owned(),
+        "No device is opened and no printer state can be changed.".to_owned(),
+        format!("Input: {input}"),
+        String::new(),
+    ];
+    if input.is_empty() {
+        lines.push("Example: MFG:EPSON;MDL:C90;".to_owned());
+        lines.push("Esc: back".to_owned());
+        return lines;
+    }
+
+    match PrinterIdentity::parse(input) {
+        Ok(identity) => {
+            lines.push("Parsed fields:".to_owned());
+            lines.extend(
+                identity
+                    .fields()
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}")),
+            );
+            lines.push(format!(
+                "Detected model: {}",
+                identity.detected_model().unwrap_or("unavailable")
+            ));
+            lines.push(format!(
+                "Built-in match: {}",
+                database
+                    .resolve_identity(&identity)
+                    .map(|spec| spec.model.as_str())
+                    .unwrap_or("no built-in match")
+            ));
+        }
+        Err(error) => lines.push(format!("Device ID parse error: {error}")),
+    }
+    lines.push(String::new());
+    lines.push("Esc: back     Backspace: edit".to_owned());
+    lines
 }
 
 fn centered_area(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
@@ -298,7 +373,9 @@ fn centered_area(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatu
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Application, Navigation, View};
+    use reink_core::ModelDatabase;
+
+    use super::{Application, Navigation, View, identity_inspection_lines};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -337,5 +414,25 @@ mod tests {
             application.handle_key(key(KeyCode::Char('q'))),
             Navigation::Quit
         );
+    }
+
+    #[test]
+    fn identity_inspection_is_local_and_resolves_model_metadata() {
+        let database = ModelDatabase::builtin().unwrap();
+        let mut application = Application::new(vec!["C90".to_owned()]);
+
+        application.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(application.view, View::IdentityInspection);
+        for character in "MFG:EPSON;MDL:C90;".chars() {
+            application.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(application.identity_input, "MFG:EPSON;MDL:C90;");
+        assert!(
+            identity_inspection_lines(&application.identity_input, &database)
+                .iter()
+                .any(|line| line == "Built-in match: C90")
+        );
+        application.handle_key(key(KeyCode::Esc));
+        assert_eq!(application.view, View::Home);
     }
 }

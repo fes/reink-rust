@@ -323,16 +323,18 @@ or text output, and has no write/reset command.
 
 ### `reink-tui`
 
-`reink-tui` is an interactive, read-only terminal UI. Its initial workflow
-browses the built-in model database; it does not open devices or expose
-EEPROM-write or counter-reset actions.
+`reink-tui` is an interactive, read-only terminal UI. It browses the built-in
+model database and can locally inspect a typed IEEE 1284 device ID against that
+database; it does not open devices or expose EEPROM-write or counter-reset
+actions.
 
 ```powershell
 cargo run -p reink-tui
 ```
 
 Use `Enter` or `M` to browse models, arrow keys or `J`/`K` to select a model,
-and `Esc` or `Q` to return or exit.
+and `Esc` or `Q` to return or exit. Use `I` to type and locally parse an IEEE
+1284 ID; this only resolves bundled metadata and sends no traffic.
 
 ## Protocol provenance
 
