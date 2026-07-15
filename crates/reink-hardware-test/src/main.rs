@@ -7,10 +7,9 @@ use clap::{Parser, Subcommand};
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
-#[cfg(any(target_os = "linux", test))]
-use serde_json::Value;
-#[cfg(any(target_os = "linux", test))]
-use serde_json::json;
+use serde_json::{Value, json};
+
+const NON_EXECUTABLE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES";
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +36,15 @@ enum Command {
     },
     /// Explain why write validation is not available.
     WriteSequence,
+    /// Create a non-executable write-validation safety-gate report.
+    WriteValidationPlan {
+        /// SHA-256 reference for a separately retained sanitized hardware-evidence report.
+        #[arg(long)]
+        evidence_sha256: Option<String>,
+        /// Exact acknowledgement that this command cannot execute physical writes.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
     /// Run D4 Init, EPSON-CTRL identity read, orderly close, and Exit.
     D4Identity {
         #[arg(long, value_parser = parse_u16)]
@@ -87,6 +95,13 @@ fn run(cli: Cli) -> Result<String, String> {
         Command::WriteSequence => Err(
             "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
         ),
+        Command::WriteValidationPlan {
+            evidence_sha256,
+            confirmation,
+        } => Ok(write_validation_plan_report(
+            evidence_sha256.as_deref(),
+            confirmation.as_deref(),
+        )),
         Command::D4Identity { vendor_id, product_id, interface, alternate_setting, model } => d4_identity(vendor_id, product_id, interface, alternate_setting, &model),
         Command::D4EepromRead { vendor_id, product_id, interface, alternate_setting, model, address } => d4_eeprom_read(vendor_id, product_id, interface, alternate_setting, &model, &address),
     }
@@ -216,6 +231,53 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
 }
 
+fn is_sha256_reference(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn safety_gate(name: &str, satisfied: bool, requirement: &str) -> Value {
+    json!({
+        "name": name,
+        "status": if satisfied { "satisfied" } else { "blocked" },
+        "requirement": requirement,
+    })
+}
+
+fn write_validation_plan_report(
+    evidence_sha256: Option<&str>,
+    confirmation: Option<&str>,
+) -> String {
+    let evidence_is_sanitized_reference = evidence_sha256.is_some_and(is_sha256_reference);
+    let explicit_non_executable_confirmation =
+        confirmation == Some(NON_EXECUTABLE_WRITE_CONFIRMATION);
+    json!({
+        "schema_version": 1,
+        "mode": "non_executable",
+        "command": "write-validation-plan",
+        "execution": "disabled",
+        "evidence_sha256": evidence_is_sanitized_reference.then_some(evidence_sha256),
+        "gates": [
+            safety_gate(
+                "sanitized-hardware-evidence-reference",
+                evidence_is_sanitized_reference,
+                "Provide the SHA-256 reference of a separately retained sanitized read-only hardware report.",
+            ),
+            safety_gate(
+                "explicit-non-executable-confirmation",
+                explicit_non_executable_confirmation,
+                "Pass --confirmation I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES exactly.",
+            ),
+            safety_gate(
+                "separate-write-safety-review",
+                false,
+                "A human safety review must approve backup, read-back, rollback, and device-specific evidence before any future implementation can be considered.",
+            ),
+        ],
+        "next_step": "Retain sanitized evidence and obtain separate human safety review. This command cannot enable, queue, or execute a physical write or reset.",
+    })
+    .to_string()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn completed_step(name: &str, result: Value) -> Value {
     json!({"name": name, "status": "completed", "result": result})
@@ -290,7 +352,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Cli, Command, d4_eeprom_read_report, d4_identity_report, parse_u16, read_sequence_report,
+        Cli, Command, NON_EXECUTABLE_WRITE_CONFIRMATION, d4_eeprom_read_report, d4_identity_report,
+        parse_u16, read_sequence_report, write_validation_plan_report,
     };
 
     fn report(output: String) -> Value {
@@ -388,5 +451,49 @@ mod tests {
         ));
         assert_eq!(parse_u16("0x04b8").unwrap(), 0x04b8);
         assert!(parse_u16("not-a-number").is_err());
+    }
+
+    #[test]
+    fn write_validation_plan_stays_non_executable_when_gates_are_blocked() {
+        let plan = report(write_validation_plan_report(None, None));
+
+        assert_eq!(plan["mode"], "non_executable");
+        assert_eq!(plan["execution"], "disabled");
+        assert!(plan["evidence_sha256"].is_null());
+        assert!(
+            plan["gates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|gate| gate["status"] == "blocked")
+        );
+        assert!(
+            plan["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("cannot enable")
+        );
+    }
+
+    #[test]
+    fn write_validation_plan_requires_sanitized_reference_and_exact_confirmation() {
+        let evidence = "a".repeat(64);
+        let plan = report(write_validation_plan_report(
+            Some(&evidence),
+            Some(NON_EXECUTABLE_WRITE_CONFIRMATION),
+        ));
+        assert_eq!(plan["execution"], "disabled");
+        assert_eq!(plan["evidence_sha256"], evidence);
+        assert_eq!(plan["gates"][0]["status"], "satisfied");
+        assert_eq!(plan["gates"][1]["status"], "satisfied");
+        assert_eq!(plan["gates"][2]["status"], "blocked");
+
+        let invalid = report(write_validation_plan_report(
+            Some("not-a-sha256-reference"),
+            Some("I_CONFIRM_WRITES"),
+        ));
+        assert!(invalid["evidence_sha256"].is_null());
+        assert_eq!(invalid["gates"][0]["status"], "blocked");
+        assert_eq!(invalid["gates"][1]["status"], "blocked");
     }
 }

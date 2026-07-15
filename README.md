@@ -300,6 +300,20 @@ ordered step objects (`name`, `status`, and `result`). Preserve those reports as
 hardware evidence. The driver performs no physical write or reset operation;
 its `write-sequence` command is deliberately unavailable.
 
+`write-validation-plan` is a separate **non-executable** safety-gate report.
+It never selects a USB device, opens a session, queues a write, or resets a
+printer. It accepts only the SHA-256 reference of a separately retained,
+sanitized read-only report and an exact acknowledgement:
+
+```powershell
+cargo run -p reink-hardware-test -- write-validation-plan --evidence-sha256 <64-hex-character-sha256> --confirmation I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES
+```
+
+The report always has `execution: "disabled"`. Even when the sanitized-evidence
+reference and acknowledgement gates are satisfied, its mandatory
+`separate-write-safety-review` gate remains blocked. No current command can
+turn that plan into a physical EEPROM write or reset.
+
 `snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
 credentials from the process environment:
 
