@@ -46,6 +46,21 @@ enum Command {
         #[arg(long)]
         model: String,
     },
+    /// Read explicitly selected EEPROM addresses over a read-only D4 session.
+    D4EepromRead {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        model: String,
+        #[arg(long, required = true, value_parser = parse_u16)]
+        address: Vec<u16>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -69,7 +84,43 @@ fn run(cli: Cli) -> Result<String, String> {
             "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
         ),
         Command::D4Identity { vendor_id, product_id, interface, alternate_setting, model } => d4_identity(vendor_id, product_id, interface, alternate_setting, &model),
+        Command::D4EepromRead { vendor_id, product_id, interface, alternate_setting, model, address } => d4_eeprom_read(vendor_id, product_id, interface, alternate_setting, &model, &address),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn d4_eeprom_read(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    model: &str,
+    addresses: &[u16],
+) -> Result<String, String> {
+    let spec = ModelDatabase::builtin()
+        .map_err(|e| e.to_string())?
+        .get(model)
+        .ok_or_else(|| format!("unknown model: {model}"))?
+        .clone();
+    let transport = reink_usb::LinuxUsbTransport::open(
+        vendor_id,
+        product_id,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut session =
+        reink_app::EpsonD4Session::connect(transport, spec).map_err(|e| e.to_string())?;
+    let values = session.read_eeprom(addresses).map_err(|e| e.to_string())?;
+    session.shutdown().map_err(|e| e.to_string())?;
+    Ok(json!({"schema_version": 1, "mode": "read_only", "eeprom": values.iter().map(|v| json!({"address": format!("{:04X}", v.address), "value": v.value})).collect::<Vec<_>>()}).to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn d4_eeprom_read(_: u16, _: u16, _: u8, _: u8, _: &str, _: &[u16]) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux".to_owned())
 }
 
 #[cfg(target_os = "linux")]
