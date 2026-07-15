@@ -98,3 +98,14 @@ a write or reset operation, require all of the following:
 4. Application-layer explicit confirmation and device identity display.
 5. No automatic Windows driver installation, replacement, detachment, or
    rebinding.
+6. A separately retained sanitized read-only report, identified by a SHA-256
+   reference rather than embedded raw hardware data.
+7. A separate human safety review covering backups, read-back, rollback, and
+   device-specific evidence.
+
+`reink-hardware-test write-validation-plan` records the sanitized-reference,
+explicit-acknowledgement, and separate-review gates as a non-executable
+checklist. Its acknowledgement can only satisfy the acknowledgement gate; the
+separate-review gate is intentionally always blocked, and the report cannot
+select a device, open a transport, queue a command, or execute a write or
+reset.
