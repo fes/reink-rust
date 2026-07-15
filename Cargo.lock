@@ -818,6 +818,7 @@ dependencies = [
  "reink-d4",
  "reink-platform",
  "reink-platform-test",
+ "reink-usb",
 ]
 
 [[package]]
@@ -825,6 +826,7 @@ name = "reink-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "reink-app",
  "reink-core",
  "reink-discovery",
  "reink-platform",

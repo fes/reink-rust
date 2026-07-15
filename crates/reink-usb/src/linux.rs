@@ -14,9 +14,6 @@ use crate::{
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const GET_DEVICE_ID_REQUEST: u8 = 0;
 const DEVICE_ID_BUFFER_CAPACITY: usize = 1024;
-const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@EJL\n";
-const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
-const ENTRY_REPLY_READ_LIMIT: usize = 5;
 
 /// A claimed Linux USB printer interface backed by libusb.
 pub struct LinuxUsbTransport {
@@ -65,7 +62,7 @@ impl LinuxUsbTransport {
     }
 }
 
-/// Reads the standard USB Printer Class device identifier without entering D4.
+/// Reads the standard USB Printer Class device identifier without a protocol session.
 ///
 /// The selected interface must not have an active kernel driver. This function
 /// never detaches, rebinds, or otherwise modifies a driver.
@@ -93,24 +90,31 @@ pub fn read_printer_device_id(
     }
 }
 
-/// Outcome of a bounded Epson D4 entry probe.
+/// Outcome of a bounded request/reply probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum D4EntryProbeResult {
-    /// The source-compatible entry reply was recognized.
+pub enum BoundedExchangeProbeResult {
+    /// The expected reply bytes were recognized.
     Recognized,
-    /// The device replied, but its bytes did not match the known entry reply.
+    /// The device replied, but its bytes did not contain the expected reply.
     Unrecognized { received_bytes: usize },
 }
 
-/// Sends only the source-compatible Epson D4 entry sequence and reads its reply.
+/// Sends a request and looks for an expected reply across at most `max_reads`.
 ///
-/// This probe does not initialize D4, open a service, read EEPROM, write
-/// printer state, or reset counters. It never returns raw reply bytes.
-pub fn probe_d4_entry(
+/// The selected interface must not have an active kernel driver. This function
+/// never detaches, rebinds, or otherwise modifies a driver. It never returns
+/// the collected reply bytes.
+pub fn probe_bounded_exchange(
     vendor_id: u16,
     product_id: u16,
     interface: UsbInterfaceSelector,
-) -> Result<D4EntryProbeResult, UsbOpenError> {
+    request: &[u8],
+    expected_reply: &[u8],
+    max_reads: usize,
+) -> Result<BoundedExchangeProbeResult, UsbOpenError> {
+    if expected_reply.is_empty() {
+        return Err(UsbOpenError::EmptyExpectedReply);
+    }
     let context = Context::new().map_err(UsbOpenError::Context)?;
     let device = find_device(&context, vendor_id, product_id)?;
     let selected = selected_interface(&device, interface)?;
@@ -120,7 +124,13 @@ pub fn probe_d4_entry(
         .claim_interface(selected.number)
         .map_err(UsbOpenError::Claim)?;
 
-    let result = probe_d4_entry_with_claimed_handle(&mut handle, &selected);
+    let result = probe_bounded_exchange_with_claimed_handle(
+        &mut handle,
+        &selected,
+        request,
+        expected_reply,
+        max_reads,
+    );
     let release = handle
         .release_interface(selected.number)
         .map_err(UsbOpenError::Release);
@@ -130,37 +140,51 @@ pub fn probe_d4_entry(
     }
 }
 
-fn probe_d4_entry_with_claimed_handle(
+fn probe_bounded_exchange_with_claimed_handle(
     handle: &mut DeviceHandle<Context>,
     selected: &SelectedUsbInterface,
-) -> Result<D4EntryProbeResult, UsbOpenError> {
+    request: &[u8],
+    expected_reply: &[u8],
+    max_reads: usize,
+) -> Result<BoundedExchangeProbeResult, UsbOpenError> {
     handle
-        .write_bulk(
-            selected.output.address,
-            EPSON_D4_ENTRY_COMMAND,
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(UsbOpenError::WriteD4Entry)?;
+        .write_bulk(selected.output.address, request, DEFAULT_TIMEOUT)
+        .map_err(UsbOpenError::WriteExchange)?;
+    read_bounded_reply(expected_reply, max_reads, |buffer| {
+        handle.read_bulk(selected.input.address, buffer, DEFAULT_TIMEOUT)
+    })
+    .map_err(UsbOpenError::ReadExchange)
+}
+
+fn read_bounded_reply(
+    expected_reply: &[u8],
+    max_reads: usize,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, rusb::Error>,
+) -> Result<BoundedExchangeProbeResult, rusb::Error> {
     let mut reply = Vec::new();
     let mut buffer = [0; 256];
-    for _ in 0..ENTRY_REPLY_READ_LIMIT {
-        match handle.read_bulk(selected.input.address, &mut buffer, DEFAULT_TIMEOUT) {
+    for _ in 0..max_reads {
+        match read(&mut buffer) {
             Ok(count) => {
-                reply.extend_from_slice(&buffer[..count]);
-                if reply
-                    .windows(EPSON_D4_ENTRY_REPLY.len())
-                    .any(|window| window == EPSON_D4_ENTRY_REPLY)
-                {
-                    return Ok(D4EntryProbeResult::Recognized);
+                if append_and_recognize(&mut reply, &buffer[..count], expected_reply) {
+                    return Ok(BoundedExchangeProbeResult::Recognized);
                 }
             }
             Err(rusb::Error::Timeout) => break,
-            Err(error) => return Err(UsbOpenError::ReadD4Entry(error)),
+            Err(error) => return Err(error),
         }
     }
-    Ok(D4EntryProbeResult::Unrecognized {
+    Ok(BoundedExchangeProbeResult::Unrecognized {
         received_bytes: reply.len(),
     })
+}
+
+fn append_and_recognize(reply: &mut Vec<u8>, fragment: &[u8], expected_reply: &[u8]) -> bool {
+    reply.extend_from_slice(fragment);
+    !expected_reply.is_empty()
+        && reply
+            .windows(expected_reply.len())
+            .any(|window| window == expected_reply)
 }
 
 impl ByteTransport for LinuxUsbTransport {
@@ -341,9 +365,10 @@ pub enum UsbOpenError {
     },
     Claim(rusb::Error),
     ReadDeviceId(rusb::Error),
-    WriteD4Entry(rusb::Error),
-    ReadD4Entry(rusb::Error),
+    WriteExchange(rusb::Error),
+    ReadExchange(rusb::Error),
     Release(rusb::Error),
+    EmptyExpectedReply,
     InvalidDeviceIdLength {
         received: usize,
         declared: Option<usize>,
@@ -378,13 +403,22 @@ impl fmt::Display for UsbOpenError {
             Self::ReadDeviceId(error) => {
                 write!(formatter, "reading USB printer device ID failed: {error}")
             }
-            Self::WriteD4Entry(error) => {
-                write!(formatter, "writing Epson D4 entry probe failed: {error}")
+            Self::WriteExchange(error) => {
+                write!(
+                    formatter,
+                    "writing bounded USB exchange request failed: {error}"
+                )
             }
-            Self::ReadD4Entry(error) => {
-                write!(formatter, "reading Epson D4 entry probe failed: {error}")
+            Self::ReadExchange(error) => {
+                write!(
+                    formatter,
+                    "reading bounded USB exchange reply failed: {error}"
+                )
             }
             Self::Release(error) => write!(formatter, "releasing USB interface failed: {error}"),
+            Self::EmptyExpectedReply => {
+                formatter.write_str("bounded USB exchange expected reply must not be empty")
+            }
             Self::InvalidDeviceIdLength { received, declared } => write!(
                 formatter,
                 "invalid USB printer device-ID length: received {received} bytes, declared {declared:?}"
@@ -397,8 +431,11 @@ impl Error for UsbOpenError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::{
-        KernelDriver, UsbOpenError, ensure_kernel_driver_inactive, parse_device_id_response,
+        BoundedExchangeProbeResult, KernelDriver, UsbOpenError, ensure_kernel_driver_inactive,
+        parse_device_id_response, read_bounded_reply,
     };
 
     #[test]
@@ -440,5 +477,39 @@ mod tests {
             error,
             UsbOpenError::KernelDriverActive { interface: 3 }
         ));
+    }
+
+    #[test]
+    fn recognizes_an_expected_reply_across_fragments() {
+        let mut fragments =
+            VecDeque::from([b"prefix-\x01\x02".to_vec(), b"\x03\x04-suffix".to_vec()]);
+
+        let result = read_bounded_reply(b"\x01\x02\x03\x04", 2, |buffer| {
+            let fragment = fragments.pop_front().unwrap();
+            buffer[..fragment.len()].copy_from_slice(&fragment);
+            Ok(fragment.len())
+        })
+        .unwrap();
+
+        assert_eq!(result, BoundedExchangeProbeResult::Recognized);
+    }
+
+    #[test]
+    fn stops_after_the_configured_read_limit() {
+        let mut fragments =
+            VecDeque::from([b"no".to_vec(), b" match".to_vec(), b" expected".to_vec()]);
+
+        let result = read_bounded_reply(b"expected", 2, |buffer| {
+            let fragment = fragments.pop_front().unwrap();
+            buffer[..fragment.len()].copy_from_slice(&fragment);
+            Ok(fragment.len())
+        })
+        .unwrap();
+
+        assert_eq!(
+            result,
+            BoundedExchangeProbeResult::Unrecognized { received_bytes: 8 }
+        );
+        assert_eq!(fragments.len(), 1);
     }
 }

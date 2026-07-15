@@ -5,6 +5,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
+use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
@@ -12,7 +14,7 @@ use reink_discovery::MdnsDiscovery;
 use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
 #[cfg(target_os = "linux")]
-use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
+use reink_usb::read_printer_device_id;
 use serde_json::json;
 
 #[derive(Parser, Debug)]
@@ -167,7 +169,7 @@ fn usb_d4_probe_output(
     alternate_setting: u8,
     as_json: bool,
 ) -> Result<String, String> {
-    let result = probe_d4_entry(
+    let result = probe_epson_d4_entry(
         vendor_id,
         product_id,
         reink_platform::UsbInterfaceSelector {
@@ -177,8 +179,8 @@ fn usb_d4_probe_output(
     )
     .map_err(|error| error.to_string())?;
     let (status, received_bytes) = match result {
-        D4EntryProbeResult::Recognized => ("recognized", None),
-        D4EntryProbeResult::Unrecognized { received_bytes } => {
+        EpsonD4EntryProbeResult::Recognized => ("recognized", None),
+        EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
             ("unrecognized", Some(received_bytes))
         }
     };

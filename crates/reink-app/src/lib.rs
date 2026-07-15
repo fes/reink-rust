@@ -6,11 +6,49 @@ use std::fmt;
 
 use reink_core::{EepromReadReply, EpsonController, EpsonError, EpsonSpec, PrinterIdentity};
 use reink_d4::{ChannelId, D4Error, D4Link};
+#[cfg(target_os = "linux")]
+use reink_platform::UsbInterfaceSelector;
 use reink_platform::{ByteTransport, TransportError};
 
 const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@EJL\n";
 const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
 const ENTRY_REPLY_READ_LIMIT: usize = 5;
+
+/// Outcome of the Epson D4 entry probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpsonD4EntryProbeResult {
+    /// The source-compatible Epson entry reply was recognized.
+    Recognized,
+    /// The device replied, but its bytes did not match the Epson entry reply.
+    Unrecognized { received_bytes: usize },
+}
+
+/// Probes Epson D4 entry on a selected Linux USB interface without initializing D4.
+///
+/// The probe sends only the source-compatible Epson entry exchange. It does
+/// not initialize D4, open a service, access EEPROM, write printer state, or
+/// reset counters.
+#[cfg(target_os = "linux")]
+pub fn probe_epson_d4_entry(
+    vendor_id: u16,
+    product_id: u16,
+    interface: UsbInterfaceSelector,
+) -> Result<EpsonD4EntryProbeResult, ApplicationError> {
+    let result = reink_usb::probe_bounded_exchange(
+        vendor_id,
+        product_id,
+        interface,
+        EPSON_D4_ENTRY_COMMAND,
+        EPSON_D4_ENTRY_REPLY,
+        ENTRY_REPLY_READ_LIMIT,
+    )?;
+    Ok(match result {
+        reink_usb::BoundedExchangeProbeResult::Recognized => EpsonD4EntryProbeResult::Recognized,
+        reink_usb::BoundedExchangeProbeResult::Unrecognized { received_bytes } => {
+            EpsonD4EntryProbeResult::Unrecognized { received_bytes }
+        }
+    })
+}
 
 /// A read-only Epson control session over an initialized IEEE 1284.4 link.
 pub struct EpsonD4Session<T> {
@@ -93,6 +131,8 @@ pub enum ApplicationError {
     Transport(TransportError),
     D4(D4Error),
     Epson(EpsonError),
+    #[cfg(target_os = "linux")]
+    Usb(reink_usb::UsbOpenError),
     EntryReplyMissing,
     EntryReplyInvalid,
 }
@@ -103,6 +143,8 @@ impl fmt::Display for ApplicationError {
             Self::Transport(error) => write!(formatter, "transport error: {error}"),
             Self::D4(error) => write!(formatter, "D4 error: {error}"),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
+            #[cfg(target_os = "linux")]
+            Self::Usb(error) => write!(formatter, "USB error: {error}"),
             Self::EntryReplyMissing => formatter.write_str("Epson D4 entry reply was not received"),
             Self::EntryReplyInvalid => {
                 formatter.write_str("Epson D4 entry reply was not recognized")
@@ -117,6 +159,8 @@ impl Error for ApplicationError {
             Self::Transport(error) => Some(error),
             Self::D4(error) => Some(error),
             Self::Epson(error) => Some(error),
+            #[cfg(target_os = "linux")]
+            Self::Usb(error) => Some(error),
             Self::EntryReplyMissing | Self::EntryReplyInvalid => None,
         }
     }
@@ -140,13 +184,20 @@ impl From<EpsonError> for ApplicationError {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<reink_usb::UsbOpenError> for ApplicationError {
+    fn from(error: reink_usb::UsbOpenError) -> Self {
+        Self::Usb(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use reink_core::{ModelDatabase, encode_command, encode_eeprom_read};
     use reink_d4::{Packet, ProtocolRevision, TransactionMessage};
     use reink_platform_test::{SanitizedTranscript, TranscriptTransport};
 
-    use super::{EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session};
+    use super::{ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session};
 
     fn spec() -> reink_core::EpsonSpec {
         ModelDatabase::builtin()
@@ -284,5 +335,25 @@ mod tests {
         assert_eq!(session.read_eeprom(&[0x0c]).unwrap()[0].value, 0x42);
         session.shutdown().unwrap();
         session.into_transport().assert_finished();
+    }
+
+    #[test]
+    fn rejects_an_unrecognized_epson_entry_reply() {
+        let mut target = SanitizedTranscript::new("unrecognized Epson D4 entry reply");
+        target.expect_write(EPSON_D4_ENTRY_COMMAND);
+        target.respond_fragmented([
+            b"\x00".to_vec(),
+            b"\x00".to_vec(),
+            b"\x00".to_vec(),
+            b"\x08".to_vec(),
+            b"\x01".to_vec(),
+        ]);
+
+        let error = match EpsonD4Session::connect(target.into_transport(), spec()) {
+            Ok(_) => panic!("unrecognized Epson entry reply unexpectedly opened a D4 session"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ApplicationError::EntryReplyInvalid));
     }
 }

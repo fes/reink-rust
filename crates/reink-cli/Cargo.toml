@@ -8,6 +8,7 @@ description = "Read-only command-line interface for ReInk"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+reink-app = { path = "../reink-app" }
 reink-core = { path = "../reink-core" }
 reink-discovery = { path = "../reink-discovery" }
 reink-platform = { path = "../reink-platform" }

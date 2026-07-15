@@ -89,8 +89,8 @@ Current and planned workspace crates:
 | `reink-platform-test` | Strict scripted transports, control channels, and discovery fakes for downstream tests |
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
-| `reink-app` | Read-only Epson D4 session setup and application-facing identity/EEPROM operations |
-| `reink-usb` | Linux-only libusb bulk transport and USB printer-interface selection |
+| `reink-app` | Read-only Epson D4 session and entry-probe application services |
+| `reink-usb` | Linux-only libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
 | `reink-hardware-test` | Opt-in Linux hardware validation driver; read-only sequence only |
@@ -134,7 +134,9 @@ than USB vendor/product attributes.
 `reink-usb` uses `rusb` only on Linux. It selects alternate-setting-zero USB
 printer-class interfaces with both bulk-IN and bulk-OUT endpoints, claims the
 selected interface only when no kernel driver is active, and implements
-`ByteTransport` with bounded bulk I/O.
+`ByteTransport` with bounded bulk I/O. Its optional bounded exchange probe is
+protocol-neutral: callers provide request bytes, expected reply bytes, and a
+read limit.
 It refuses to claim an interface with an active Linux kernel driver and never
 detaches, reattaches, rebinds, or otherwise modifies drivers.
 
@@ -205,9 +207,12 @@ compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
 exposes read-only identity and EEPROM operations. It also closes the service
 channel and terminates D4 through `shutdown()`.
 
-The D4 entry exchange is tested only with scripted transports. Do not use it
-against hardware until the evidence requirements in the protocol provenance
-plan have been met for the selected printer family.
+On Linux, `probe_epson_d4_entry` is the separate safe entry-probe API used by
+the CLI and hardware-test driver. It owns the Epson request and reply
+semantics while delegating bounded USB I/O to `reink-usb`; it stops before D4
+Init or service setup. The D4 entry exchange is tested only with scripted
+transports. Do not use it against hardware until the evidence requirements in
+the protocol provenance plan have been met for the selected printer family.
 
 Build and test the service independently with:
 

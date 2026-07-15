@@ -4,9 +4,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
+use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
+#[cfg(target_os = "linux")]
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
-use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
+use reink_usb::read_printer_device_id;
 use serde_json::{Value, json};
 
 const NON_EXECUTABLE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES";
@@ -203,10 +205,10 @@ fn read_sequence(
         .resolve_identity(&identity)
         .map(|spec| spec.model.as_str());
     let entry =
-        probe_d4_entry(vendor_id, product_id, selector).map_err(|error| error.to_string())?;
+        probe_epson_d4_entry(vendor_id, product_id, selector).map_err(|error| error.to_string())?;
     let d4_entry = match entry {
-        D4EntryProbeResult::Recognized => json!({"status": "recognized"}),
-        D4EntryProbeResult::Unrecognized { received_bytes } => {
+        EpsonD4EntryProbeResult::Recognized => json!({"status": "recognized"}),
+        EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
             json!({"status": "unrecognized", "received_bytes": received_bytes})
         }
     };

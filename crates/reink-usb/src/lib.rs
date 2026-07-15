@@ -16,5 +16,6 @@ pub use descriptor::{
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    D4EntryProbeResult, LinuxUsbTransport, UsbOpenError, probe_d4_entry, read_printer_device_id,
+    BoundedExchangeProbeResult, LinuxUsbTransport, UsbOpenError, probe_bounded_exchange,
+    read_printer_device_id,
 };
