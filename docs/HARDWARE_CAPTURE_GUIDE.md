@@ -45,6 +45,15 @@ driver owns the interface, stop: ReInk deliberately refuses to detach the
 driver, and no workaround, driver rebinding, or manual detachment belongs in
 this project's workflow.
 
+## Read-only validation matrix
+
+For each accessible printer, collect two complete structured runs of device-ID,
+D4 entry, D4 identity, and orderly shutdown. After identity validation, collect
+small EEPROM read sets covering low, middle, known waste-counter, and
+near-upper-bound addresses. Record invalid-model and invalid-address failures
+only through the validation driver; do not deliberately provoke USB or printer
+faults.
+
 ## SNMP capture sequence
 
 For an authorized read-only session, retain sanitized evidence of:

@@ -79,3 +79,28 @@ five bounded replies. It stops before D4 Init, service opening, EEPROM reads,
 writes, or counter resets. It reports only whether the known reply was
 recognized, or an unexpected reply byte count; it never prints raw response
 bytes.
+
+7. Complete read-only evidence collection
+-----------------------------------------
+
+For every printer whose selected interface has no active kernel driver, retain
+sanitized JSON from the following commands:
+
+cargo run -p reink-hardware-test -- read-sequence \
+  --vendor-id 0x04b8 --product-id 0xNNNN --interface N
+
+cargo run -p reink-hardware-test -- d4-identity \
+  --vendor-id 0x04b8 --product-id 0xNNNN --interface N --model MODEL
+
+Run the complete sequence twice on the same printer. Retain both results to
+check stable replies and orderly shutdown.
+
+After a successful D4 identity result, use d4-eeprom-read only for explicitly
+selected addresses: one low address, one mid-range address, one configured
+waste-counter address, and one near the configured upper bound.
+
+Also retain sanitized errors for an invalid model name and an invalid EEPROM
+address. Do not induce transport, USB, or printer errors deliberately.
+
+For a printer blocked by an active kernel driver, retain only the driver-block
+error and device-file permission output. Do not detach or rebind the driver.
