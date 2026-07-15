@@ -1,0 +1,60 @@
+ReInk Linux USB read-only command checklist
+============================================
+
+Run these commands on native Linux. Send back sanitized output. Do not use
+sudo, unload usblp, unbind drivers, or modify udev rules.
+
+1. Clone and build
+------------------
+
+git clone https://github.com/fes/reink-rust.git
+cd reink-rust
+cargo build --workspace
+
+If the build reports missing libusb development files, report that error rather
+than installing anything yet.
+
+2. Record environment details
+-----------------------------
+
+rustc --version
+cargo --version
+uname -sr
+pkg-config --modversion libusb-1.0
+
+3. Identify Epson USB products and printer interfaces
+-----------------------------------------------------
+
+lsusb -d 04b8:
+lsusb -t
+
+for dev in /sys/bus/usb/devices/*; do
+  [ -f "$dev/idVendor" ] || continue
+  [ "$(cat "$dev/idVendor")" = "04b8" ] || continue
+  echo "Device: $(basename "$dev")  VID:PID=$(cat "$dev/idVendor"):$(cat "$dev/idProduct")"
+  for intf in "$dev":*; do
+    [ -f "$intf/bInterfaceNumber" ] || continue
+    driver="$(basename "$(readlink -f "$intf/driver" 2>/dev/null)" 2>/dev/null || echo none)"
+    echo "  interface=$(cat "$intf/bInterfaceNumber") class=$(cat "$intf/bInterfaceClass") driver=$driver"
+  done
+done
+
+4. Check local printer device-file candidates and permissions
+-------------------------------------------------------------
+
+cargo run -p reink-cli -- local-devices
+ls -l /dev/lp* /dev/usb/lp* 2>/dev/null || true
+
+5. Request only the standard USB Printer Class device ID
+--------------------------------------------------------
+
+For each discovered Epson device, replace the product ID and interface number:
+
+cargo run -p reink-cli -- usb-id \
+  --vendor-id 0x04b8 \
+  --product-id 0xNNNN \
+  --interface N
+
+The command never enters Epson D4 mode and never writes printer state. An
+error that an active kernel driver owns the interface is an expected safe stop
+condition. Record the exact error, but do not detach or rebind the driver.

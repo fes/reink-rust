@@ -18,8 +18,9 @@ waste-ink pads.
 
 The workspace contains platform contracts, deterministic test doubles, Epson
 domain logic, and a read-only application service that composes a selected
-transport with the Epson D4 and control-channel layers. It does not yet
-provide a CLI or UI, and its scripted D4 entry exchange is not hardware-ready.
+transport with the Epson D4 and control-channel layers. It includes read-only
+CLI and terminal UI surfaces; its scripted D4 entry exchange is not
+hardware-ready.
 
 | Area | Status |
 | --- | --- |
@@ -34,7 +35,7 @@ provide a CLI or UI, and its scripted D4 entry exchange is not hardware-ready.
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB | Planned |
 | Read-only CLI | Implemented |
-| Terminal UI | Planned |
+| Read-only terminal UI model browser | Implemented |
 
 ## Porting approach
 
@@ -96,9 +97,9 @@ Current and planned workspace crates:
 | `reink-tui` | Read-only keyboard-driven terminal model browser |
 
 `reink-platform` supports USB selectors, explicit device paths, and IPv4/IPv6
-network locations. A future Linux device-file adapter may use `/dev/lp*` or
-`/dev/usb/lp*`; Windows support must use a proper USB backend rather than
-assuming a POSIX-style device path.
+network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
+without opening devices. Windows support must use a proper USB backend rather
+than assuming a POSIX-style device path.
 
 ### USB backend and Windows driver policy
 
@@ -311,26 +312,108 @@ When hardware is available, follow the
 defines the required read-only evidence, redaction rules, and strict transcript
 replay approach before any hardware-derived fixture is committed.
 
-## Prerequisites
+## Fresh-system setup
 
-- Rust stable with the native MSVC toolchain, Cargo, Rustfmt, and Clippy.
-- Visual Studio Build Tools with the matching C++ toolchain and Windows SDK on
-  Windows.
-- CMake for future native dependencies, such as a USB backend.
+These instructions assume a stock operating system and a new checkout. They
+are deliberately explicit so a human or coding agent can follow them without
+making USB-driver changes.
 
-`reink-core` uses `serde` and `toml` to load the embedded model database.
+### Windows: build, test, and read-only UI
 
-## Build
+Windows supports the workspace's pure crates, CLI, terminal UI, mDNS, and SNMP
+paths. Native Windows USB access is **not supported**. Do not install, replace,
+detach, rebind, or restore a printer driver for ReInk.
+
+1. Install [Git for Windows](https://git-scm.com/download/win).
+2. Install the current stable Rust MSVC toolchain from
+   [rustup](https://rustup.rs/).
+3. Install Visual Studio 2022 Build Tools. Select **Desktop development with
+   C++**, including the MSVC x64/x86 build tools and a Windows SDK.
+4. Open **x64 Native Tools Command Prompt for VS 2022**. Do not use a normal
+   Command Prompt unless the matching MSVC linker is already configured.
+5. Run:
 
 ```powershell
+rustup default stable-x86_64-pc-windows-msvc
+rustup component add rustfmt clippy
+git clone https://github.com/fes/reink-rust.git
+cd reink-rust
 cargo build --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-On Windows, run this from a Developer Command Prompt for the installed
-architecture, or otherwise ensure the matching MSVC linker is available on
-`PATH`.
+Run the safe local tools:
 
-## Test and lint
+```powershell
+cargo run -p reink-cli -- models
+cargo run -p reink-cli -- --json models
+cargo run -p reink-cli -- discover --timeout-seconds 3
+cargo run -p reink-tui
+```
+
+`local-devices` and `usb-id` return an unsupported-platform error on Windows;
+that is intentional.
+
+### Linux: build, test, and read-only USB preflight
+
+Use native Linux for direct USB work. WSL can build and test pure Rust code,
+but is not the supported environment for the USB-printer preflight.
+
+On Debian or Ubuntu, install the build dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libusb-1.0-0-dev libudev-dev git curl
+```
+
+On other distributions, install the equivalents of a C/C++ build toolchain,
+`pkg-config`, libusb development headers, libudev development headers, Git,
+and curl. For example, Fedora provides `libusb1-devel` and `systemd-devel`.
+
+Install Rust and create the checkout:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+git clone https://github.com/fes/reink-rust.git
+cd reink-rust
+cargo build --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Run the safe local tools:
+
+```bash
+cargo run -p reink-cli -- models
+cargo run -p reink-cli -- local-devices
+cargo run -p reink-tui
+```
+
+For a physical USB printer, follow
+[the Linux read-only USB checklist](docs/LINUX_USB_READONLY_COMMANDS.txt).
+The only current USB request is the standard Printer Class device-ID read.
+It requires an exact vendor/product/interface selection and refuses to detach
+an active kernel driver.
+
+### Instructions for coding agents and automation
+
+1. Run the build, format, Clippy, and test commands above after source changes.
+2. Treat all printer access as opt-in. Never run `usb-id`, D4, EEPROM, or reset
+   commands against a device unless the user explicitly selects it.
+3. Never install, detach, unload, rebind, replace, or restore a USB/printer
+   driver. An active Linux kernel driver is a stop condition, not an error to
+   work around.
+4. Never commit raw captures, serial numbers, USB paths, IP addresses, SNMP
+   credentials, or other device-specific data. Use sanitized transcripts only.
+5. Do not add write/reset commands until the protocol-provenance safety gate
+   and hardware evidence requirements are satisfied.
+
+## Build, test, and lint
 
 ```powershell
 cargo fmt --all -- --check
