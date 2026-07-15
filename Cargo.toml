@@ -5,6 +5,7 @@ members = [
     "crates/reink-core",
     "crates/reink-d4",
     "crates/reink-discovery",
+    "crates/reink-hardware-test",
     "crates/reink-platform",
     "crates/reink-platform-test",
     "crates/reink-snmp",

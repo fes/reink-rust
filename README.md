@@ -93,6 +93,7 @@ Current and planned workspace crates:
 | `reink-usb` | Linux-only libusb bulk transport and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery; native device-file discovery remains planned |
+| `reink-hardware-test` | Opt-in Linux hardware validation driver; read-only sequence only |
 | `reink-cli` | Read-only model, identity, and mDNS discovery commands |
 | `reink-tui` | Read-only keyboard-driven terminal model browser |
 
@@ -272,6 +273,15 @@ or a bounded byte count:
 ```powershell
 cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
+
+For a single structured read-only preflight report, use:
+
+```powershell
+cargo run -p reink-hardware-test -- read-sequence --vendor-id 0x04b8 --product-id <product-id> --interface <number>
+```
+
+The driver currently runs device-ID, model-match, and D4-entry validation only.
+Its `write-sequence` command is deliberately unavailable.
 
 `snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
 credentials from the process environment:

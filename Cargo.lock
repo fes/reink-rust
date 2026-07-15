@@ -860,6 +860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reink-hardware-test"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "reink-core",
+ "reink-platform",
+ "reink-usb",
+ "serde_json",
+]
+
+[[package]]
 name = "reink-platform"
 version = "0.1.0"
 
