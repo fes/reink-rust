@@ -8,6 +8,7 @@ description = "Opt-in read-only hardware validation driver for ReInk"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+reink-app = { path = "../reink-app" }
 reink-core = { path = "../reink-core" }
 reink-platform = { path = "../reink-platform" }
 reink-usb = { path = "../reink-usb" }

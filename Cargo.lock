@@ -864,6 +864,7 @@ name = "reink-hardware-test"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "reink-app",
  "reink-core",
  "reink-platform",
  "reink-usb",
