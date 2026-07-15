@@ -280,8 +280,20 @@ For a single structured read-only preflight report, use:
 cargo run -p reink-hardware-test -- read-sequence --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
 
-The driver currently runs device-ID, model-match, and D4-entry validation only.
-Its `write-sequence` command is deliberately unavailable.
+`read-sequence` records USB device-ID, device-ID parsing, model resolution, and
+the capture-only D4 entry probe as ordered `steps`. `d4-identity` records the
+D4 session, identity read, and orderly shutdown; `d4-eeprom-read` does the same
+for explicitly selected EEPROM addresses:
+
+```powershell
+cargo run -p reink-hardware-test -- d4-identity --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model>
+cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0x000c
+```
+
+All successful reports use schema version 2 with `mode: "read_only"` and
+ordered step objects (`name`, `status`, and `result`). Preserve those reports as
+hardware evidence. The driver performs no physical write or reset operation;
+its `write-sequence` command is deliberately unavailable.
 
 `snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
 credentials from the process environment:

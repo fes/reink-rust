@@ -3,9 +3,13 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
+#[cfg(any(target_os = "linux", test))]
+use serde_json::Value;
+#[cfg(any(target_os = "linux", test))]
 use serde_json::json;
 
 #[derive(Parser)]
@@ -115,7 +119,12 @@ fn d4_eeprom_read(
         reink_app::EpsonD4Session::connect(transport, spec).map_err(|e| e.to_string())?;
     let values = session.read_eeprom(addresses).map_err(|e| e.to_string())?;
     session.shutdown().map_err(|e| e.to_string())?;
-    Ok(json!({"schema_version": 1, "mode": "read_only", "eeprom": values.iter().map(|v| json!({"address": format!("{:04X}", v.address), "value": v.value})).collect::<Vec<_>>()}).to_string())
+    Ok(d4_eeprom_read_report(
+        values
+            .iter()
+            .map(|value| json!({"address": format!("{:04X}", value.address), "value": value.value}))
+            .collect(),
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -149,7 +158,7 @@ fn d4_identity(
         reink_app::EpsonD4Session::connect(transport, spec).map_err(|e| e.to_string())?;
     let identity = session.read_identity().map_err(|e| e.to_string())?;
     session.shutdown().map_err(|e| e.to_string())?;
-    Ok(json!({"schema_version": 1, "mode": "read_only", "d4": {"init": "completed", "service": "EPSON-CTRL", "shutdown": "completed"}, "identity": identity.fields()}).to_string())
+    Ok(d4_identity_report(json!(identity.fields())))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -186,16 +195,12 @@ fn read_sequence(
             json!({"status": "unrecognized", "received_bytes": received_bytes})
         }
     };
-    Ok(json!({
-        "schema_version": 1,
-        "mode": "read_only",
-        "usb": {"vendor_id": format!("{vendor_id:04x}"), "product_id": format!("{product_id:04x}"), "interface": interface, "alternate_setting": alternate_setting},
-        "identity": identity.fields(),
-        "detected_model": identity.detected_model(),
-        "resolved_model": resolved_model,
-        "d4_entry": d4_entry,
-        "next_step": "D4 Init and EPSON-CTRL are intentionally not implemented in this driver yet"
-    }).to_string())
+    Ok(read_sequence_report(
+        json!({"vendor_id": format!("{vendor_id:04x}"), "product_id": format!("{product_id:04x}"), "interface": interface, "alternate_setting": alternate_setting, "bytes_received": bytes.len()}),
+        json!(identity.fields()),
+        json!({"detected_model": identity.detected_model(), "resolved_model": resolved_model}),
+        d4_entry,
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -209,4 +214,179 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_or((value, 10), |value| (value, 16));
     u16::from_str_radix(value, radix)
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn completed_step(name: &str, result: Value) -> Value {
+    json!({"name": name, "status": "completed", "result": result})
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String {
+    json!({
+        "schema_version": 2,
+        "mode": "read_only",
+        "command": command,
+        "steps": steps,
+        "next_step": next_step,
+    })
+    .to_string()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_sequence_report(
+    usb: Value,
+    identity: Value,
+    model_resolution: Value,
+    d4_entry: Value,
+) -> String {
+    read_only_report(
+        "read-sequence",
+        vec![
+            completed_step("usb-device-id", usb),
+            completed_step("parse-device-id", identity),
+            completed_step("resolve-model", model_resolution),
+            completed_step("d4-entry-probe", d4_entry),
+        ],
+        "Review this read-only preflight evidence before using d4-identity or d4-eeprom-read; write and reset validation remain unavailable.",
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn d4_identity_report(identity: Value) -> String {
+    read_only_report(
+        "d4-identity",
+        vec![
+            completed_step(
+                "d4-session-connect",
+                json!({"init": "completed", "service": "EPSON-CTRL"}),
+            ),
+            completed_step("identity-read", identity),
+            completed_step("d4-session-shutdown", json!({"exit": "completed"})),
+        ],
+        "Review identity evidence before selecting any EEPROM addresses; write and reset validation remain unavailable.",
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn d4_eeprom_read_report(values: Vec<Value>) -> String {
+    read_only_report(
+        "d4-eeprom-read",
+        vec![
+            completed_step(
+                "d4-session-connect",
+                json!({"init": "completed", "service": "EPSON-CTRL"}),
+            ),
+            completed_step("eeprom-read", json!({"values": values})),
+            completed_step("d4-session-shutdown", json!({"exit": "completed"})),
+        ],
+        "Preserve this read-only EEPROM evidence for future write-safety review; write and reset validation remain unavailable.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use serde_json::{Value, json};
+
+    use super::{
+        Cli, Command, d4_eeprom_read_report, d4_identity_report, parse_u16, read_sequence_report,
+    };
+
+    fn report(output: String) -> Value {
+        serde_json::from_str(&output).unwrap()
+    }
+
+    fn assert_completed_steps(report: &Value, expected_names: &[&str]) {
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["mode"], "read_only");
+        let steps = report["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), expected_names.len());
+        for (step, expected_name) in steps.iter().zip(expected_names) {
+            assert_eq!(step["name"], *expected_name);
+            assert_eq!(step["status"], "completed");
+            assert!(step.get("result").is_some());
+        }
+    }
+
+    #[test]
+    fn read_sequence_uses_versioned_per_step_results() {
+        let output = report(read_sequence_report(
+            json!({"vendor_id": "04b8", "bytes_received": 25}),
+            json!({"MFG": "EPSON", "MDL": "C90"}),
+            json!({"detected_model": "C90", "resolved_model": "C90"}),
+            json!({"status": "recognized"}),
+        ));
+
+        assert_eq!(output["command"], "read-sequence");
+        assert_completed_steps(
+            &output,
+            &[
+                "usb-device-id",
+                "parse-device-id",
+                "resolve-model",
+                "d4-entry-probe",
+            ],
+        );
+        assert_eq!(output["steps"][3]["result"]["status"], "recognized");
+        assert!(
+            output["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("d4-identity")
+        );
+    }
+
+    #[test]
+    fn d4_reports_preserve_read_only_step_evidence() {
+        let identity = report(d4_identity_report(json!({"MFG": "EPSON", "MDL": "C90"})));
+        assert_eq!(identity["command"], "d4-identity");
+        assert_completed_steps(
+            &identity,
+            &["d4-session-connect", "identity-read", "d4-session-shutdown"],
+        );
+        assert_eq!(identity["steps"][1]["result"]["MDL"], "C90");
+
+        let eeprom = report(d4_eeprom_read_report(vec![
+            json!({"address": "000C", "value": 66}),
+        ]));
+        assert_eq!(eeprom["command"], "d4-eeprom-read");
+        assert_completed_steps(
+            &eeprom,
+            &["d4-session-connect", "eeprom-read", "d4-session-shutdown"],
+        );
+        assert_eq!(eeprom["steps"][1]["result"]["values"][0]["address"], "000C");
+    }
+
+    #[test]
+    fn parses_only_explicit_read_only_commands() {
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "d4-eeprom-read",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--address",
+            "0x000c",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::D4EepromRead {
+                vendor_id: 0x04b8,
+                product_id: 1234,
+                interface: 0,
+                alternate_setting: 0,
+                ref model,
+                ref address,
+            } if model == "C90" && address == &[0x000c]
+        ));
+        assert_eq!(parse_u16("0x04b8").unwrap(), 0x04b8);
+        assert!(parse_u16("not-a-number").is_err());
+    }
 }
