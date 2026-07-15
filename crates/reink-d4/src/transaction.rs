@@ -256,14 +256,26 @@ impl TransactionMessage {
                 message: "transaction code",
             })?;
         match code {
-            0x00 => Ok(Self::Init {
-                revision: ProtocolRevision::from_byte(byte(body, 0)?)?,
-            }),
-            0x80 => Ok(Self::InitReply {
-                result: byte(body, 0)?,
-                revision: ProtocolRevision::from_byte(byte(body, 1)?)?,
-            }),
+            0x00 => {
+                exact_length(body, 1, "Init")?;
+                Ok(Self::Init {
+                    revision: ProtocolRevision::from_byte(byte(body, 0)?)?,
+                })
+            }
+            0x80 => {
+                exact_length(body, 2, "Init reply")?;
+                Ok(Self::InitReply {
+                    result: byte(body, 0)?,
+                    revision: ProtocolRevision::from_byte(byte(body, 1)?)?,
+                })
+            }
             0x01 => {
+                let expected_length = if revision == ProtocolRevision::V10 {
+                    10
+                } else {
+                    8
+                };
+                exact_length(body, expected_length, "OpenChannel")?;
                 let initial_credit = if revision == ProtocolRevision::V10 {
                     Some(u16_at(body, 8)?)
                 } else {
@@ -278,74 +290,143 @@ impl TransactionMessage {
                     initial_credit,
                 })
             }
-            0x81 => Ok(Self::OpenChannelReply {
-                result: byte(body, 0)?,
-                peer_socket: byte(body, 1)?,
-                source_socket: byte(body, 2)?,
-                max_packet_size: u16_at(body, 3)?,
-                max_service_size: u16_at(body, 5)?,
-                max_credit: u16_at(body, 7)?,
-                granted_credit: u16_at(body, 9)?,
-            }),
-            0x02 => Ok(Self::CloseChannel {
-                peer_socket: byte(body, 0)?,
-                source_socket: byte(body, 1)?,
-            }),
-            0x82 => Ok(Self::CloseChannelReply {
-                result: byte(body, 0)?,
-                peer_socket: byte(body, 1)?,
-                source_socket: byte(body, 2)?,
-            }),
-            0x03 => Ok(Self::Credit {
-                peer_socket: byte(body, 0)?,
-                source_socket: byte(body, 1)?,
-                added_credit: u16_at(body, 2)?,
-            }),
-            0x83 => Ok(Self::CreditReply {
-                result: byte(body, 0)?,
-                peer_socket: byte(body, 1)?,
-                source_socket: byte(body, 2)?,
-            }),
-            0x04 => Ok(Self::CreditRequest {
-                peer_socket: byte(body, 0)?,
-                source_socket: byte(body, 1)?,
-                max_credit: if revision == ProtocolRevision::V10 {
-                    0
-                } else {
-                    u16_at(body, 2)?
-                },
-            }),
-            0x84 => Ok(Self::CreditRequestReply {
-                result: byte(body, 0)?,
-                peer_socket: byte(body, 1)?,
-                source_socket: byte(body, 2)?,
-                added_credit: u16_at(body, 3)?,
-            }),
-            0x08 => Ok(Self::Exit),
-            0x88 => Ok(Self::ExitReply {
-                result: byte(body, 0)?,
-            }),
+            0x81 => {
+                exact_length(body, 11, "OpenChannel reply")?;
+                Ok(Self::OpenChannelReply {
+                    result: byte(body, 0)?,
+                    peer_socket: byte(body, 1)?,
+                    source_socket: byte(body, 2)?,
+                    max_packet_size: u16_at(body, 3)?,
+                    max_service_size: u16_at(body, 5)?,
+                    max_credit: u16_at(body, 7)?,
+                    granted_credit: u16_at(body, 9)?,
+                })
+            }
+            0x02 => {
+                exact_length(
+                    body,
+                    if revision == ProtocolRevision::V10 {
+                        3
+                    } else {
+                        2
+                    },
+                    "CloseChannel",
+                )?;
+                Ok(Self::CloseChannel {
+                    peer_socket: byte(body, 0)?,
+                    source_socket: byte(body, 1)?,
+                })
+            }
+            0x82 => {
+                exact_length(body, 3, "CloseChannel reply")?;
+                Ok(Self::CloseChannelReply {
+                    result: byte(body, 0)?,
+                    peer_socket: byte(body, 1)?,
+                    source_socket: byte(body, 2)?,
+                })
+            }
+            0x03 => {
+                exact_length(body, 4, "Credit")?;
+                Ok(Self::Credit {
+                    peer_socket: byte(body, 0)?,
+                    source_socket: byte(body, 1)?,
+                    added_credit: u16_at(body, 2)?,
+                })
+            }
+            0x83 => {
+                exact_length(body, 3, "Credit reply")?;
+                Ok(Self::CreditReply {
+                    result: byte(body, 0)?,
+                    peer_socket: byte(body, 1)?,
+                    source_socket: byte(body, 2)?,
+                })
+            }
+            0x04 => {
+                exact_length(
+                    body,
+                    if revision == ProtocolRevision::V10 {
+                        6
+                    } else {
+                        4
+                    },
+                    "CreditRequest",
+                )?;
+                Ok(Self::CreditRequest {
+                    peer_socket: byte(body, 0)?,
+                    source_socket: byte(body, 1)?,
+                    max_credit: if revision == ProtocolRevision::V10 {
+                        0
+                    } else {
+                        u16_at(body, 2)?
+                    },
+                })
+            }
+            0x84 => {
+                exact_length(body, 5, "CreditRequest reply")?;
+                Ok(Self::CreditRequestReply {
+                    result: byte(body, 0)?,
+                    peer_socket: byte(body, 1)?,
+                    source_socket: byte(body, 2)?,
+                    added_credit: u16_at(body, 3)?,
+                })
+            }
+            0x08 => {
+                exact_length(body, 0, "Exit")?;
+                Ok(Self::Exit)
+            }
+            0x88 => {
+                exact_length(body, 1, "Exit reply")?;
+                Ok(Self::ExitReply {
+                    result: byte(body, 0)?,
+                })
+            }
             0x09 => Ok(Self::GetSocketId {
                 service_name: ascii_from(body)?,
             }),
-            0x89 => Ok(Self::GetSocketIdReply {
-                result: byte(body, 0)?,
-                socket_id: byte(body, 1)?,
-                service_name: ascii_from(&body[2..])?,
-            }),
-            0x0a => Ok(Self::GetServiceName {
-                socket_id: byte(body, 0)?,
-            }),
-            0x8a => Ok(Self::GetServiceNameReply {
-                result: byte(body, 0)?,
-                socket_id: byte(body, 1)?,
-                service_name: ascii_from(&body[2..])?,
-            }),
-            0x7f => Ok(Self::Error {
-                peer_socket: byte(body, 0)?,
-                source_socket: byte(body, 1)?,
-                error_code: byte(body, 2)?,
-            }),
+            0x89 => {
+                let result = byte(body, 0)?;
+                let socket_id = byte(body, 1)?;
+                let service_name = if result == 0 {
+                    ascii_from(&body[2..])?
+                } else {
+                    exact_length(body, 2, "GetSocketId reply")?;
+                    String::new()
+                };
+                Ok(Self::GetSocketIdReply {
+                    result,
+                    socket_id,
+                    service_name,
+                })
+            }
+            0x0a => {
+                exact_length(body, 1, "GetServiceName")?;
+                Ok(Self::GetServiceName {
+                    socket_id: byte(body, 0)?,
+                })
+            }
+            0x8a => {
+                let result = byte(body, 0)?;
+                let socket_id = byte(body, 1)?;
+                let service_name = if result == 0 {
+                    ascii_from(&body[2..])?
+                } else {
+                    exact_length(body, 2, "GetServiceName reply")?;
+                    String::new()
+                };
+                Ok(Self::GetServiceNameReply {
+                    result,
+                    socket_id,
+                    service_name,
+                })
+            }
+            0x7f => {
+                exact_length(body, 3, "Error")?;
+                Ok(Self::Error {
+                    peer_socket: byte(body, 0)?,
+                    source_socket: byte(body, 1)?,
+                    error_code: byte(body, 2)?,
+                })
+            }
             _ => Err(TransactionParseError::UnknownCode { code }),
         }
     }
@@ -371,6 +452,26 @@ fn u16_at(bytes: &[u8], index: usize) -> Result<u16, TransactionParseError> {
     ]))
 }
 
+fn exact_length(
+    bytes: &[u8],
+    expected: usize,
+    message: &'static str,
+) -> Result<(), TransactionParseError> {
+    if bytes.len() == expected {
+        Ok(())
+    } else if bytes.len() < expected {
+        Err(TransactionParseError::Truncated {
+            message: "transaction field",
+        })
+    } else {
+        Err(TransactionParseError::UnexpectedLength {
+            message,
+            expected,
+            actual: bytes.len(),
+        })
+    }
+}
+
 fn ascii(value: &str) -> Result<&[u8], TransactionParseError> {
     if !value.is_ascii() {
         return Err(TransactionParseError::NonAsciiServiceName);
@@ -394,18 +495,33 @@ fn ascii_from(value: &[u8]) -> Result<String, TransactionParseError> {
     if !value.is_ascii() {
         return Err(TransactionParseError::NonAsciiServiceName);
     }
-    Ok(String::from_utf8(value.to_vec()).expect("ASCII is valid UTF-8"))
+    let value = String::from_utf8(value.to_vec()).expect("ASCII is valid UTF-8");
+    ascii(&value)?;
+    Ok(value)
 }
 
 /// A malformed transaction-channel message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransactionParseError {
-    Truncated { message: &'static str },
-    UnknownCode { code: u8 },
-    UnsupportedRevision { revision: u8 },
+    Truncated {
+        message: &'static str,
+    },
+    UnknownCode {
+        code: u8,
+    },
+    UnsupportedRevision {
+        revision: u8,
+    },
     NonAsciiServiceName,
     InvalidServiceName,
-    MessageTooLarge { actual: usize },
+    UnexpectedLength {
+        message: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    MessageTooLarge {
+        actual: usize,
+    },
 }
 
 impl fmt::Display for TransactionParseError {
@@ -421,6 +537,14 @@ impl fmt::Display for TransactionParseError {
             }
             Self::NonAsciiServiceName => formatter.write_str("service name is not ASCII"),
             Self::InvalidServiceName => formatter.write_str("invalid service name"),
+            Self::UnexpectedLength {
+                message,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{message} has an unexpected length: expected {expected}, got {actual}"
+            ),
             Self::MessageTooLarge { actual } => {
                 write!(formatter, "transaction payload exceeds 58 bytes: {actual}")
             }
@@ -434,7 +558,7 @@ impl Error for TransactionParseError {}
 mod tests {
     use crate::ProtocolRevision;
 
-    use super::TransactionMessage;
+    use super::{TransactionMessage, TransactionParseError};
 
     #[test]
     fn codecs_init_and_service_lookup() {
@@ -503,6 +627,167 @@ mod tests {
                 .encode(ProtocolRevision::V20)
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn deterministic_transaction_corpus_round_trips_each_message_family() {
+        let v20_messages = vec![
+            TransactionMessage::Init {
+                revision: ProtocolRevision::V20,
+            },
+            TransactionMessage::InitReply {
+                result: 0,
+                revision: ProtocolRevision::V20,
+            },
+            TransactionMessage::OpenChannel {
+                peer_socket: 2,
+                source_socket: 3,
+                max_packet_size: 0x100,
+                max_service_size: 0x200,
+                max_credit: 4,
+                initial_credit: None,
+            },
+            TransactionMessage::OpenChannelReply {
+                result: 0,
+                peer_socket: 2,
+                source_socket: 3,
+                max_packet_size: 0x100,
+                max_service_size: 0x200,
+                max_credit: 4,
+                granted_credit: 1,
+            },
+            TransactionMessage::CloseChannel {
+                peer_socket: 2,
+                source_socket: 3,
+            },
+            TransactionMessage::CloseChannelReply {
+                result: 0,
+                peer_socket: 2,
+                source_socket: 3,
+            },
+            TransactionMessage::Credit {
+                peer_socket: 2,
+                source_socket: 3,
+                added_credit: 4,
+            },
+            TransactionMessage::CreditReply {
+                result: 0,
+                peer_socket: 2,
+                source_socket: 3,
+            },
+            TransactionMessage::CreditRequest {
+                peer_socket: 2,
+                source_socket: 3,
+                max_credit: 4,
+            },
+            TransactionMessage::CreditRequestReply {
+                result: 0,
+                peer_socket: 2,
+                source_socket: 3,
+                added_credit: 4,
+            },
+            TransactionMessage::Exit,
+            TransactionMessage::ExitReply { result: 0 },
+            TransactionMessage::GetSocketId {
+                service_name: "EPSON-CTRL".to_owned(),
+            },
+            TransactionMessage::GetSocketIdReply {
+                result: 0,
+                socket_id: 2,
+                service_name: "EPSON-CTRL".to_owned(),
+            },
+            TransactionMessage::GetServiceName { socket_id: 2 },
+            TransactionMessage::GetServiceNameReply {
+                result: 0,
+                socket_id: 2,
+                service_name: "EPSON-CTRL".to_owned(),
+            },
+            TransactionMessage::Error {
+                peer_socket: 2,
+                source_socket: 3,
+                error_code: 0x86,
+            },
+        ];
+
+        for revision in [ProtocolRevision::V10, ProtocolRevision::V20] {
+            for message in &v20_messages {
+                let expected = match (revision, message) {
+                    (
+                        ProtocolRevision::V10,
+                        TransactionMessage::OpenChannel {
+                            peer_socket,
+                            source_socket,
+                            max_packet_size,
+                            max_service_size,
+                            max_credit,
+                            ..
+                        },
+                    ) => TransactionMessage::OpenChannel {
+                        peer_socket: *peer_socket,
+                        source_socket: *source_socket,
+                        max_packet_size: *max_packet_size,
+                        max_service_size: *max_service_size,
+                        max_credit: *max_credit,
+                        initial_credit: Some(0),
+                    },
+                    (
+                        ProtocolRevision::V10,
+                        TransactionMessage::CreditRequest {
+                            peer_socket,
+                            source_socket,
+                            ..
+                        },
+                    ) => TransactionMessage::CreditRequest {
+                        peer_socket: *peer_socket,
+                        source_socket: *source_socket,
+                        max_credit: 0,
+                    },
+                    _ => message.clone(),
+                };
+                let encoded = message.encode(revision).unwrap();
+                assert_eq!(
+                    TransactionMessage::decode(&encoded, revision).unwrap(),
+                    expected,
+                    "revision={revision:?}, message={message:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_on_fixed_length_messages() {
+        let cases = [
+            (ProtocolRevision::V20, vec![0x00, 0x20]),
+            (ProtocolRevision::V20, vec![0x80, 0, 0x20]),
+            (ProtocolRevision::V20, vec![0x01, 2, 3, 1, 0, 2, 0, 0, 4]),
+            (ProtocolRevision::V10, vec![0x02, 2, 3, 0]),
+            (ProtocolRevision::V20, vec![0x03, 2, 3, 0, 4]),
+            (ProtocolRevision::V20, vec![0x08]),
+            (ProtocolRevision::V20, vec![0x7f, 2, 3, 0x86]),
+        ];
+
+        for (revision, mut encoded) in cases {
+            encoded.push(0xff);
+            assert!(matches!(
+                TransactionMessage::decode(&encoded, revision),
+                Err(TransactionParseError::UnexpectedLength { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_empty_service_names_in_received_messages() {
+        for payload in [
+            vec![0x09],
+            vec![0x09, b'e'],
+            vec![0x89, 0, 2],
+            vec![0x8a, 0, 2, b'e'],
+        ] {
+            assert!(matches!(
+                TransactionMessage::decode(&payload, ProtocolRevision::V20),
+                Err(TransactionParseError::InvalidServiceName)
+            ));
         }
     }
 }

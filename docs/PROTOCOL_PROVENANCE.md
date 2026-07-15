@@ -68,6 +68,12 @@ accounting, and revision-`0x20` state transitions. The repository contains
 only independently written implementation and tests. Revision `0x10` remains
 source-compatible behavior pending separate authoritative evidence.
 
+The decoder rejects trailing bytes on fixed-layout transaction messages and
+rejects empty or invalid received service names. Deterministic packet
+fragmentation and transaction-codec matrices protect this boundary without
+requiring a device capture. This strictness is malformed-input hardening, not
+additional evidence that a revision-`0x10` layout is authoritative.
+
 ## D4 review checklist
 
 Before a hardware adapter uses `reink-d4`, complete and record review for the

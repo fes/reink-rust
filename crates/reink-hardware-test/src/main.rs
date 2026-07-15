@@ -284,6 +284,37 @@ fn completed_step(name: &str, result: Value) -> Value {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadOnlyFailureKind {
+    Blocked,
+    Timeout,
+    Malformed,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ReadOnlyFailureKind {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Timeout => "timeout",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
+    json!({
+        "name": name,
+        "status": kind.status(),
+        "error": {
+            "kind": kind.status(),
+            "message": message,
+        },
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String {
     json!({
         "schema_version": 2,
@@ -293,6 +324,26 @@ fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String
         "next_step": next_step,
     })
     .to_string()
+}
+
+/// Produces a deterministic report for a hardware-independent driver simulation.
+///
+/// Concrete USB operations currently return their native error to preserve a
+/// nonzero process exit. This helper defines the schema used by tests and by a
+/// future opt-in runner that can retain partial read-only evidence safely.
+#[cfg(any(target_os = "linux", test))]
+fn simulated_read_only_report(
+    command: &str,
+    completed: Vec<(&str, Value)>,
+    failure: (&str, ReadOnlyFailureKind, &str),
+    next_step: &str,
+) -> String {
+    let mut steps = completed
+        .into_iter()
+        .map(|(name, result)| completed_step(name, result))
+        .collect::<Vec<_>>();
+    steps.push(failed_step(failure.0, failure.1, failure.2));
+    read_only_report(command, steps, next_step)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -352,8 +403,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Cli, Command, NON_EXECUTABLE_WRITE_CONFIRMATION, d4_eeprom_read_report, d4_identity_report,
-        parse_u16, read_sequence_report, write_validation_plan_report,
+        Cli, Command, NON_EXECUTABLE_WRITE_CONFIRMATION, ReadOnlyFailureKind,
+        d4_eeprom_read_report, d4_identity_report, parse_u16, read_sequence_report,
+        simulated_read_only_report, write_validation_plan_report,
     };
 
     fn report(output: String) -> Value {
@@ -419,6 +471,44 @@ mod tests {
             &["d4-session-connect", "eeprom-read", "d4-session-shutdown"],
         );
         assert_eq!(eeprom["steps"][1]["result"]["values"][0]["address"], "000C");
+    }
+
+    #[test]
+    fn simulated_driver_reports_preserve_completed_evidence_and_classify_failures() {
+        let cases = [
+            (
+                ReadOnlyFailureKind::Blocked,
+                "active kernel driver",
+                "blocked",
+            ),
+            (
+                ReadOnlyFailureKind::Timeout,
+                "USB read timed out",
+                "timeout",
+            ),
+            (
+                ReadOnlyFailureKind::Malformed,
+                "device ID has an invalid length",
+                "malformed",
+            ),
+        ];
+
+        for (kind, message, status) in cases {
+            let output = report(simulated_read_only_report(
+                "read-sequence",
+                vec![("usb-device-id", json!({"bytes_received": 25}))],
+                ("parse-device-id", kind, message),
+                "Resolve the reported read-only condition before retrying; no write or reset is available.",
+            ));
+            assert_eq!(output["schema_version"], 2);
+            assert_eq!(output["mode"], "read_only");
+            assert_eq!(output["steps"][0]["status"], "completed");
+            assert_eq!(output["steps"][1]["name"], "parse-device-id");
+            assert_eq!(output["steps"][1]["status"], status);
+            assert_eq!(output["steps"][1]["error"]["kind"], status);
+            assert_eq!(output["steps"][1]["error"]["message"], message);
+            assert!(output["steps"][1].get("result").is_none());
+        }
     }
 
     #[test]

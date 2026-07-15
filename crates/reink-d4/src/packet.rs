@@ -230,4 +230,30 @@ mod tests {
             PacketError::ReservedControlBits { control: 0x80 }
         );
     }
+
+    #[test]
+    fn deterministic_fragmentation_matrix_preserves_complete_packets() {
+        for payload_length in [0, 1, 2, 5, 57, 58, 255, 1024, 65_529] {
+            let payload = (0..payload_length)
+                .map(|index| (index as u8).wrapping_mul(31))
+                .collect::<Vec<_>>();
+            let packet = Packet::new(2, 3, payload, 7, 0).unwrap();
+            let encoded = packet.encode();
+
+            for fragment_length in [1, 2, 3, 5, 64, 256, 4096] {
+                let mut decoder = PacketDecoder::default();
+                let mut received = Vec::new();
+                for fragment in encoded.chunks(fragment_length) {
+                    received.extend(decoder.push(fragment).unwrap());
+                }
+
+                assert_eq!(
+                    received,
+                    vec![packet.clone()],
+                    "payload={payload_length}, fragment={fragment_length}"
+                );
+                assert_eq!(decoder.buffered_len(), 0);
+            }
+        }
+    }
 }

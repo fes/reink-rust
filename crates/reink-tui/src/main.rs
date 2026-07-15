@@ -114,6 +114,7 @@ enum View {
     Models,
     ModelDetail,
     IdentityInspection,
+    ReadOnlyWorkflows,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +155,9 @@ impl Application {
             View::Home if matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I')) => {
                 self.view = View::IdentityInspection;
             }
+            View::Home if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H')) => {
+                self.view = View::ReadOnlyWorkflows;
+            }
             View::Models => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -179,6 +183,14 @@ impl Application {
                 }
                 _ => {}
             },
+            View::ReadOnlyWorkflows
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                ) =>
+            {
+                self.view = View::Home;
+            }
             _ => {}
         }
         Navigation::Continue
@@ -200,6 +212,7 @@ impl Application {
             View::Models => self.draw_models(frame),
             View::ModelDetail => self.draw_model_detail(frame, database),
             View::IdentityInspection => self.draw_identity_inspection(frame, database),
+            View::ReadOnlyWorkflows => self.draw_read_only_workflows(frame),
         }
     }
 
@@ -212,7 +225,7 @@ impl Application {
             Line::from("Browse the built-in Epson model database."),
             Line::from("No device is opened and no printer state can be changed."),
             Line::from(""),
-            Line::from("Enter or M: models     I: inspect a device ID     Q or Esc: quit"),
+            Line::from("Enter/M: models  I: inspect ID  H: read-only workflows  Q/Esc: quit"),
         ]);
         frame.render_widget(
             Paragraph::new(text)
@@ -302,6 +315,38 @@ impl Application {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(" Local IEEE 1284 identity inspection "),
+                )
+                .wrap(Wrap { trim: true }),
+            frame.area(),
+        );
+    }
+
+    fn draw_read_only_workflows(&self, frame: &mut ratatui::Frame<'_>) {
+        let text = Text::from(vec![
+            Line::from("CLI discovery and hardware validation are separate opt-in commands.")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(""),
+            Line::from("Network discovery: reink discover --timeout-seconds 3"),
+            Line::from("Linux device candidates: reink local-devices"),
+            Line::from(
+                "Both commands are read-only; device-file discovery does not open a device.",
+            ),
+            Line::from(""),
+            Line::from("Linux hardware preflight: reink-hardware-test read-sequence"),
+            Line::from(
+                "It requires an exact vendor/product/interface selection and may communicate",
+            ),
+            Line::from("only with the explicitly selected printer. It never writes or resets."),
+            Line::from(""),
+            Line::from("This UI does not run discovery or hardware commands."),
+            Line::from("Esc or Q: back"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Read-only workflows "),
                 )
                 .wrap(Wrap { trim: true }),
             frame.area(),
@@ -433,6 +478,19 @@ mod tests {
                 .any(|line| line == "Built-in match: C90")
         );
         application.handle_key(key(KeyCode::Esc));
+        assert_eq!(application.view, View::Home);
+    }
+
+    #[test]
+    fn workflow_view_only_exposes_guidance_and_returns_home() {
+        let mut application = Application::new(vec![]);
+
+        application.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(application.view, View::ReadOnlyWorkflows);
+        assert_eq!(
+            application.handle_key(key(KeyCode::Char('q'))),
+            Navigation::Continue
+        );
         assert_eq!(application.view, View::Home);
     }
 }

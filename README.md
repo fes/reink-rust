@@ -92,10 +92,10 @@ Current and planned workspace crates:
 | `reink-app` | Read-only Epson D4 session setup and application-facing identity/EEPROM operations |
 | `reink-usb` | Linux-only libusb bulk transport and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
-| `reink-discovery` | mDNS printer discovery; native device-file discovery remains planned |
+| `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
 | `reink-hardware-test` | Opt-in Linux hardware validation driver; read-only sequence only |
 | `reink-cli` | Read-only model, identity, and mDNS discovery commands |
-| `reink-tui` | Read-only keyboard-driven terminal model browser |
+| `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
 
 `reink-platform` supports USB selectors, explicit device paths, and IPv4/IPv6
 network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
@@ -300,6 +300,12 @@ ordered step objects (`name`, `status`, and `result`). Preserve those reports as
 hardware evidence. The driver performs no physical write or reset operation;
 its `write-sequence` command is deliberately unavailable.
 
+The report schema also reserves `blocked`, `timeout`, and `malformed` step
+statuses for a future opt-in runner that can preserve partial read-only
+evidence. Deterministic hardware-independent simulations verify these result
+shapes; the current concrete commands still return a nonzero process result for
+an operational USB failure rather than presenting it as success.
+
 `write-validation-plan` is a separate **non-executable** safety-gate report.
 It never selects a USB device, opens a session, queues a write, or resets a
 printer. It accepts only the SHA-256 reference of a separately retained,
@@ -348,7 +354,9 @@ cargo run -p reink-tui
 
 Use `Enter` or `M` to browse models, arrow keys or `J`/`K` to select a model,
 and `Esc` or `Q` to return or exit. Use `I` to type and locally parse an IEEE
-1284 ID; this only resolves bundled metadata and sends no traffic.
+1284 ID; this only resolves bundled metadata and sends no traffic. `H` shows
+the separate CLI discovery and Linux hardware-preflight workflows, but never
+runs them or opens a device.
 
 ## Protocol provenance
 
@@ -475,10 +483,18 @@ cargo test --workspace
 
 The current hardware-free suite covers identity parsing, model-database
 validation and counter merging, Epson command encoding, EEPROM reply parsing,
-D4 state transitions, the read-only D4 application session, SNMP OID mapping,
-mDNS result conversion, CLI argument parsing, and platform test doubles.
+D4 state transitions, strict malformed transaction rejection, deterministic
+packet-fragmentation matrices, transcript-replayed read-only sessions, the
+read-only D4 application session, SNMP OID mapping, mDNS result conversion,
+CLI argument parsing, and platform test doubles.
 Hardware smoke tests, when added, will be opt-in and require an explicitly
 selected device.
+
+GitHub Actions runs this same formatting, Clippy, and test sequence on current
+Linux and Windows runners. Tagged `v*` revisions and manual dispatch create
+release-build artifacts for the read-only CLI, hardware-test driver, and TUI;
+publishing a release remains a maintainer action after reviewing those
+artifacts.
 
 ## Application-service workflow
 

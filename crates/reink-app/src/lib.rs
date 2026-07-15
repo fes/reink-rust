@@ -168,6 +168,11 @@ mod tests {
         .encode()
     }
 
+    fn respond_fragmented_packet(target: &mut SanitizedTranscript, packet: Vec<u8>) {
+        let split = packet.len().min(3);
+        target.respond_fragmented([packet[..split].to_vec(), packet[split..].to_vec()]);
+    }
+
     fn read_only_d4_transcript(spec: &reink_core::EpsonSpec) -> TranscriptTransport {
         let mut target = SanitizedTranscript::new("synthetic Epson D4 read-only lifecycle");
         target.expect_write(EPSON_D4_ENTRY_COMMAND);
@@ -176,49 +181,59 @@ mod tests {
             EPSON_D4_ENTRY_REPLY[4..].to_vec(),
         ]);
         target.expect_write(Packet::new(0, 0, [0, 0x20], 1, 0).unwrap().encode());
-        target.respond(transaction_packet(
-            TransactionMessage::InitReply {
-                result: 0,
-                revision: ProtocolRevision::V20,
-            },
-            1,
-        ));
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::InitReply {
+                    result: 0,
+                    revision: ProtocolRevision::V20,
+                },
+                1,
+            ),
+        );
         target.expect_write(
             Packet::new(0, 0, b"\x09EPSON-CTRL".to_vec(), 1, 0)
                 .unwrap()
                 .encode(),
         );
-        target.respond(transaction_packet(
-            TransactionMessage::GetSocketIdReply {
-                result: 0,
-                socket_id: 2,
-                service_name: "EPSON-CTRL".to_owned(),
-            },
-            1,
-        ));
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::GetSocketIdReply {
+                    result: 0,
+                    socket_id: 2,
+                    service_name: "EPSON-CTRL".to_owned(),
+                },
+                1,
+            ),
+        );
         target.expect_write(
             Packet::new(0, 0, b"\x01\x02\x02\x01\x00\x01\x00\x00\x00".to_vec(), 1, 0)
                 .unwrap()
                 .encode(),
         );
-        target.respond(transaction_packet(
-            TransactionMessage::OpenChannelReply {
-                result: 0,
-                peer_socket: 2,
-                source_socket: 2,
-                max_packet_size: 0x100,
-                max_service_size: 0x100,
-                max_credit: 0,
-                granted_credit: 1,
-            },
-            1,
-        ));
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::OpenChannelReply {
+                    result: 0,
+                    peer_socket: 2,
+                    source_socket: 2,
+                    max_packet_size: 0x100,
+                    max_service_size: 0x100,
+                    max_credit: 0,
+                    granted_credit: 1,
+                },
+                1,
+            ),
+        );
         target.expect_write(
             Packet::new(2, 2, encode_command(*b"di", &[1]).unwrap(), 1, 0)
                 .unwrap()
                 .encode(),
         );
-        target.respond(
+        respond_fragmented_packet(
+            &mut target,
             Packet::new(2, 2, b"@EJL ID MFG:EPSON;MDL:C90;".to_vec(), 1, 0)
                 .unwrap()
                 .encode(),
@@ -228,7 +243,8 @@ mod tests {
                 .unwrap()
                 .encode(),
         );
-        target.respond(
+        respond_fragmented_packet(
+            &mut target,
             Packet::new(2, 2, b"@BDC PS EE:0C4200;".to_vec(), 1, 0)
                 .unwrap()
                 .encode(),
@@ -238,19 +254,22 @@ mod tests {
                 .unwrap()
                 .encode(),
         );
-        target.respond(transaction_packet(
-            TransactionMessage::CloseChannelReply {
-                result: 0,
-                peer_socket: 2,
-                source_socket: 2,
-            },
-            1,
-        ));
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::CloseChannelReply {
+                    result: 0,
+                    peer_socket: 2,
+                    source_socket: 2,
+                },
+                1,
+            ),
+        );
         target.expect_write(Packet::new(0, 0, [0x08], 1, 0).unwrap().encode());
-        target.respond(transaction_packet(
-            TransactionMessage::ExitReply { result: 0 },
-            1,
-        ));
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(TransactionMessage::ExitReply { result: 0 }, 1),
+        );
         target.into_transport()
     }
 
