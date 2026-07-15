@@ -3,11 +3,11 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_core::{ModelDatabase, PrinterIdentity};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_usb::read_printer_device_id;
 use serde_json::{Value, json};
 
@@ -35,6 +35,10 @@ enum Command {
         interface: u8,
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
     },
     /// Explain why write validation is not available.
     WriteSequence,
@@ -58,6 +62,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
         #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        #[arg(long)]
         model: String,
     },
     /// Read explicitly selected EEPROM addresses over a read-only D4 session.
@@ -70,6 +78,10 @@ enum Command {
         interface: u8,
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
         #[arg(long)]
         model: String,
         #[arg(long, required = true, value_parser = parse_u16)]
@@ -92,8 +104,21 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
-        Command::ReadSequence { vendor_id, product_id, interface, alternate_setting } =>
-            read_sequence(vendor_id, product_id, interface, alternate_setting),
+        Command::ReadSequence {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+        } => read_sequence(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+        ),
         Command::WriteSequence => Err(
             "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
         ),
@@ -104,17 +129,54 @@ fn run(cli: Cli) -> Result<String, String> {
             evidence_sha256.as_deref(),
             confirmation.as_deref(),
         )),
-        Command::D4Identity { vendor_id, product_id, interface, alternate_setting, model } => d4_identity(vendor_id, product_id, interface, alternate_setting, &model),
-        Command::D4EepromRead { vendor_id, product_id, interface, alternate_setting, model, address } => d4_eeprom_read(vendor_id, product_id, interface, alternate_setting, &model, &address),
+        Command::D4Identity {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+        } => d4_identity(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+        ),
+        Command::D4EepromRead {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            address,
+        } => d4_eeprom_read(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            &address,
+        ),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn d4_eeprom_read(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
     alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
     model: &str,
     addresses: &[u16],
 ) -> Result<String, String> {
@@ -123,9 +185,8 @@ fn d4_eeprom_read(
         .get(model)
         .ok_or_else(|| format!("unknown model: {model}"))?
         .clone();
-    let transport = reink_usb::LinuxUsbTransport::open(
-        vendor_id,
-        product_id,
+    let transport = reink_usb::ReadOnlyUsbTransport::open(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
@@ -144,17 +205,29 @@ fn d4_eeprom_read(
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn d4_eeprom_read(_: u16, _: u16, _: u8, _: u8, _: &str, _: &[u16]) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux".to_owned())
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_read(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: &[u16],
+) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn d4_identity(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
     alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
     model: &str,
 ) -> Result<String, String> {
     let spec = ModelDatabase::builtin()
@@ -162,9 +235,8 @@ fn d4_identity(
         .get(model)
         .ok_or_else(|| format!("unknown model: {model}"))?
         .clone();
-    let transport = reink_usb::LinuxUsbTransport::open(
-        vendor_id,
-        product_id,
+    let transport = reink_usb::ReadOnlyUsbTransport::open(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
@@ -178,24 +250,34 @@ fn d4_identity(
     Ok(d4_identity_report(json!(identity.fields())))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn d4_identity(_: u16, _: u16, _: u8, _: u8, _: &str) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux".to_owned())
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn d4_identity(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_sequence(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
     alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
 ) -> Result<String, String> {
     let selector = reink_platform::UsbInterfaceSelector {
         number: interface,
         alternate_setting,
     };
-    let bytes = read_printer_device_id(vendor_id, product_id, selector)
-        .map_err(|error| error.to_string())?;
+    let device = usb_device_selector(vendor_id, product_id, bus_number, device_address)?;
+    let bytes = read_printer_device_id(device, selector).map_err(|error| error.to_string())?;
     let identity = PrinterIdentity::parse(
         std::str::from_utf8(&bytes).map_err(|_| "USB device ID is not UTF-8")?,
     )
@@ -204,8 +286,7 @@ fn read_sequence(
     let resolved_model = database
         .resolve_identity(&identity)
         .map(|spec| spec.model.as_str());
-    let entry =
-        probe_epson_d4_entry(vendor_id, product_id, selector).map_err(|error| error.to_string())?;
+    let entry = probe_epson_d4_entry(device, selector).map_err(|error| error.to_string())?;
     let d4_entry = match entry {
         EpsonD4EntryProbeResult::Recognized => json!({"status": "recognized"}),
         EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
@@ -220,9 +301,16 @@ fn read_sequence(
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_sequence(_: u16, _: u16, _: u8, _: u8) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux".to_owned())
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_sequence(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {
@@ -231,6 +319,25 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_or((value, 10), |value| (value, 16));
     u16::from_str_radix(value, radix)
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn usb_device_selector(
+    vendor_id: u16,
+    product_id: u16,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+) -> Result<reink_usb::UsbDeviceSelector, String> {
+    match (bus_number, device_address) {
+        (None, None) => Ok(reink_usb::UsbDeviceSelector::new(vendor_id, product_id)),
+        (Some(bus_number), Some(device_address)) => Ok(reink_usb::UsbDeviceSelector::at_location(
+            vendor_id,
+            product_id,
+            bus_number,
+            device_address,
+        )),
+        _ => Err("--bus-number and --device-address must be provided together".to_owned()),
+    }
 }
 
 fn is_sha256_reference(value: &str) -> bool {
@@ -280,12 +387,12 @@ fn write_validation_plan_report(
     .to_string()
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn completed_step(name: &str, result: Value) -> Value {
     json!({"name": name, "status": "completed", "result": result})
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadOnlyFailureKind {
     Blocked,
@@ -293,7 +400,7 @@ enum ReadOnlyFailureKind {
     Malformed,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl ReadOnlyFailureKind {
     fn status(self) -> &'static str {
         match self {
@@ -304,7 +411,7 @@ impl ReadOnlyFailureKind {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
     json!({
         "name": name,
@@ -316,7 +423,7 @@ fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String {
     json!({
         "schema_version": 2,
@@ -333,7 +440,7 @@ fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String
 /// Concrete USB operations currently return their native error to preserve a
 /// nonzero process exit. This helper defines the schema used by tests and by a
 /// future opt-in runner that can retain partial read-only evidence safely.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn simulated_read_only_report(
     command: &str,
     completed: Vec<(&str, Value)>,
@@ -348,7 +455,7 @@ fn simulated_read_only_report(
     read_only_report(command, steps, next_step)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn read_sequence_report(
     usb: Value,
     identity: Value,
@@ -367,7 +474,7 @@ fn read_sequence_report(
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn d4_identity_report(identity: Value) -> String {
     read_only_report(
         "d4-identity",
@@ -383,7 +490,7 @@ fn d4_identity_report(identity: Value) -> String {
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn d4_eeprom_read_report(values: Vec<Value>) -> String {
     read_only_report(
         "d4-eeprom-read",
@@ -407,7 +514,7 @@ mod tests {
     use super::{
         Cli, Command, NON_EXECUTABLE_WRITE_CONFIRMATION, ReadOnlyFailureKind,
         d4_eeprom_read_report, d4_identity_report, parse_u16, read_sequence_report,
-        simulated_read_only_report, write_validation_plan_report,
+        simulated_read_only_report, usb_device_selector, write_validation_plan_report,
     };
 
     fn report(output: String) -> Value {
@@ -537,12 +644,23 @@ mod tests {
                 product_id: 1234,
                 interface: 0,
                 alternate_setting: 0,
+                bus_number: None,
+                device_address: None,
                 ref model,
                 ref address,
             } if model == "C90" && address == &[0x000c]
         ));
         assert_eq!(parse_u16("0x04b8").unwrap(), 0x04b8);
         assert!(parse_u16("not-a-number").is_err());
+    }
+
+    #[test]
+    fn requires_a_complete_optional_usb_location() {
+        assert!(usb_device_selector(0x04b8, 0x1234, Some(1), None).is_err());
+        assert_eq!(
+            usb_device_selector(0x04b8, 0x1234, Some(1), Some(2)).unwrap(),
+            reink_usb::UsbDeviceSelector::at_location(0x04b8, 0x1234, 1, 2)
+        );
     }
 
     #[test]

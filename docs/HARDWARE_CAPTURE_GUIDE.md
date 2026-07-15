@@ -38,12 +38,14 @@ fixture.
 
 ## USB identity preflight
 
-Before any D4 interaction, use the Linux `usb-id` command with an exact
-vendor/product/interface selection to request the standard USB Printer Class
-device ID. It must remain separate from Epson D4 traffic. If an active kernel
-driver owns the interface, stop: ReInk deliberately refuses to detach the
-driver, and no workaround, driver rebinding, or manual detachment belongs in
-this project's workflow.
+Before any D4 interaction, use the Linux or macOS `usb-id` command with an
+exact vendor/product/interface selection to request the standard USB Printer
+Class device ID. If vendor/product IDs match more than one attached device,
+also provide the matching `--bus-number` and `--device-address`; ReInk refuses
+to select one arbitrarily. It must remain separate from Epson D4 traffic. If
+an active Linux kernel driver owns the interface or macOS rejects the libusb
+claim, stop: ReInk deliberately provides no detachment, rebinding, installation,
+or workaround.
 
 ## Read-only validation matrix
 

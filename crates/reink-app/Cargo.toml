@@ -11,7 +11,7 @@ reink-core = { path = "../reink-core" }
 reink-d4 = { path = "../reink-d4" }
 reink-platform = { path = "../reink-platform" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 reink-usb = { path = "../reink-usb" }
 
 [dev-dependencies]

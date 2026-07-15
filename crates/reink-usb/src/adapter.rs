@@ -8,15 +8,17 @@ use rusb::{
 };
 
 use crate::{
-    EndpointDescriptor, SelectedUsbInterface, UsbInterfaceDescriptor, select_printer_interface,
+    EndpointDescriptor, SelectedUsbInterface, UsbDeviceDescriptor, UsbDeviceLocation,
+    UsbDeviceSelectionError, UsbDeviceSelector, UsbInterfaceDescriptor, select_printer_interface,
+    select_usb_device,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const GET_DEVICE_ID_REQUEST: u8 = 0;
 const DEVICE_ID_BUFFER_CAPACITY: usize = 1024;
 
-/// A claimed Linux USB printer interface backed by libusb.
-pub struct LinuxUsbTransport {
+/// A claimed read-only USB printer interface backed by libusb.
+pub struct ReadOnlyUsbTransport {
     _context: Context,
     handle: DeviceHandle<Context>,
     interface: u8,
@@ -26,16 +28,18 @@ pub struct LinuxUsbTransport {
     timeout: Duration,
 }
 
-impl LinuxUsbTransport {
-    /// Opens a selected inactive printer interface without modifying its driver.
+impl ReadOnlyUsbTransport {
+    /// Opens a selected printer interface without modifying its driver.
+    ///
+    /// Linux refuses interfaces owned by an active kernel driver. On macOS,
+    /// libusb claim failure is returned without a driver workaround.
     pub fn open(
-        vendor_id: u16,
-        product_id: u16,
+        device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
     ) -> Result<Self, UsbOpenError> {
         let context = Context::new().map_err(UsbOpenError::Context)?;
-        let device = find_device(&context, vendor_id, product_id)?;
-        Self::open_device(context, device, interface)
+        let usb_device = find_device(&context, device)?;
+        Self::open_device(context, usb_device, interface)
     }
 
     fn open_device(
@@ -45,6 +49,7 @@ impl LinuxUsbTransport {
     ) -> Result<Self, UsbOpenError> {
         let selected = selected_interface(&device, interface)?;
         let mut handle = device.open().map_err(UsbOpenError::Open)?;
+        #[cfg(target_os = "linux")]
         ensure_kernel_driver_inactive(&mut handle, selected.number)?;
         handle
             .claim_interface(selected.number)
@@ -64,17 +69,17 @@ impl LinuxUsbTransport {
 
 /// Reads the standard USB Printer Class device identifier without a protocol session.
 ///
-/// The selected interface must not have an active kernel driver. This function
-/// never detaches, rebinds, or otherwise modifies a driver.
+/// On Linux, the selected interface must not have an active kernel driver.
+/// This function never detaches, rebinds, or otherwise modifies a driver.
 pub fn read_printer_device_id(
-    vendor_id: u16,
-    product_id: u16,
+    device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<Vec<u8>, UsbOpenError> {
     let context = Context::new().map_err(UsbOpenError::Context)?;
-    let device = find_device(&context, vendor_id, product_id)?;
-    let selected = selected_interface(&device, interface)?;
-    let mut handle = device.open().map_err(UsbOpenError::Open)?;
+    let usb_device = find_device(&context, device)?;
+    let selected = selected_interface(&usb_device, interface)?;
+    let mut handle = usb_device.open().map_err(UsbOpenError::Open)?;
+    #[cfg(target_os = "linux")]
     ensure_kernel_driver_inactive(&mut handle, selected.number)?;
     handle
         .claim_interface(selected.number)
@@ -101,12 +106,11 @@ pub enum BoundedExchangeProbeResult {
 
 /// Sends a request and looks for an expected reply across at most `max_reads`.
 ///
-/// The selected interface must not have an active kernel driver. This function
-/// never detaches, rebinds, or otherwise modifies a driver. It never returns
-/// the collected reply bytes.
+/// On Linux, the selected interface must not have an active kernel driver.
+/// This function never detaches, rebinds, or otherwise modifies a driver. It
+/// never returns the collected reply bytes.
 pub fn probe_bounded_exchange(
-    vendor_id: u16,
-    product_id: u16,
+    device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
     request: &[u8],
     expected_reply: &[u8],
@@ -116,9 +120,10 @@ pub fn probe_bounded_exchange(
         return Err(UsbOpenError::EmptyExpectedReply);
     }
     let context = Context::new().map_err(UsbOpenError::Context)?;
-    let device = find_device(&context, vendor_id, product_id)?;
-    let selected = selected_interface(&device, interface)?;
-    let mut handle = device.open().map_err(UsbOpenError::Open)?;
+    let usb_device = find_device(&context, device)?;
+    let selected = selected_interface(&usb_device, interface)?;
+    let mut handle = usb_device.open().map_err(UsbOpenError::Open)?;
+    #[cfg(target_os = "linux")]
     ensure_kernel_driver_inactive(&mut handle, selected.number)?;
     handle
         .claim_interface(selected.number)
@@ -187,7 +192,7 @@ fn append_and_recognize(reply: &mut Vec<u8>, fragment: &[u8], expected_reply: &[
             .any(|window| window == expected_reply)
 }
 
-impl ByteTransport for LinuxUsbTransport {
+impl ByteTransport for ReadOnlyUsbTransport {
     fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
         self.handle
             .write_bulk(self.output_endpoint, data, self.timeout)
@@ -214,7 +219,7 @@ impl ByteTransport for LinuxUsbTransport {
     }
 }
 
-impl Drop for LinuxUsbTransport {
+impl Drop for ReadOnlyUsbTransport {
     fn drop(&mut self) {
         let _ = self.handle.release_interface(self.interface);
     }
@@ -222,22 +227,36 @@ impl Drop for LinuxUsbTransport {
 
 fn find_device(
     context: &Context,
-    vendor_id: u16,
-    product_id: u16,
+    selector: UsbDeviceSelector,
 ) -> Result<Device<Context>, UsbOpenError> {
-    context
-        .devices()
-        .map_err(UsbOpenError::Context)?
+    let devices = context.devices().map_err(UsbOpenError::Context)?;
+    let descriptors = devices
+        .iter()
+        .filter_map(|device| {
+            device
+                .device_descriptor()
+                .ok()
+                .map(|descriptor| UsbDeviceDescriptor {
+                    vendor_id: descriptor.vendor_id(),
+                    product_id: descriptor.product_id(),
+                    location: UsbDeviceLocation {
+                        bus_number: device.bus_number(),
+                        address: device.address(),
+                    },
+                })
+        })
+        .collect::<Vec<_>>();
+    let selected =
+        select_usb_device(&descriptors, selector).map_err(UsbOpenError::DeviceSelection)?;
+    devices
         .iter()
         .find(|device| {
-            device.device_descriptor().is_ok_and(|descriptor| {
-                descriptor.vendor_id() == vendor_id && descriptor.product_id() == product_id
-            })
+            device.bus_number() == selected.location.bus_number
+                && device.address() == selected.location.address
         })
-        .ok_or(UsbOpenError::DeviceNotFound {
-            vendor_id,
-            product_id,
-        })
+        .ok_or(UsbOpenError::DeviceSelection(
+            UsbDeviceSelectionError::NotFound { selector },
+        ))
 }
 
 fn selected_interface(
@@ -280,16 +299,19 @@ fn selected_interface(
         .ok_or(UsbOpenError::InterfaceNotFound { selector })
 }
 
+#[cfg(target_os = "linux")]
 trait KernelDriver {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error>;
 }
 
+#[cfg(target_os = "linux")]
 impl KernelDriver for DeviceHandle<Context> {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error> {
         DeviceHandle::kernel_driver_active(self, interface)
     }
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_kernel_driver_inactive<H: KernelDriver>(
     handle: &mut H,
     interface: u8,
@@ -350,10 +372,7 @@ fn transport_error(operation: &'static str, error: rusb::Error) -> TransportErro
 #[derive(Debug)]
 pub enum UsbOpenError {
     Context(rusb::Error),
-    DeviceNotFound {
-        vendor_id: u16,
-        product_id: u16,
-    },
+    DeviceSelection(UsbDeviceSelectionError),
     Descriptor(rusb::Error),
     InterfaceNotFound {
         selector: UsbInterfaceSelector,
@@ -379,13 +398,18 @@ impl fmt::Display for UsbOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Context(error) => write!(formatter, "libusb context failed: {error}"),
-            Self::DeviceNotFound {
-                vendor_id,
-                product_id,
-            } => write!(
+            Self::DeviceSelection(UsbDeviceSelectionError::NotFound { selector }) => write!(
                 formatter,
-                "USB device {vendor_id:04x}:{product_id:04x} was not found"
+                "USB device {:04x}:{:04x} was not found",
+                selector.vendor_id, selector.product_id
             ),
+            Self::DeviceSelection(UsbDeviceSelectionError::Ambiguous { selector, matches }) => {
+                write!(
+                    formatter,
+                    "USB device {:04x}:{:04x} matched {matches} devices; provide --bus-number and --device-address",
+                    selector.vendor_id, selector.product_id
+                )
+            }
             Self::Descriptor(error) => write!(formatter, "USB descriptor read failed: {error}"),
             Self::InterfaceNotFound { selector } => write!(
                 formatter,
@@ -434,8 +458,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{
-        BoundedExchangeProbeResult, KernelDriver, UsbOpenError, ensure_kernel_driver_inactive,
-        parse_device_id_response, read_bounded_reply,
+        BoundedExchangeProbeResult, UsbOpenError, parse_device_id_response, read_bounded_reply,
     };
 
     #[test]
@@ -461,8 +484,13 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    use super::{KernelDriver, ensure_kernel_driver_inactive};
+
+    #[cfg(target_os = "linux")]
     struct ActiveKernelDriver;
 
+    #[cfg(target_os = "linux")]
     impl KernelDriver for ActiveKernelDriver {
         fn kernel_driver_active(&mut self, _: u8) -> Result<bool, rusb::Error> {
             Ok(true)
@@ -470,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn refuses_to_detach_an_active_kernel_driver() {
         let error = ensure_kernel_driver_inactive(&mut ActiveKernelDriver, 3).unwrap_err();
 

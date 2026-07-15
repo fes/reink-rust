@@ -6,7 +6,7 @@ use std::fmt;
 
 use reink_core::{EepromReadReply, EpsonController, EpsonError, EpsonSpec, PrinterIdentity};
 use reink_d4::{ChannelId, D4Error, D4Link};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_platform::UsbInterfaceSelector;
 use reink_platform::{ByteTransport, TransportError};
 
@@ -23,20 +23,18 @@ pub enum EpsonD4EntryProbeResult {
     Unrecognized { received_bytes: usize },
 }
 
-/// Probes Epson D4 entry on a selected Linux USB interface without initializing D4.
+/// Probes Epson D4 entry on a selected Linux or macOS USB interface without initializing D4.
 ///
 /// The probe sends only the source-compatible Epson entry exchange. It does
 /// not initialize D4, open a service, access EEPROM, write printer state, or
 /// reset counters.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn probe_epson_d4_entry(
-    vendor_id: u16,
-    product_id: u16,
+    device: reink_usb::UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<EpsonD4EntryProbeResult, ApplicationError> {
     let result = reink_usb::probe_bounded_exchange(
-        vendor_id,
-        product_id,
+        device,
         interface,
         EPSON_D4_ENTRY_COMMAND,
         EPSON_D4_ENTRY_REPLY,
@@ -131,7 +129,7 @@ pub enum ApplicationError {
     Transport(TransportError),
     D4(D4Error),
     Epson(EpsonError),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Usb(reink_usb::UsbOpenError),
     EntryReplyMissing,
     EntryReplyInvalid,
@@ -143,7 +141,7 @@ impl fmt::Display for ApplicationError {
             Self::Transport(error) => write!(formatter, "transport error: {error}"),
             Self::D4(error) => write!(formatter, "D4 error: {error}"),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => write!(formatter, "USB error: {error}"),
             Self::EntryReplyMissing => formatter.write_str("Epson D4 entry reply was not received"),
             Self::EntryReplyInvalid => {
@@ -159,7 +157,7 @@ impl Error for ApplicationError {
             Self::Transport(error) => Some(error),
             Self::D4(error) => Some(error),
             Self::Epson(error) => Some(error),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => Some(error),
             Self::EntryReplyMissing | Self::EntryReplyInvalid => None,
         }
@@ -184,7 +182,7 @@ impl From<EpsonError> for ApplicationError {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl From<reink_usb::UsbOpenError> for ApplicationError {
     fn from(error: reink_usb::UsbOpenError) -> Self {
         Self::Usb(error)

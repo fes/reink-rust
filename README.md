@@ -31,7 +31,7 @@ hardware-ready.
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
 | Epson command execution and EEPROM read/write orchestration | Implemented with scripted transports |
 | Read-only Epson D4 application service | Implemented with scripted transports |
-| Linux USB bulk transport and descriptor selection | Implemented |
+| Linux and macOS USB bulk transport and descriptor selection | Implemented; no hardware validation claimed |
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB | Planned |
 | Read-only CLI | Implemented |
@@ -90,10 +90,10 @@ Current and planned workspace crates:
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
 | `reink-app` | Read-only Epson D4 session and entry-probe application services |
-| `reink-usb` | Linux-only libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
+| `reink-usb` | Read-only Linux and macOS libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
-| `reink-hardware-test` | Opt-in Linux hardware validation driver; read-only sequence only |
+| `reink-hardware-test` | Opt-in Linux and macOS read-only validation driver; hardware validation remains unclaimed |
 | `reink-cli` | Read-only model, identity, and mDNS discovery commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
 
@@ -102,12 +102,11 @@ network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
 without opening devices. Windows support must use a proper USB backend rather
 than assuming a POSIX-style device path.
 
-### USB backend and Windows driver policy
+### USB backend and driver policy
 
-Linux USB support will use a libusb-based adapter, likely through `rusb`, to
-select printer-class interfaces and exchange bulk-endpoint traffic. Existing
-Linux permissions and kernel-driver handling remain the responsibility of that
-adapter.
+Linux and macOS USB support use a libusb-based adapter through `rusb` to select
+printer-class interfaces and exchange bulk-endpoint traffic. Linux permissions
+and kernel-driver handling remain the responsibility of that adapter.
 
 Windows support will first investigate a native printer-stack adapter. It must
 prove that a normally installed printer can carry the D4 entry sequence,
@@ -131,27 +130,37 @@ than USB vendor/product attributes.
 
 ### `reink-usb`
 
-`reink-usb` uses `rusb` only on Linux. It selects alternate-setting-zero USB
-printer-class interfaces with both bulk-IN and bulk-OUT endpoints, claims the
-selected interface only when no kernel driver is active, and implements
-`ByteTransport` with bounded bulk I/O. Its optional bounded exchange probe is
-protocol-neutral: callers provide request bytes, expected reply bytes, and a
-read limit.
+`reink-usb` uses `rusb` on Linux and macOS. It selects alternate-setting-zero USB
+printer-class interfaces with both bulk-IN and bulk-OUT endpoints, refuses a
+Linux interface with an active kernel driver, and implements `ByteTransport`
+with bounded bulk I/O. Its optional bounded exchange probe is protocol-neutral:
+callers provide request bytes, expected reply bytes, and a read limit.
 It refuses to claim an interface with an active Linux kernel driver and never
-detaches, reattaches, rebinds, or otherwise modifies drivers.
+detaches, reattaches, rebinds, installs, or otherwise modifies drivers on
+either platform. macOS access uses only libusb's normal read/claim operations;
+if the system declines the claim, ReInk reports the error and provides no
+driver workaround.
 
 The Windows build contains no libusb transport and no driver-management code.
 Windows support remains contingent on the native printer-stack prototype
 described above.
 
 The concrete Linux transport must be built and exercised on Linux (or in
-Linux CI with libusb development headers). Cross-compiling it from Windows
-also requires a Linux C compiler and sysroot for `libusb1-sys`; the pure
-descriptor-selection tests remain host-independent.
+Linux CI with libusb development headers). The macOS adapter is compiled in
+macOS CI using `rusb`'s vendored libusb support; this is compilation and
+scripted-test coverage only, not hardware validation. Cross-compiling the Linux
+adapter from Windows also requires a Linux C compiler and sysroot for
+`libusb1-sys`; the pure descriptor-selection tests remain host-independent.
 
 For native Linux or WSL development, install `build-essential`, `pkg-config`,
 `libusb-1.0-0-dev`, and `libudev-dev`, then use the stable Linux Rust
 toolchain.
+
+For macOS development, use the stable Xcode command-line tools and Rust
+toolchain. No driver installation, detachment, rebinding, or manual workaround
+is part of setup. Use `system_profiler SPUSBDataType` to obtain the selected
+printer's vendor/product IDs and, when duplicate IDs are attached, its
+libusb-visible bus and address. A libusb claim failure is a stop condition.
 
 ### `reink-core`
 
@@ -207,7 +216,7 @@ compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
 exposes read-only identity and EEPROM operations. It also closes the service
 channel and terminates D4 through `shutdown()`.
 
-On Linux, `probe_epson_d4_entry` is the separate safe entry-probe API used by
+On Linux and macOS, `probe_epson_d4_entry` is the separate safe entry-probe API used by
 the CLI and hardware-test driver. It owns the Epson request and reply
 semantics while delegating bounded USB I/O to `reink-usb`; it stops before D4
 Init or service setup. The D4 entry exchange is tested only with scripted
@@ -264,16 +273,19 @@ cargo run -p reink-cli -- local-devices
 
 For a standard USB Printer Class identity read, select the exact device and
 interface. The command never enters Epson D4 mode and refuses to detach an
-active Linux kernel driver:
+active Linux kernel driver. If multiple devices share vendor/product IDs, add
+both `--bus-number` and `--device-address`; ReInk refuses to choose one
+arbitrarily:
 
 ```powershell
 cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
 
-Use your platform's USB listing tool to obtain the product and interface values.
-Do not guess them and do not use this command on Windows; its USB path is not
-supported. An active Linux kernel driver is a deliberate stop condition: ReInk
-will not detach it for any command.
+Use your platform's USB listing tool to obtain the product, interface, and any
+needed location values. Do not guess them and do not use this command on
+Windows; its USB path is not supported. An active Linux kernel driver or a
+failed macOS claim is a deliberate stop condition: ReInk will not detach,
+rebind, install, or work around a driver for any command.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service

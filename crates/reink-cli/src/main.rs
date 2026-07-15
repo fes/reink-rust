@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
@@ -13,7 +13,7 @@ use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
 use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_usb::read_printer_device_id;
 use serde_json::json;
 
@@ -58,6 +58,12 @@ enum Command {
         /// Explicit alternate setting for the printer interface.
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
+        /// Optional USB bus number; requires --device-address.
+        #[arg(long)]
+        bus_number: Option<u8>,
+        /// Optional USB device address; requires --bus-number.
+        #[arg(long)]
+        device_address: Option<u8>,
     },
     /// Probe only the Epson D4 entry reply; does not initialize D4 or open a service.
     UsbD4Probe {
@@ -69,6 +75,12 @@ enum Command {
         interface: u8,
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
+        /// Optional USB bus number; requires --device-address.
+        #[arg(long)]
+        bus_number: Option<u8>,
+        /// Optional USB device address; requires --bus-number.
+        #[arg(long)]
+        device_address: Option<u8>,
     },
 }
 
@@ -138,11 +150,15 @@ fn run(cli: Cli) -> Result<(), String> {
             product_id,
             interface,
             alternate_setting,
+            bus_number,
+            device_address,
         } => usb_identity_output(
             vendor_id,
             product_id,
             interface,
             alternate_setting,
+            bus_number,
+            device_address,
             cli.json,
         )?,
         Command::UsbD4Probe {
@@ -150,28 +166,33 @@ fn run(cli: Cli) -> Result<(), String> {
             product_id,
             interface,
             alternate_setting,
+            bus_number,
+            device_address,
         } => usb_d4_probe_output(
             vendor_id,
             product_id,
             interface,
             alternate_setting,
+            bus_number,
+            device_address,
             cli.json,
         )?,
     };
     write_stdout(&output)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn usb_d4_probe_output(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
     alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
     as_json: bool,
 ) -> Result<String, String> {
     let result = probe_epson_d4_entry(
-        vendor_id,
-        product_id,
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
@@ -194,15 +215,17 @@ fn usb_d4_probe_output(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn usb_d4_probe_output(
     _vendor_id: u16,
     _product_id: u16,
     _interface: u8,
     _alternate_setting: u8,
+    _bus_number: Option<u8>,
+    _device_address: Option<u8>,
     _as_json: bool,
 ) -> Result<String, String> {
-    Err("USB D4 probing is currently supported only on Linux".to_owned())
+    Err("USB D4 probing is currently supported only on Linux or macOS".to_owned())
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {
@@ -214,17 +237,37 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_err(|_| format!("expected a decimal or 0x-prefixed 16-bit integer, got {value:?}"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn usb_device_selector(
+    vendor_id: u16,
+    product_id: u16,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+) -> Result<reink_usb::UsbDeviceSelector, String> {
+    match (bus_number, device_address) {
+        (None, None) => Ok(reink_usb::UsbDeviceSelector::new(vendor_id, product_id)),
+        (Some(bus_number), Some(device_address)) => Ok(reink_usb::UsbDeviceSelector::at_location(
+            vendor_id,
+            product_id,
+            bus_number,
+            device_address,
+        )),
+        _ => Err("--bus-number and --device-address must be provided together".to_owned()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn usb_identity_output(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
     alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
     as_json: bool,
 ) -> Result<String, String> {
     let bytes = read_printer_device_id(
-        vendor_id,
-        product_id,
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
@@ -238,15 +281,17 @@ fn usb_identity_output(
     Ok(render_identity(&identity, &database, as_json))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn usb_identity_output(
     _vendor_id: u16,
     _product_id: u16,
     _interface: u8,
     _alternate_setting: u8,
+    _bus_number: Option<u8>,
+    _device_address: Option<u8>,
     _as_json: bool,
 ) -> Result<String, String> {
-    Err("USB identity inspection is currently supported only on Linux".to_owned())
+    Err("USB identity inspection is currently supported only on Linux or macOS".to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -417,6 +462,8 @@ mod tests {
                 product_id: 1234,
                 interface: 0,
                 alternate_setting: 0,
+                bus_number: None,
+                device_address: None,
             }
         ));
     }
@@ -448,5 +495,14 @@ mod tests {
         assert_eq!(super::parse_u16("0x04b8").unwrap(), 0x04b8);
         assert_eq!(super::parse_u16("1208").unwrap(), 1208);
         assert!(super::parse_u16("0xnope").is_err());
+    }
+
+    #[test]
+    fn requires_complete_optional_usb_location() {
+        assert!(super::usb_device_selector(0x04b8, 0x1234, Some(1), None).is_err());
+        assert_eq!(
+            super::usb_device_selector(0x04b8, 0x1234, Some(1), Some(2)).unwrap(),
+            reink_usb::UsbDeviceSelector::at_location(0x04b8, 0x1234, 1, 2)
+        );
     }
 }
