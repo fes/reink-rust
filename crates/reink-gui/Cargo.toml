@@ -1,0 +1,11 @@
+[package]
+name = "reink-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only fixture-backed graphical user interface for ReInk"
+
+[dependencies]
+eframe = "0.35"
+reink-core = { path = "../reink-core" }

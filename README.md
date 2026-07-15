@@ -70,7 +70,7 @@ an async runtime.
 ## Architecture
 
 ```text
-CLI / terminal UI
+CLI / terminal UI / fixture GUI
         |
 application service
         |
@@ -96,6 +96,7 @@ Current and planned workspace crates:
 | `reink-hardware-test` | Opt-in Linux and macOS read-only validation driver; hardware validation remains unclaimed |
 | `reink-cli` | Read-only model, identity, and mDNS discovery commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
+| `reink-gui` | Optional fixture-backed graphical read-only mockup with no transport dependencies |
 
 `reink-platform` supports USB selectors, explicit device paths, and IPv4/IPv6
 network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
@@ -375,6 +376,23 @@ and `Esc` or `Q` to return or exit. Use `I` to type and locally parse an IEEE
 the separate CLI discovery and Linux hardware-preflight workflows, but never
 runs them or opens a device.
 
+### `reink-gui`
+
+`reink-gui` is an optional native GUI built with `egui`/`eframe`. It is
+separate from `reink-tui` and depends only on `reink-core`; it has no USB,
+SNMP, D4, or other transport dependency. It uses deterministic internal
+fixtures to display the safety boundary, select a fixture device, resolve its
+IEEE 1284 identity against the bundled model database, inspect an ordered
+success/blocked/failure validation report, and browse mock EEPROM rows. It
+contains no write or reset control.
+
+The GUI is excluded from the workspace default members, so base CLI builds do
+not require it. Build and run it explicitly on Windows, Linux, or macOS:
+
+```powershell
+cargo run -p reink-gui
+```
+
 ## Protocol provenance
 
 The port distinguishes standards conformance from source-compatible or
@@ -395,9 +413,9 @@ These instructions assume a stock operating system and a new checkout. They
 are deliberately explicit so a human or coding agent can follow them without
 making USB-driver changes.
 
-### Windows: build, test, and read-only UI
+### Windows: build, test, and read-only UIs
 
-Windows supports the workspace's pure crates, CLI, terminal UI, mDNS, and SNMP
+Windows supports the workspace's pure crates, CLI, terminal UI, fixture GUI, mDNS, and SNMP
 paths. Native Windows USB access is **not supported**. Do not install, replace,
 detach, rebind, or restore a printer driver for ReInk.
 
@@ -428,10 +446,21 @@ cargo run -p reink-cli -- models
 cargo run -p reink-cli -- --json models
 cargo run -p reink-cli -- discover --timeout-seconds 3
 cargo run -p reink-tui
+cargo run -p reink-gui
 ```
 
 `local-devices` and `usb-id` return an unsupported-platform error on Windows;
 that is intentional.
+
+### macOS: fixture GUI
+
+The optional fixture GUI is supported on macOS and requires no USB access or
+printer configuration. Install the current stable Xcode command-line tools and
+Rust toolchain, then run:
+
+```bash
+cargo run -p reink-gui
+```
 
 ### Linux: build, test, and read-only USB preflight
 
@@ -469,6 +498,7 @@ Run the safe local tools:
 cargo run -p reink-cli -- models
 cargo run -p reink-cli -- local-devices
 cargo run -p reink-tui
+cargo run -p reink-gui
 ```
 
 For a physical USB printer, follow
@@ -508,7 +538,7 @@ Hardware smoke tests, when added, will be opt-in and require an explicitly
 selected device.
 
 GitHub Actions runs this same formatting, Clippy, and test sequence on current
-Linux and Windows runners. Tagged `v*` revisions and manual dispatch create
+Linux, macOS, and Windows runners. Tagged `v*` revisions and manual dispatch create
 release-build artifacts for the read-only CLI, hardware-test driver, and TUI;
 publishing a release remains a maintainer action after reviewing those
 artifacts.
