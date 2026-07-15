@@ -65,6 +65,15 @@ impl PrinterIdentity {
         self.field("MDL")
     }
 
+    /// Returns the source-compatible Epson database model candidate.
+    ///
+    /// Epson IEEE 1284 IDs commonly append ` Series`, while the bundled model
+    /// database stores the base model name.
+    pub fn detected_model(&self) -> Option<&str> {
+        self.model()
+            .map(|model| model.strip_suffix(" Series").unwrap_or(model))
+    }
+
     pub fn serial_number(&self) -> Option<&str> {
         self.field("SN")
     }
@@ -111,6 +120,7 @@ mod tests {
 
         assert_eq!(identity.manufacturer(), Some("EPSON"));
         assert_eq!(identity.model(), Some("XP-352 Series"));
+        assert_eq!(identity.detected_model(), Some("XP-352"));
         assert_eq!(identity.serial_number(), Some("123"));
         assert_eq!(identity.command_set(), ["ESCPL2", "BDC"]);
     }

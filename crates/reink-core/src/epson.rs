@@ -4,6 +4,8 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::PrinterIdentity;
+
 pub const BUILTIN_EPSON_TOML: &str = include_str!("../assets/epson.toml");
 
 /// Number of bytes used to encode an EEPROM address.
@@ -168,6 +170,11 @@ impl ModelDatabase {
 
     pub fn get(&self, model: &str) -> Option<&EpsonSpec> {
         self.models.get(model)
+    }
+
+    /// Resolves a database specification from a normalized IEEE 1284 identity.
+    pub fn resolve_identity(&self, identity: &PrinterIdentity) -> Option<&EpsonSpec> {
+        identity.detected_model().and_then(|model| self.get(model))
     }
 
     pub fn models(&self) -> impl Iterator<Item = &str> {

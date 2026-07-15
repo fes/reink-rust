@@ -75,11 +75,10 @@ fn read_sequence(
         std::str::from_utf8(&bytes).map_err(|_| "USB device ID is not UTF-8")?,
     )
     .map_err(|error| error.to_string())?;
-    let model = identity.model().unwrap_or_default();
-    let known_model = ModelDatabase::builtin()
-        .map_err(|error| error.to_string())?
-        .get(model)
-        .is_some();
+    let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+    let resolved_model = database
+        .resolve_identity(&identity)
+        .map(|spec| spec.model.as_str());
     let entry =
         probe_d4_entry(vendor_id, product_id, selector).map_err(|error| error.to_string())?;
     let d4_entry = match entry {
@@ -93,7 +92,8 @@ fn read_sequence(
         "mode": "read_only",
         "usb": {"vendor_id": format!("{vendor_id:04x}"), "product_id": format!("{product_id:04x}"), "interface": interface, "alternate_setting": alternate_setting},
         "identity": identity.fields(),
-        "model_database_match": known_model,
+        "detected_model": identity.detected_model(),
+        "resolved_model": resolved_model,
         "d4_entry": d4_entry,
         "next_step": "D4 Init and EPSON-CTRL are intentionally not implemented in this driver yet"
     }).to_string())
