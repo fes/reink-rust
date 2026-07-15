@@ -264,6 +264,15 @@ Do not guess them and do not use this command on Windows; its USB path is not
 supported. An active Linux kernel driver is a deliberate stop condition: ReInk
 will not detach it for any command.
 
+`usb-d4-probe` is a separate, opt-in capture-only command. It sends the
+source-compatible Epson entry sequence and stops before D4 Init, service
+opening, EEPROM access, writes, or resets. It reports only a recognized reply
+or a bounded byte count:
+
+```powershell
+cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number>
+```
+
 `snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
 credentials from the process environment:
 

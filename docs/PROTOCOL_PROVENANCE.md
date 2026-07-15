@@ -28,7 +28,7 @@ original words, and keep the licensed document outside the repository.
 | D4 init, service lookup, channel open, credits | `reink-d4/src/link.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `D4Link`, `TXChannel`, and `Channel` | IEEE 1284.4 state-machine rules | Reviewed; peer transactions, open/close/Exit covered by unit tests |
 | Epson D4 entry sequence and `EPSON-CTRL` service | `reink-app/src/lib.rs` | C: `reinkpy/epson.py` (`EpsonD4._init_link`) | Epson documentation or sanitized capture | Scripted read-only session implemented; hardware evidence required |
 | IEEE 1284 device ID | `reink-core/src/identity.rs` | C: `reinkpy/__init__.py` parser | IEEE 1284 device-ID definition | Pending review |
-| USB printer interface selection | `reink-usb/src/descriptor.rs` | C: `reinkpy/usb.py` | USB-IF Printer Device Class 1.1 | Linux implementation exists; clause-level review pending |
+| USB printer interface selection and standard device ID | `reink-usb/src/descriptor.rs`, `linux.rs` | C: `reinkpy/usb.py`; sanitized Linux preflight | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-D4 device-ID read succeeded on one selected printer; an active-driver refusal succeeded on another; clause-level review pending |
 | SNMP printer identification | `reink-snmp/src/lib.rs` | C: `reinkpy/snmp.py`; RFC 3805 for standard MIB context | RFC 3805 where applicable; Epson enterprise MIB for private OIDs | Adapter and deterministic OID tests implemented; private OID evidence still required |
 | Epson EEPROM factory commands | `reink-core/src/command.rs`, `controller.rs` | C: `reinkpy/epson.py`, model TOML | Epson documentation or sanitized capture | Scripted execution implemented; hardware evidence still required |
 

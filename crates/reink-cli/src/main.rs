@@ -12,7 +12,7 @@ use reink_discovery::MdnsDiscovery;
 use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
 #[cfg(target_os = "linux")]
-use reink_usb::read_printer_device_id;
+use reink_usb::{D4EntryProbeResult, probe_d4_entry, read_printer_device_id};
 use serde_json::{Map, Value, json};
 
 #[derive(Parser, Debug)]
@@ -54,6 +54,17 @@ enum Command {
         #[arg(long)]
         interface: u8,
         /// Explicit alternate setting for the printer interface.
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+    },
+    /// Probe only the Epson D4 entry reply; does not initialize D4 or open a service.
+    UsbD4Probe {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
         #[arg(long, default_value_t = 0)]
         alternate_setting: u8,
     },
@@ -130,8 +141,64 @@ fn run(cli: Cli) -> Result<(), String> {
             alternate_setting,
             cli.json,
         )?,
+        Command::UsbD4Probe {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+        } => usb_d4_probe_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            cli.json,
+        )?,
     };
     write_stdout(&output)
+}
+
+#[cfg(target_os = "linux")]
+fn usb_d4_probe_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    as_json: bool,
+) -> Result<String, String> {
+    let result = probe_d4_entry(
+        vendor_id,
+        product_id,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let (status, received_bytes) = match result {
+        D4EntryProbeResult::Recognized => ("recognized", None),
+        D4EntryProbeResult::Unrecognized { received_bytes } => {
+            ("unrecognized", Some(received_bytes))
+        }
+    };
+    Ok(if as_json {
+        json!({ "d4_entry": status, "received_bytes": received_bytes }).to_string()
+    } else {
+        match received_bytes {
+            Some(count) => format!("D4 entry reply: {status} ({count} bytes received)"),
+            None => format!("D4 entry reply: {status}"),
+        }
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_d4_probe_output(
+    _vendor_id: u16,
+    _product_id: u16,
+    _interface: u8,
+    _alternate_setting: u8,
+    _as_json: bool,
+) -> Result<String, String> {
+    Err("USB D4 probing is currently supported only on Linux".to_owned())
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {

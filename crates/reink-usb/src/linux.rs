@@ -14,6 +14,9 @@ use crate::{
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const GET_DEVICE_ID_REQUEST: u8 = 0;
 const DEVICE_ID_BUFFER_CAPACITY: usize = 1024;
+const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@EJL\n";
+const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
+const ENTRY_REPLY_READ_LIMIT: usize = 5;
 
 /// A claimed Linux USB printer interface backed by libusb.
 pub struct LinuxUsbTransport {
@@ -88,6 +91,76 @@ pub fn read_printer_device_id(
         Err(error) => Err(error),
         Ok(device_id) => release.map(|()| device_id),
     }
+}
+
+/// Outcome of a bounded Epson D4 entry probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum D4EntryProbeResult {
+    /// The source-compatible entry reply was recognized.
+    Recognized,
+    /// The device replied, but its bytes did not match the known entry reply.
+    Unrecognized { received_bytes: usize },
+}
+
+/// Sends only the source-compatible Epson D4 entry sequence and reads its reply.
+///
+/// This probe does not initialize D4, open a service, read EEPROM, write
+/// printer state, or reset counters. It never returns raw reply bytes.
+pub fn probe_d4_entry(
+    vendor_id: u16,
+    product_id: u16,
+    interface: UsbInterfaceSelector,
+) -> Result<D4EntryProbeResult, UsbOpenError> {
+    let context = Context::new().map_err(UsbOpenError::Context)?;
+    let device = find_device(&context, vendor_id, product_id)?;
+    let selected = selected_interface(&device, interface)?;
+    let mut handle = device.open().map_err(UsbOpenError::Open)?;
+    ensure_kernel_driver_inactive(&mut handle, selected.number)?;
+    handle
+        .claim_interface(selected.number)
+        .map_err(UsbOpenError::Claim)?;
+
+    let result = probe_d4_entry_with_claimed_handle(&mut handle, &selected);
+    let release = handle
+        .release_interface(selected.number)
+        .map_err(UsbOpenError::Release);
+    match result {
+        Err(error) => Err(error),
+        Ok(outcome) => release.map(|()| outcome),
+    }
+}
+
+fn probe_d4_entry_with_claimed_handle(
+    handle: &mut DeviceHandle<Context>,
+    selected: &SelectedUsbInterface,
+) -> Result<D4EntryProbeResult, UsbOpenError> {
+    handle
+        .write_bulk(
+            selected.output.address,
+            EPSON_D4_ENTRY_COMMAND,
+            DEFAULT_TIMEOUT,
+        )
+        .map_err(UsbOpenError::WriteD4Entry)?;
+    let mut reply = Vec::new();
+    let mut buffer = [0; 256];
+    for _ in 0..ENTRY_REPLY_READ_LIMIT {
+        match handle.read_bulk(selected.input.address, &mut buffer, DEFAULT_TIMEOUT) {
+            Ok(count) => {
+                reply.extend_from_slice(&buffer[..count]);
+                if reply
+                    .windows(EPSON_D4_ENTRY_REPLY.len())
+                    .any(|window| window == EPSON_D4_ENTRY_REPLY)
+                {
+                    return Ok(D4EntryProbeResult::Recognized);
+                }
+            }
+            Err(rusb::Error::Timeout) => break,
+            Err(error) => return Err(UsbOpenError::ReadD4Entry(error)),
+        }
+    }
+    Ok(D4EntryProbeResult::Unrecognized {
+        received_bytes: reply.len(),
+    })
 }
 
 impl ByteTransport for LinuxUsbTransport {
@@ -268,6 +341,8 @@ pub enum UsbOpenError {
     },
     Claim(rusb::Error),
     ReadDeviceId(rusb::Error),
+    WriteD4Entry(rusb::Error),
+    ReadD4Entry(rusb::Error),
     Release(rusb::Error),
     InvalidDeviceIdLength {
         received: usize,
@@ -302,6 +377,12 @@ impl fmt::Display for UsbOpenError {
             Self::Claim(error) => write!(formatter, "claiming USB interface failed: {error}"),
             Self::ReadDeviceId(error) => {
                 write!(formatter, "reading USB printer device ID failed: {error}")
+            }
+            Self::WriteD4Entry(error) => {
+                write!(formatter, "writing Epson D4 entry probe failed: {error}")
+            }
+            Self::ReadD4Entry(error) => {
+                write!(formatter, "reading Epson D4 entry probe failed: {error}")
             }
             Self::Release(error) => write!(formatter, "releasing USB interface failed: {error}"),
             Self::InvalidDeviceIdLength { received, declared } => write!(
