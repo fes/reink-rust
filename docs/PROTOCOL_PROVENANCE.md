@@ -92,10 +92,11 @@ in the test comment only when it is available under the project's license.
 
 ## Vendor-command safety gate
 
-The EEPROM factory-command encoder is intentionally not connected to a
-transport yet. Before enabling a read operation, retain a sanitized request
-and response fixture for each supported address-width family. Before enabling
-a write or reset operation, require all of the following:
+The EEPROM factory **write** encoder is intentionally not connected to any
+public hardware workflow. The read-only hardware driver may issue explicitly
+selected EEPROM reads to collect the sanitized request/response evidence needed
+for each supported address-width family. Before enabling a write or reset
+operation, require all of the following:
 
 1. Vendor documentation or repeatable capture evidence for the exact model
    family and command.
