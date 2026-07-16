@@ -754,9 +754,12 @@ impl ReinkGui {
         let value_width = 60.0;
         let field_panel_width = address_width + field_column_width + value_width + 32.0;
         let dump_panel_width = 600.0;
+        let dump_panel_height = 48.0
+            + bytes.chunks(16).count() as f32
+                * (ui.text_style_height(&egui::TextStyle::Body) + 4.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
-                egui::vec2(field_panel_width, 430.0),
+                egui::vec2(field_panel_width, dump_panel_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.heading("Fields");
@@ -835,11 +838,33 @@ impl ReinkGui {
                                 }
                             }
                         });
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        let mut direct_editing = false;
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(
+                                &mut direct_editing,
+                                "Enable direct EEPROM editing",
+                            ),
+                        );
+                    });
+                    ui.label("Unavailable until hardware evidence and safety review authorize it.");
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Selected field: {} at 0x{selected_address:04X}",
+                                selected_label
+                            ));
+                            let mut value = format!("0x{selected_value:02X}");
+                            ui.add(egui::TextEdit::singleline(&mut value).desired_width(80.0));
+                        });
+                    });
                 },
             );
             ui.separator();
             ui.allocate_ui_with_layout(
-                egui::vec2(dump_panel_width, 430.0),
+                egui::vec2(dump_panel_width, dump_panel_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::default()
@@ -847,52 +872,46 @@ impl ReinkGui {
                         .inner_margin(egui::Margin::same(4))
                         .show(ui, |ui| {
                             ui.heading("Hex dump");
-                            egui::ScrollArea::both()
-                                .id_salt("fixture-eeprom-dump")
-                                .max_height(358.0)
+                            egui::Grid::new("fixture-eeprom-dump-grid")
+                                .num_columns(3)
+                                .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
-                                    egui::Grid::new("fixture-eeprom-dump-grid")
-                                        .num_columns(3)
-                                        .spacing([12.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.strong("Address");
-                                            ui.strong("Bytes");
-                                            ui.strong("ASCII");
-                                            ui.end_row();
+                                    ui.strong("Address");
+                                    ui.strong("Bytes");
+                                    ui.strong("ASCII");
+                                    ui.end_row();
 
-                                            for (line, chunk) in bytes.chunks(16).enumerate() {
-                                                let line_address = self
-                                                    .loaded_eeprom
-                                                    .as_ref()
-                                                    .map(|file| file.start_address + line * 16)
-                                                    .unwrap_or(line * 16);
-                                                ui.monospace(format!("{line_address:04X}"));
-                                                ui.horizontal(|ui| {
-                                                    for (index, byte) in chunk.iter().enumerate() {
-                                                        let address = line_address + index;
-                                                        if ui
-                                                            .add(
-                                                                egui::Label::new(dump_cell(
-                                                                    format!("{byte:02X}"),
-                                                                    address == selected_address,
-                                                                ))
-                                                                .sense(egui::Sense::click()),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            selected_address_from_dump =
-                                                                Some(address);
-                                                        }
-                                                    }
-                                                });
-                                                ui.label(ascii_dump_line(
-                                                    chunk,
-                                                    line_address,
-                                                    selected_address,
-                                                ));
-                                                ui.end_row();
+                                    for (line, chunk) in bytes.chunks(16).enumerate() {
+                                        let line_address = self
+                                            .loaded_eeprom
+                                            .as_ref()
+                                            .map(|file| file.start_address + line * 16)
+                                            .unwrap_or(line * 16);
+                                        ui.monospace(format!("{line_address:04X}"));
+                                        ui.horizontal(|ui| {
+                                            for (index, byte) in chunk.iter().enumerate() {
+                                                let address = line_address + index;
+                                                if ui
+                                                    .add(
+                                                        egui::Label::new(dump_cell(
+                                                            format!("{byte:02X}"),
+                                                            address == selected_address,
+                                                        ))
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    selected_address_from_dump = Some(address);
+                                                }
                                             }
                                         });
+                                        ui.label(ascii_dump_line(
+                                            chunk,
+                                            line_address,
+                                            selected_address,
+                                        ));
+                                        ui.end_row();
+                                    }
                                 });
                         });
                 },
@@ -901,25 +920,6 @@ impl ReinkGui {
         if let Some(address) = selected_address_from_dump {
             self.select_eeprom_address(address);
         }
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            let mut direct_editing = false;
-            ui.add_enabled(
-                false,
-                egui::Checkbox::new(&mut direct_editing, "Enable direct EEPROM editing"),
-            );
-            ui.label("Unavailable until hardware evidence and safety review authorize it.");
-        });
-        ui.add_enabled_ui(false, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Selected field: {} at 0x{selected_address:04X}",
-                    selected_label
-                ));
-                let mut value = format!("0x{selected_value:02X}");
-                ui.add(egui::TextEdit::singleline(&mut value).desired_width(80.0));
-            });
-        });
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
