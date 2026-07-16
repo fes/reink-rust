@@ -1,16 +1,19 @@
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
+use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
 use reink_core::{ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reink_platform::RecordingTransport;
 use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -81,6 +84,27 @@ enum Command {
         /// Optional USB device address; requires --bus-number.
         #[arg(long)]
         device_address: Option<u8>,
+    },
+    /// Read a complete model-bounded EEPROM image and save it as a new binary file.
+    UsbEepromDump {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        /// Exact model identity established by a prior read-only identity operation.
+        #[arg(long)]
+        model: String,
+        /// New private binary image path. Existing files are never overwritten.
+        #[arg(long)]
+        output_file: std::path::PathBuf,
     },
 }
 
@@ -175,6 +199,26 @@ fn run(cli: Cli) -> Result<(), String> {
             alternate_setting,
             bus_number,
             device_address,
+            cli.json,
+        )?,
+        Command::UsbEepromDump {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            output_file,
+        } => usb_eeprom_dump_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            &output_file,
             cli.json,
         )?,
     };
@@ -279,6 +323,131 @@ fn usb_identity_output(
     let identity = PrinterIdentity::parse(identifier).map_err(|error| error.to_string())?;
     let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
     Ok(render_identity(&identity, &database, as_json))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_dump_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    output_file: &Path,
+    as_json: bool,
+) -> Result<String, String> {
+    if output_file.exists() {
+        return Err(format!(
+            "refusing to overwrite existing EEPROM image: {}",
+            output_file.display()
+        ));
+    }
+    if let Some(parent) = output_file.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "EEPROM image parent directory does not exist: {}",
+            parent.display()
+        ));
+    }
+
+    let spec = ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .ok_or_else(|| format!("unknown model: {model}"))?
+        .clone();
+    let transport = reink_usb::ReadOnlyUsbTransport::open(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut session = EpsonD4Session::connect(RecordingTransport::new(transport), spec)
+        .map_err(|error| error.to_string())?;
+    let dump = session.dump_eeprom();
+    let shutdown = session.shutdown();
+    let (mut transport, _) = session.into_transport().into_parts();
+    let close = transport.close();
+    let image = match (dump, shutdown, close) {
+        (Ok(image), Ok(()), Ok(())) => image,
+        (Err(dump), Ok(()), Ok(())) => return Err(format!("EEPROM dump failed: {dump}")),
+        (Ok(_), Err(shutdown), Ok(())) => return Err(format!("D4 shutdown failed: {shutdown}")),
+        (Ok(_), Ok(()), Err(close)) => return Err(format!("USB transport close failed: {close}")),
+        (Err(dump), Err(shutdown), Err(close)) => {
+            return Err(format!(
+                "EEPROM dump failed: {dump}; D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
+            ));
+        }
+        (Err(dump), Err(shutdown), Ok(())) => {
+            return Err(format!(
+                "EEPROM dump failed: {dump}; D4 shutdown failed: {shutdown}"
+            ));
+        }
+        (Err(dump), Ok(()), Err(close)) => {
+            return Err(format!(
+                "EEPROM dump failed: {dump}; USB transport close failed: {close}"
+            ));
+        }
+        (Ok(_), Err(shutdown), Err(close)) => {
+            return Err(format!(
+                "D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
+            ));
+        }
+    };
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_file)
+        .and_then(|mut file| file.write_all(&image.bytes))
+        .map_err(|error| {
+            format!(
+                "could not save EEPROM image {}: {error}",
+                output_file.display()
+            )
+        })?;
+
+    Ok(if as_json {
+        json!({
+            "mode": "read_only",
+            "model": image.model,
+            "start_address": format!("{:04X}", image.start_address),
+            "end_address": format!("{:04X}", image.end_address()),
+            "byte_count": image.bytes.len(),
+            "output_file": output_file,
+        })
+        .to_string()
+    } else {
+        format!(
+            "Saved {}-byte EEPROM image for {} ({:#06x}..={:#06x}) to {}",
+            image.bytes.len(),
+            image.model,
+            image.start_address,
+            image.end_address(),
+            output_file.display()
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_dump_output(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: &Path,
+    _: bool,
+) -> Result<String, String> {
+    Err("USB EEPROM dumps are currently supported only on Linux or macOS".to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

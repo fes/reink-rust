@@ -124,6 +124,11 @@ stops before D4 Init and may leave a printer awaiting D4 traffic, so the
 automated runner passes `--skip-d4-entry-probe` and lets each later D4 command
 start and close its own session.
 
+After every evidence command succeeds, the automated Linux runner invokes the
+durable `reink-cli usb-eeprom-dump` workflow and saves a new private
+`eeprom-image.bin` beside the reports. It is a model-bounded read-only image,
+not a hardware-test report or write authorization.
+
 ### Automated Linux run
 
 For the standard complete evidence sequence, use the companion

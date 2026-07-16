@@ -71,19 +71,19 @@ detach or hand off a driver, issue a control request, send D4 or EEPROM
 traffic, or enable writes. No GUI driver-handoff control is present. Selecting
 a candidate clears the raw EEPROM source; selecting a fixture or raw file
 clears the candidate. A candidate has no identity or EEPROM data and makes
-connected operations and fixture validation unavailable until a future explicit
-read-only operation exists. That future selected-printer operation must restore
-the prior association after using an existing driver for the selected interface;
-do not add an operation merely to perform handoff. On Windows, native USB
+fixture validation unavailable until an explicit read-only operation is selected.
+For a candidate with exactly one model hint, **Read EEPROM** confirms the
+printer identity, performs the model-bounded dump, restores the selected
+interface association, and shows the in-memory image. On Windows, native USB
 descriptor enumeration is unavailable; raw EEPROM inspection remains available, while fixtures require
 the explicit `--fixtures` launch mode.
 
 ## Safety and diagnostics
 
 The GUI remains transport-free for fixtures and descriptor candidates. Debug
-traffic is a live, opt-in, bounded in-memory session-only pane for future
-recorded-session TX/RX events. Selecting a descriptor candidate alone
-produces no traffic; only a future explicit connected read-only operation can
-append records. No current GUI operation emits events or exports them.
+traffic is a live, opt-in, bounded in-memory session-only pane for
+recorded-session TX/RX events. Selecting a descriptor candidate alone produces
+no traffic; an explicit **Read EEPROM** operation can append its records. No
+GUI operation exports them.
 Persistent printer writes and counter resets remain unavailable until the
 separate hardware-evidence and safety-review gates are complete.

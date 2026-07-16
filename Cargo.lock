@@ -3276,6 +3276,7 @@ name = "reink-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "reink-app",
  "reink-core",
  "reink-platform",
  "reink-usb",

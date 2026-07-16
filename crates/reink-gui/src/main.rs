@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
 
 use eframe::egui::{self, Color32, RichText};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reink_app::{EepromImage, EpsonD4Session};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reink_core::ModelDatabase;
 use reink_gui::{
     DebugTrafficTrace, DescriptorCandidate, GuiState, Page, SourceMode, ValidationStatus,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reink_platform::RecordingTransport;
 use reink_platform::TransportEvent;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -37,6 +43,9 @@ pub struct ReinkGui {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     usb_scan_receiver: Option<Receiver<Result<Vec<reink_usb::UsbPrinterCandidate>, String>>>,
     file_error: Option<String>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    usb_dump_receiver: Option<Receiver<UsbEepromDumpOutcome>>,
+    usb_dump_error: Option<String>,
     debug_traffic: DebugTrafficTrace,
     debug_height: f32,
 }
@@ -44,6 +53,7 @@ pub struct ReinkGui {
 struct LoadedEeprom {
     path: String,
     bytes: Vec<u8>,
+    start_address: usize,
     selected_offset: usize,
     model: Option<String>,
 }
@@ -61,6 +71,12 @@ enum UsbScanStatus {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Failed(String),
     Unavailable,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct UsbEepromDumpOutcome {
+    result: Result<EepromImage, String>,
+    events: Vec<TransportEvent>,
 }
 
 fn source_mode_from_args(arguments: impl IntoIterator<Item = String>) -> SourceMode {
@@ -88,6 +104,9 @@ impl ReinkGui {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             usb_scan_receiver: None,
             file_error: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            usb_dump_receiver: None,
+            usb_dump_error: None,
             debug_traffic: DebugTrafficTrace::new(),
             debug_height: 180.0,
         };
@@ -144,7 +163,7 @@ impl ReinkGui {
     fn selected_address(&self) -> usize {
         self.loaded_eeprom
             .as_ref()
-            .map(|file| file.selected_offset)
+            .map(|file| file.start_address + file.selected_offset)
             .unwrap_or(self.state.selected_eeprom_row().address as usize)
     }
 
@@ -201,8 +220,11 @@ impl ReinkGui {
 
     fn select_eeprom_address(&mut self, address: usize) {
         if let Some(file) = &mut self.loaded_eeprom {
-            if address < file.bytes.len() {
-                file.selected_offset = address;
+            if address >= file.start_address {
+                let offset = address - file.start_address;
+                if offset < file.bytes.len() {
+                    file.selected_offset = offset;
+                }
             }
         } else if let Some(index) = self
             .state
@@ -226,22 +248,26 @@ impl ReinkGui {
         match std::fs::read(&path) {
             Ok(bytes) if bytes.is_empty() => {
                 self.file_error = Some("The selected EEPROM file is empty.".to_owned());
+                self.usb_dump_error = None;
             }
             Ok(bytes) => {
                 self.loaded_eeprom = Some(LoadedEeprom {
                     path: path.display().to_string(),
                     bytes,
+                    start_address: 0,
                     selected_offset: 0,
                     model: None,
                 });
                 self.selected_usb_candidate = None;
                 self.selected_fixture = None;
                 self.file_error = None;
+                self.usb_dump_error = None;
                 self.show_validation_report = false;
                 self.state.navigate_to(Page::Eeprom);
             }
             Err(error) => {
                 self.file_error = Some(format!("Unable to open EEPROM file: {error}"));
+                self.usb_dump_error = None;
             }
         }
     }
@@ -307,6 +333,81 @@ impl ReinkGui {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn poll_usb_candidates(&mut self) {}
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn usb_dump_in_progress(&self) -> bool {
+        self.usb_dump_receiver.is_some()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_usb_eeprom_dump(&mut self) {
+        let result =
+            self.usb_dump_receiver
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(UsbEepromDumpOutcome {
+                        result: Err(
+                            "The selected-printer EEPROM dump stopped unexpectedly.".to_owned()
+                        ),
+                        events: Vec::new(),
+                    }),
+                });
+        let Some(result) = result else {
+            return;
+        };
+
+        self.usb_dump_receiver = None;
+        let UsbEepromDumpOutcome { result, events } = result;
+        if !events.is_empty() {
+            self.append_recorded_transport_events(events);
+        }
+        match result {
+            Ok(image) => {
+                self.loaded_eeprom = Some(LoadedEeprom {
+                    path: format!("USB dump: {}", image.model),
+                    bytes: image.bytes,
+                    start_address: usize::from(image.start_address),
+                    selected_offset: 0,
+                    model: Some(image.model),
+                });
+                self.selected_usb_candidate = None;
+                self.selected_fixture = None;
+                self.file_error = None;
+                self.usb_dump_error = None;
+                self.show_validation_report = false;
+                self.state.navigate_to(Page::Eeprom);
+            }
+            Err(error) => self.usb_dump_error = Some(error),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn poll_usb_eeprom_dump(&mut self) {}
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn start_selected_usb_eeprom_dump(&mut self) {
+        if self.usb_dump_receiver.is_some() {
+            return;
+        }
+        let Some(candidate) = self.selected_usb_candidate().cloned() else {
+            return;
+        };
+        if candidate.model_hints.len() != 1 {
+            self.usb_dump_error = Some(
+                "Selected printer candidate must resolve to exactly one model hint before dumping EEPROM.".to_owned(),
+            );
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.usb_dump_receiver = Some(receiver);
+        self.usb_dump_error = None;
+        std::thread::spawn(move || {
+            let outcome = dump_selected_usb_eeprom(candidate);
+            let _ = sender.send(outcome);
+        });
+    }
 
     fn tab_strip_pane(&mut self, ui: &mut egui::Ui) {
         ui.allocate_ui_with_layout(
@@ -501,6 +602,17 @@ impl ReinkGui {
             ui.label("Hints are not identity confirmation.");
             ui.strong("No printer connection has been opened");
             ui.label("Identity/EEPROM reads require a future explicit read-only operation.");
+            if candidate.model_hints.len() == 1 {
+                ui.label(format!("Resolved model hint: {}", candidate.model_hints[0]));
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    if self.usb_dump_in_progress() {
+                        ui.label("Dumping selected printer EEPROM…");
+                    } else if ui.button("Dump selected printer EEPROM").clicked() {
+                        self.start_selected_usb_eeprom_dump();
+                    }
+                }
+            }
             return;
         }
 
@@ -721,7 +833,11 @@ impl ReinkGui {
                                             ui.end_row();
 
                                             for (line, chunk) in bytes.chunks(16).enumerate() {
-                                                let line_address = line * 16;
+                                                let line_address = self
+                                                    .loaded_eeprom
+                                                    .as_ref()
+                                                    .map(|file| file.start_address + line * 16)
+                                                    .unwrap_or(line * 16);
                                                 ui.monospace(format!("{line_address:04X}"));
                                                 ui.horizontal(|ui| {
                                                     for (index, byte) in chunk.iter().enumerate() {
@@ -911,6 +1027,10 @@ impl ReinkGui {
                     ui.colored_label(Color32::from_rgb(181, 47, 47), error);
                     ui.add_space(6.0);
                 }
+                if let Some(error) = &self.usb_dump_error {
+                    ui.colored_label(Color32::from_rgb(181, 47, 47), error);
+                    ui.add_space(6.0);
+                }
                 match self.state.page() {
                     Page::Status => self.status(ui),
                     Page::Eeprom => self.eeprom_viewer(ui),
@@ -973,11 +1093,114 @@ impl ReinkGui {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dump_selected_usb_eeprom(candidate: DescriptorCandidate) -> UsbEepromDumpOutcome {
+    let hint = candidate
+        .model_hints
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<missing model hint>".to_owned());
+    let database = match ModelDatabase::builtin() {
+        Ok(database) => database,
+        Err(error) => {
+            return UsbEepromDumpOutcome {
+                result: Err(format!("model database load failed: {error}")),
+                events: Vec::new(),
+            };
+        }
+    };
+    let spec = match database.get(&hint).cloned() {
+        Some(spec) => spec,
+        None => {
+            return UsbEepromDumpOutcome {
+                result: Err(format!("unknown EEPROM model hint: {hint}")),
+                events: Vec::new(),
+            };
+        }
+    };
+    let device = reink_usb::UsbDeviceSelector::at_location(
+        candidate.vendor_id,
+        candidate.product_id,
+        candidate.bus_number,
+        candidate.device_address,
+    );
+    let interface = reink_platform::UsbInterfaceSelector {
+        number: candidate.interface_number,
+        alternate_setting: candidate.alternate_setting,
+    };
+    let transport = match reink_usb::ReadOnlyUsbTransport::open(device, interface) {
+        Ok(transport) => transport,
+        Err(error) => {
+            return UsbEepromDumpOutcome {
+                result: Err(error.to_string()),
+                events: Vec::new(),
+            };
+        }
+    };
+
+    let recording = RecordingTransport::new(transport);
+    let mut session = match EpsonD4Session::connect_recoverable(recording, spec) {
+        Ok(session) => session,
+        Err((error, recording)) => {
+            let (mut transport, events) = recording.into_parts();
+            let close_error = transport.close().err().map(|error| error.to_string());
+            return UsbEepromDumpOutcome {
+                result: Err(match close_error {
+                    Some(close) => format!(
+                        "Epson D4 session setup failed: {error}; USB transport close failed: {close}"
+                    ),
+                    None => format!("Epson D4 session setup failed: {error}"),
+                }),
+                events,
+            };
+        }
+    };
+
+    let operation_result = (|| -> Result<EepromImage, String> {
+        let identity = session.read_identity().map_err(|error| error.to_string())?;
+        let identity_model = identity
+            .detected_model()
+            .ok_or_else(|| "printer identity did not report a model".to_owned())?;
+        if identity_model != hint {
+            return Err(format!(
+                "selected model hint {hint:?} did not match printer identity {identity_model:?}"
+            ));
+        }
+        session.dump_eeprom().map_err(|error| error.to_string())
+    })();
+    let shutdown_result = session.shutdown().map_err(|error| error.to_string());
+    let recording = session.into_transport();
+    let (mut transport, events) = recording.into_parts();
+    let close_result = transport.close().map_err(|error| error.to_string());
+
+    let result = match (operation_result, shutdown_result, close_result) {
+        (Ok(image), Ok(()), Ok(())) => Ok(image),
+        (Err(operation), Ok(()), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown), Ok(())) => Err(format!("D4 shutdown failed: {shutdown}")),
+        (Ok(_), Ok(()), Err(close)) => Err(format!("USB transport close failed: {close}")),
+        (Err(operation), Err(shutdown), Ok(())) => {
+            Err(format!("{operation}; D4 shutdown failed: {shutdown}"))
+        }
+        (Err(operation), Ok(()), Err(close)) => {
+            Err(format!("{operation}; USB transport close failed: {close}"))
+        }
+        (Ok(_), Err(shutdown), Err(close)) => Err(format!(
+            "D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
+        )),
+        (Err(operation), Err(shutdown), Err(close)) => Err(format!(
+            "{operation}; D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
+        )),
+    };
+
+    UsbEepromDumpOutcome { result, events }
+}
+
 impl eframe::App for ReinkGui {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.poll_usb_candidates();
+        self.poll_usb_eeprom_dump();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if matches!(&self.usb_scan_status, UsbScanStatus::Scanning) {
+        if matches!(&self.usb_scan_status, UsbScanStatus::Scanning) || self.usb_dump_in_progress() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }

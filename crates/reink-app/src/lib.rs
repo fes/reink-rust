@@ -114,6 +114,29 @@ pub struct EpsonD4Session<T> {
     spec: EpsonSpec,
 }
 
+/// A complete, read-only EEPROM image for one resolved model range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EepromImage {
+    pub model: String,
+    pub start_address: u16,
+    pub bytes: Vec<u8>,
+}
+
+impl EepromImage {
+    pub fn end_address(&self) -> u16 {
+        self.start_address
+            .checked_add(self.bytes.len().saturating_sub(1) as u16)
+            .unwrap_or(u16::MAX)
+    }
+
+    pub fn value_at(&self, address: u16) -> Option<u8> {
+        address
+            .checked_sub(self.start_address)
+            .and_then(|offset| self.bytes.get(usize::from(offset)))
+            .copied()
+    }
+}
+
 impl<T: ByteTransport> EpsonD4Session<T> {
     /// Enters Epson D4 mode, initializes the link, and opens `EPSON-CTRL`.
     pub fn connect(target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
@@ -176,6 +199,28 @@ impl<T: ByteTransport> EpsonD4Session<T> {
     ) -> Result<Vec<EepromReadReply>, ApplicationError> {
         let mut channel = self.link.control_channel(self.control_channel)?;
         Ok(EpsonController::new(&mut channel, &self.spec).read_eeprom(addresses)?)
+    }
+
+    /// Reads every address in the selected model's bounded EEPROM range.
+    pub fn dump_eeprom(&mut self) -> Result<EepromImage, ApplicationError> {
+        let start_address = self.spec.memory_low;
+        let mut bytes = Vec::with_capacity(
+            usize::from(self.spec.memory_high).saturating_sub(usize::from(start_address)) + 1,
+        );
+        for address in start_address..=self.spec.memory_high {
+            let mut reply = self.read_eeprom(&[address])?;
+            bytes.push(
+                reply
+                    .pop()
+                    .expect("one requested EEPROM address produces one reply")
+                    .value,
+            );
+        }
+        Ok(EepromImage {
+            model: self.spec.model.clone(),
+            start_address,
+            bytes,
+        })
     }
 
     /// Closes the control channel and terminates the D4 conversation.
