@@ -9,6 +9,8 @@ use crate::{
     packet::HEADER_LENGTH,
 };
 
+const MAX_CONSECUTIVE_EMPTY_READS: usize = 7;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ChannelId {
     pub peer_socket: u8,
@@ -437,11 +439,17 @@ impl<T: ByteTransport> D4Link<T> {
             return Ok(packet);
         }
         let mut buffer = [0; 4096];
+        let mut consecutive_empty_reads = 0;
         loop {
             let read = self.target.read(&mut buffer)?;
             if read == 0 {
-                return Err(D4Error::UnexpectedEof);
+                consecutive_empty_reads += 1;
+                if consecutive_empty_reads == MAX_CONSECUTIVE_EMPTY_READS {
+                    return Err(D4Error::UnexpectedEof);
+                }
+                continue;
             }
+            consecutive_empty_reads = 0;
             self.received.extend(self.decoder.push(&buffer[..read])?);
             if let Some(packet) = self.received.pop_front() {
                 return Ok(packet);
@@ -1045,6 +1053,52 @@ mod tests {
                 .unwrap(),
             b"reply"
         );
+        link.target().assert_finished();
+    }
+
+    #[test]
+    fn revision_10_retries_an_empty_read_between_control_requests() {
+        let channel = ChannelId {
+            peer_socket: 2,
+            source_socket: 2,
+        };
+        let mut target = ScriptedTransport::new("scripted");
+        target.expect_write(Packet::new(2, 2, b"first".to_vec(), 1, 0).unwrap().encode());
+        target.push_read_data(
+            Packet::new(2, 2, b"first-reply".to_vec(), 0, 1)
+                .unwrap()
+                .encode(),
+        );
+        target.expect_write(
+            Packet::new(0, 0, [0x04, 2, 2, 0, 0x80, 0xff, 0xff], 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.push_read_data(
+            Packet::new(0, 0, [0x84, 0, 2, 2, 0, 1], 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.expect_write(
+            Packet::new(2, 2, b"second".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.push_read_data(Vec::new());
+        target.push_read_data(
+            Packet::new(2, 2, b"second-reply".to_vec(), 0, 1)
+                .unwrap()
+                .encode(),
+        );
+
+        let mut link = active_link(target);
+        link.revision = ProtocolRevision::V10;
+        let mut state = service_state(true);
+        state.credit = 1;
+        link.channels.insert(channel, state);
+
+        assert_eq!(link.request(channel, b"first").unwrap(), b"first-reply");
+        assert_eq!(link.request(channel, b"second").unwrap(), b"second-reply");
         link.target().assert_finished();
     }
 
