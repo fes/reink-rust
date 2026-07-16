@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use eframe::egui::{self, Color32, RichText};
+use regex::Regex;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_app::{EepromImage, EpsonD4Session};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -46,6 +47,7 @@ pub struct ReinkGui {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     usb_dump_receiver: Option<Receiver<UsbEepromDumpOutcome>>,
     usb_dump_error: Option<String>,
+    model_filter: String,
     debug_traffic: DebugTrafficTrace,
     debug_height: f32,
 }
@@ -107,6 +109,7 @@ impl ReinkGui {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             usb_dump_receiver: None,
             usb_dump_error: None,
+            model_filter: String::new(),
             debug_traffic: DebugTrafficTrace::new(),
             debug_height: 180.0,
         };
@@ -435,9 +438,10 @@ impl ReinkGui {
                         let selected_fixture = self.selected_fixture;
                         let selected_usb_candidate = self.selected_usb_candidate;
                         let source_label = self.source_label();
+                        let source_display = end_truncate(&source_label, 42);
                         let mut open_file = false;
-                        egui::ComboBox::from_id_salt("fixture-device")
-                            .selected_text(source_label)
+                        let source_response = egui::ComboBox::from_id_salt("fixture-device")
+                            .selected_text(source_display)
                             .width(320.0)
                             .show_ui(ui, |ui| {
                                 ui.strong("USB descriptor candidates");
@@ -499,6 +503,7 @@ impl ReinkGui {
                                     open_file = true;
                                 }
                             });
+                        source_response.response.on_hover_text(source_label);
                         if open_file {
                             self.open_eeprom_file();
                         }
@@ -528,13 +533,25 @@ impl ReinkGui {
                                 .model_names()
                                 .map(str::to_owned)
                                 .collect::<Vec<_>>();
+                            let filter = Regex::new(&self.model_filter).ok();
                             egui::ComboBox::from_id_salt("eeprom-model")
                                 .selected_text(
                                     selected_model.as_deref().unwrap_or("Select model..."),
                                 )
                                 .width(180.0)
                                 .show_ui(ui, |ui| {
+                                    ui.label("Filter (regex)");
+                                    ui.text_edit_singleline(&mut self.model_filter);
+                                    if !self.model_filter.is_empty() && filter.is_none() {
+                                        ui.colored_label(Color32::RED, "Invalid regular expression");
+                                    }
+                                    ui.separator();
                                     for model in &model_names {
+                                        if !self.model_filter.is_empty()
+                                            && !filter.as_ref().is_some_and(|regex| regex.is_match(model))
+                                        {
+                                            continue;
+                                        }
                                         if ui
                                             .selectable_label(
                                                 selected_model.as_deref() == Some(model.as_str()),
@@ -1378,6 +1395,18 @@ fn paint_dashed_vertical_line(ui: &egui::Ui, x: f32, rect: egui::Rect, stroke: e
             .line_segment([egui::pos2(x, y), egui::pos2(x, end)], stroke);
         y += 6.0;
     }
+}
+
+fn end_truncate(value: &str, maximum_characters: usize) -> String {
+    if value.chars().count() <= maximum_characters {
+        return value.to_owned();
+    }
+    let suffix = value
+        .chars()
+        .rev()
+        .take(maximum_characters.saturating_sub(1))
+        .collect::<Vec<_>>();
+    format!("…{}", suffix.into_iter().rev().collect::<String>())
 }
 
 fn dump_cell(value: String, highlighted: bool) -> RichText {

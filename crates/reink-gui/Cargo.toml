@@ -8,6 +8,7 @@ description = "Read-only graphical user interface for ReInk"
 
 [dependencies]
 eframe = "0.35"
+regex = "1.11"
 reink-app = { path = "../reink-app" }
 reink-core = { path = "../reink-core" }
 reink-platform = { path = "../reink-platform" }
