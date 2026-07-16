@@ -299,6 +299,7 @@ impl<T: ByteTransport> D4Link<T> {
 
     fn request(&mut self, channel: ChannelId, request: &[u8]) -> Result<Vec<u8>, D4Error> {
         self.require_active_conversation()?;
+        self.ensure_channel_credit(channel)?;
         self.send(channel, request.to_vec(), true)?;
         loop {
             let packet = self.next_packet()?;
@@ -327,6 +328,68 @@ impl<T: ByteTransport> D4Link<T> {
             }
             self.received.push_back(packet);
         }
+    }
+
+    fn ensure_channel_credit(&mut self, channel: ChannelId) -> Result<(), D4Error> {
+        for _ in 0..3 {
+            let (credit, max_credit) = {
+                let state = self
+                    .channels
+                    .get(&channel)
+                    .ok_or(D4Error::UnknownChannel { channel })?;
+                (state.credit, state.max_credit)
+            };
+            if credit > 0 {
+                return Ok(());
+            }
+
+            let reply = self.transaction(
+                TransactionMessage::CreditRequest {
+                    peer_socket: channel.peer_socket,
+                    source_socket: channel.source_socket,
+                    max_credit,
+                },
+                true,
+            )?;
+            let TransactionMessage::CreditRequestReply {
+                result,
+                peer_socket,
+                source_socket,
+                added_credit,
+            } = reply
+            else {
+                return Err(D4Error::UnexpectedTransactionReply);
+            };
+            if result != 0
+                || (ChannelId {
+                    peer_socket,
+                    source_socket,
+                }) != channel
+            {
+                return Err(D4Error::DeviceRejected { result });
+            }
+
+            let state = self
+                .channels
+                .get_mut(&channel)
+                .expect("channel existence was checked before requesting credit");
+            state.credit = state
+                .credit
+                .checked_add(added_credit)
+                .ok_or(D4Error::CreditOverflow { channel })?;
+            if state.credit > 0 {
+                return Ok(());
+            }
+        }
+
+        let state = self
+            .channels
+            .get(&channel)
+            .ok_or(D4Error::UnknownChannel { channel })?;
+        Err(D4Error::InsufficientCredit {
+            channel,
+            name: state.name.clone(),
+        })
     }
 
     fn send(
@@ -886,6 +949,102 @@ mod tests {
         let mut link = D4Link::new(target);
         link.initialize().unwrap();
         assert_eq!(link.revision(), ProtocolRevision::V10);
+        link.target().assert_finished();
+    }
+
+    #[test]
+    fn revision_10_open_reply_without_granted_credit_requests_credit_before_service_io() {
+        let mut target = ScriptedTransport::new("scripted");
+        target.expect_write(Packet::new(0, 0, [0, 0x20], 1, 0).unwrap().encode());
+        target.push_read_data(transaction_packet(
+            TransactionMessage::InitReply {
+                result: 2,
+                revision: ProtocolRevision::V10,
+            },
+            1,
+        ));
+        target.expect_write(Packet::new(0, 0, [0, 0x10], 1, 0).unwrap().encode());
+        target.push_read_data(
+            Packet::new(
+                0,
+                0,
+                TransactionMessage::InitReply {
+                    result: 0,
+                    revision: ProtocolRevision::V10,
+                }
+                .encode(ProtocolRevision::V10)
+                .unwrap(),
+                1,
+                0,
+            )
+            .unwrap()
+            .encode(),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x09EPSON-CTRL".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.push_read_data(
+            Packet::new(
+                0,
+                0,
+                TransactionMessage::GetSocketIdReply {
+                    result: 0,
+                    socket_id: 2,
+                    service_name: "EPSON-CTRL".to_owned(),
+                }
+                .encode(ProtocolRevision::V10)
+                .unwrap(),
+                1,
+                0,
+            )
+            .unwrap()
+            .encode(),
+        );
+        target.expect_write(
+            Packet::new(
+                0,
+                0,
+                b"\x01\x02\x02\x01\x00\x01\x00\x00\x00\x00\x00".to_vec(),
+                1,
+                0,
+            )
+            .unwrap()
+            .encode(),
+        );
+        target.push_read_data(
+            Packet::new(0, 0, [0x81, 0, 2, 2, 0, 0x40, 1, 0, 0, 0], 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.expect_write(
+            Packet::new(0, 0, [0x04, 2, 2, 0, 0x80, 0xff, 0xff], 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.push_read_data(
+            Packet::new(0, 0, [0x84, 0, 2, 2, 0, 1], 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.expect_write(
+            Packet::new(2, 2, b"request".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.push_read_data(Packet::new(2, 2, b"reply".to_vec(), 1, 0).unwrap().encode());
+
+        let mut link = D4Link::new(target);
+        link.initialize().unwrap();
+        let service = link.open_service("EPSON-CTRL").unwrap();
+        assert_eq!(
+            link.control_channel(service)
+                .unwrap()
+                .request(b"request")
+                .unwrap(),
+            b"reply"
+        );
         link.target().assert_finished();
     }
 

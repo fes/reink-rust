@@ -157,7 +157,9 @@ impl TransactionMessage {
                 push_u16(&mut encoded, *max_packet_size);
                 push_u16(&mut encoded, *max_service_size);
                 push_u16(&mut encoded, *max_credit);
-                push_u16(&mut encoded, *granted_credit);
+                if revision != ProtocolRevision::V10 {
+                    push_u16(&mut encoded, *granted_credit);
+                }
             }
             Self::CloseChannel {
                 peer_socket,
@@ -291,7 +293,12 @@ impl TransactionMessage {
                 })
             }
             0x81 => {
-                exact_length(body, 11, "OpenChannel reply")?;
+                let expected_length = if revision == ProtocolRevision::V10 {
+                    9
+                } else {
+                    11
+                };
+                exact_length(body, expected_length, "OpenChannel reply")?;
                 Ok(Self::OpenChannelReply {
                     result: byte(body, 0)?,
                     peer_socket: byte(body, 1)?,
@@ -299,7 +306,11 @@ impl TransactionMessage {
                     max_packet_size: u16_at(body, 3)?,
                     max_service_size: u16_at(body, 5)?,
                     max_credit: u16_at(body, 7)?,
-                    granted_credit: u16_at(body, 9)?,
+                    granted_credit: if revision == ProtocolRevision::V10 {
+                        0
+                    } else {
+                        u16_at(body, 9)?
+                    },
                 })
             }
             0x02 => {
@@ -617,6 +628,26 @@ mod tests {
     }
 
     #[test]
+    fn decodes_the_observed_revision_10_open_reply_without_granted_credit() {
+        assert_eq!(
+            TransactionMessage::decode(
+                &[0x81, 0, 2, 2, 0, 0x40, 1, 0, 0, 0],
+                ProtocolRevision::V10,
+            )
+            .unwrap(),
+            TransactionMessage::OpenChannelReply {
+                result: 0,
+                peer_socket: 2,
+                source_socket: 2,
+                max_packet_size: 0x40,
+                max_service_size: 0x100,
+                max_credit: 0,
+                granted_credit: 0,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_invalid_or_oversized_service_names() {
         let oversized = "A".repeat(41);
         for service_name in ["", "lowercase", "-LEADING", "TRAILING-", &oversized] {
@@ -742,6 +773,26 @@ mod tests {
                         peer_socket: *peer_socket,
                         source_socket: *source_socket,
                         max_credit: 0,
+                    },
+                    (
+                        ProtocolRevision::V10,
+                        TransactionMessage::OpenChannelReply {
+                            result,
+                            peer_socket,
+                            source_socket,
+                            max_packet_size,
+                            max_service_size,
+                            max_credit,
+                            ..
+                        },
+                    ) => TransactionMessage::OpenChannelReply {
+                        result: *result,
+                        peer_socket: *peer_socket,
+                        source_socket: *source_socket,
+                        max_packet_size: *max_packet_size,
+                        max_service_size: *max_service_size,
+                        max_credit: *max_credit,
+                        granted_credit: 0,
                     },
                     _ => message.clone(),
                 };

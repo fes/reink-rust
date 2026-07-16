@@ -1457,7 +1457,7 @@ fn completed_step(name: &str, result: Value) -> Value {
     json!({"name": name, "status": "completed", "result": result})
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadOnlyFailureKind {
     Blocked,
@@ -1465,7 +1465,7 @@ enum ReadOnlyFailureKind {
     Malformed,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(test)]
 impl ReadOnlyFailureKind {
     fn status(self) -> &'static str {
         match self {
@@ -1476,7 +1476,7 @@ impl ReadOnlyFailureKind {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(test)]
 fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
     json!({
         "name": name,
@@ -1587,12 +1587,8 @@ fn dump_progress(completed_address_count: usize, failed_address: Option<u16>) ->
     })
 }
 
-/// Produces a deterministic report for a hardware-independent driver simulation.
-///
-/// Concrete USB operations currently return their native error to preserve a
-/// nonzero process exit. This helper defines the schema used by tests and by a
-/// future opt-in runner that can retain partial read-only evidence safely.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+/// Produces a deterministic report for hardware-independent schema tests.
+#[cfg(test)]
 fn simulated_read_only_report(
     command: &str,
     completed: Vec<(&str, Value)>,

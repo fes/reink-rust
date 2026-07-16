@@ -132,7 +132,15 @@ impl<T: ByteTransport> EpsonD4Session<T> {
         }
         let control_channel = match link.open_service("EPSON-CTRL") {
             Ok(control_channel) => control_channel,
-            Err(error) => return Err((error.into(), link.target())),
+            Err(setup) => {
+                let recovery = link.exit().err();
+                let target = link.target();
+                let error = match recovery {
+                    Some(recovery) => ApplicationError::SetupRecovery { setup, recovery },
+                    None => setup.into(),
+                };
+                return Err((error, target));
+            }
         };
         Ok(Self {
             link,
@@ -194,6 +202,10 @@ fn wait_for_entry_reply<T: ByteTransport>(target: &mut T) -> Result<(), Applicat
 pub enum ApplicationError {
     Transport(TransportError),
     D4(D4Error),
+    SetupRecovery {
+        setup: D4Error,
+        recovery: D4Error,
+    },
     Epson(EpsonError),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Usb(reink_usb::UsbOpenError),
@@ -206,6 +218,10 @@ impl fmt::Display for ApplicationError {
         match self {
             Self::Transport(error) => write!(formatter, "transport error: {error}"),
             Self::D4(error) => write!(formatter, "D4 error: {error}"),
+            Self::SetupRecovery { setup, recovery } => write!(
+                formatter,
+                "D4 service setup failed: {setup}; orderly D4 exit also failed: {recovery}"
+            ),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => write!(formatter, "USB error: {error}"),
@@ -222,6 +238,7 @@ impl Error for ApplicationError {
         match self {
             Self::Transport(error) => Some(error),
             Self::D4(error) => Some(error),
+            Self::SetupRecovery { setup, .. } => Some(setup),
             Self::Epson(error) => Some(error),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => Some(error),
@@ -462,6 +479,66 @@ mod tests {
             };
 
         assert!(matches!(error, ApplicationError::EntryReplyInvalid));
+        target.assert_finished();
+    }
+
+    #[test]
+    fn failed_service_setup_attempts_an_orderly_d4_exit() {
+        let mut target = SanitizedTranscript::new("failed D4 service setup exits cleanly");
+        target.expect_write(EPSON_D4_ENTRY_COMMAND);
+        target.respond_fragmented([
+            EPSON_D4_ENTRY_REPLY[..4].to_vec(),
+            EPSON_D4_ENTRY_REPLY[4..].to_vec(),
+        ]);
+        target.expect_write(Packet::new(0, 0, [0, 0x20], 1, 0).unwrap().encode());
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::InitReply {
+                    result: 0,
+                    revision: ProtocolRevision::V20,
+                },
+                1,
+            ),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x09EPSON-CTRL".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::GetSocketIdReply {
+                    result: 0,
+                    socket_id: 2,
+                    service_name: "EPSON-CTRL".to_owned(),
+                },
+                1,
+            ),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x01\x02\x02\x01\x00\x01\x00\x00\x00".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            Packet::new(0, 0, [0x81], 1, 0).unwrap().encode(),
+        );
+        target.expect_write(Packet::new(0, 0, [0x08], 1, 0).unwrap().encode());
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(TransactionMessage::ExitReply { result: 0 }, 1),
+        );
+
+        let (error, target) =
+            match EpsonD4Session::connect_recoverable(target.into_transport(), spec()) {
+                Ok(_) => panic!("malformed service reply unexpectedly opened a D4 session"),
+                Err(recovery) => recovery,
+            };
+
+        assert!(matches!(error, ApplicationError::D4(_)));
         target.assert_finished();
     }
 }
