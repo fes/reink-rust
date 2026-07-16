@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only command-line interface for ReInk"
+description = "Command-line interface for ReInk inspection and explicit EEPROM operations"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

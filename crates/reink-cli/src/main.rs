@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
-use reink_core::{ModelDatabase, PrinterIdentity};
+use reink_core::{EpsonSpec, ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
@@ -20,8 +22,17 @@ use reink_snmp::{SnmpConfig, SnmpControlChannel};
 use reink_usb::read_printer_device_id;
 use serde_json::json;
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const EEPROM_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const EEPROM_RESTORE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESTORE_EEPROM";
+
 #[derive(Parser, Debug)]
-#[command(name = "reink", version, about = "Read-only ReInk printer inspection")]
+#[command(
+    name = "reink",
+    version,
+    about = "ReInk printer inspection and explicit EEPROM operations"
+)]
 struct Cli {
     /// Emit structured JSON instead of human-readable text.
     #[arg(long, global = true)]
@@ -99,12 +110,66 @@ enum Command {
         bus_number: Option<u8>,
         #[arg(long)]
         device_address: Option<u8>,
-        /// Exact model identity established by a prior read-only identity operation.
+        /// Model that must exactly match the D4 identity read from the selected printer.
         #[arg(long)]
         model: String,
         /// New private binary image path. Existing files are never overwritten.
         #[arg(long)]
         output_file: std::path::PathBuf,
+    },
+    /// Apply explicit EEPROM byte updates after saving a complete new backup.
+    UsbEepromWrite {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        /// Model that must exactly match the D4 identity read from the selected printer.
+        #[arg(long)]
+        model: String,
+        /// EEPROM update as ADDRESS=VALUE; both values accept decimal or 0x-prefixed hexadecimal.
+        #[arg(long, required = true, value_parser = parse_eeprom_update)]
+        update: Vec<(u16, u8)>,
+        /// New complete EEPROM backup path. Existing files are never overwritten.
+        #[arg(long)]
+        backup_file: PathBuf,
+        /// Exact acknowledgement required before this command opens USB.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
+    /// Restore a complete EEPROM image after saving a new rollback backup.
+    UsbEepromRestore {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        /// Model that must exactly match the D4 identity read from the selected printer.
+        #[arg(long)]
+        model: String,
+        /// Existing complete binary EEPROM image for the selected model range.
+        #[arg(long)]
+        input_file: PathBuf,
+        /// New complete pre-restore EEPROM image path. Existing files are never overwritten.
+        #[arg(long)]
+        rollback_backup_file: PathBuf,
+        /// Exact acknowledgement required before this command opens USB.
+        #[arg(long)]
+        confirmation: Option<String>,
     },
 }
 
@@ -221,6 +286,54 @@ fn run(cli: Cli) -> Result<(), String> {
             &output_file,
             cli.json,
         )?,
+        Command::UsbEepromWrite {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            update,
+            backup_file,
+            confirmation,
+        } => usb_eeprom_write_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            &update,
+            &backup_file,
+            confirmation.as_deref(),
+            cli.json,
+        )?,
+        Command::UsbEepromRestore {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            input_file,
+            rollback_backup_file,
+            confirmation,
+        } => usb_eeprom_restore_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            &input_file,
+            &rollback_backup_file,
+            confirmation.as_deref(),
+            cli.json,
+        )?,
     };
     write_stdout(&output)
 }
@@ -281,6 +394,107 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_err(|_| format!("expected a decimal or 0x-prefixed 16-bit integer, got {value:?}"))
 }
 
+fn parse_u8(value: &str) -> Result<u8, String> {
+    let (value, radix) = match value.strip_prefix("0x") {
+        Some(value) => (value, 16),
+        None => (value, 10),
+    };
+    u8::from_str_radix(value, radix)
+        .map_err(|_| format!("expected a decimal or 0x-prefixed byte, got {value:?}"))
+}
+
+fn parse_eeprom_update(value: &str) -> Result<(u16, u8), String> {
+    let (address, byte) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected EEPROM update in ADDRESS=VALUE form, got {value:?}"))?;
+    Ok((parse_u16(address)?, parse_u8(byte)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_eeprom_updates(spec: &EpsonSpec, updates: &[(u16, u8)]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Err("at least one --update ADDRESS=VALUE is required".to_owned());
+    }
+    let mut addresses = std::collections::BTreeSet::new();
+    for &(address, _) in updates {
+        if address < spec.memory_low || address > spec.memory_high {
+            return Err(format!(
+                "EEPROM update address {address:#06x} is outside model range {:#06x}..={:#06x}",
+                spec.memory_low, spec.memory_high
+            ));
+        }
+        if !addresses.insert(address) {
+            return Err(format!(
+                "EEPROM update address {address:#06x} is duplicated"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_confirmation(
+    confirmation: Option<&str>,
+    expected: &str,
+    command: &str,
+) -> Result<(), String> {
+    if confirmation == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command} requires --confirmation {expected} exactly"
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing {kind}: {}",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "{kind} parent directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_restore_image(path: &Path, spec: &EpsonSpec) -> Result<Vec<(u16, u8)>, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "could not read EEPROM restore image {}: {error}",
+            path.display()
+        )
+    })?;
+    let expected_len =
+        usize::from(spec.memory_high).saturating_sub(usize::from(spec.memory_low)) + 1;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "EEPROM restore image {} has {} bytes; model {} requires exactly {} bytes for {:#06x}..={:#06x}",
+            path.display(),
+            bytes.len(),
+            spec.model,
+            expected_len,
+            spec.memory_low,
+            spec.memory_high
+        ));
+    }
+    Ok(bytes
+        .into_iter()
+        .enumerate()
+        .map(|(offset, value)| (spec.memory_low + offset as u16, value))
+        .collect())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn usb_device_selector(
     vendor_id: u16,
@@ -338,79 +552,25 @@ fn usb_eeprom_dump_output(
     output_file: &Path,
     as_json: bool,
 ) -> Result<String, String> {
-    if output_file.exists() {
-        return Err(format!(
-            "refusing to overwrite existing EEPROM image: {}",
-            output_file.display()
-        ));
-    }
-    if let Some(parent) = output_file.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.is_dir()
-    {
-        return Err(format!(
-            "EEPROM image parent directory does not exist: {}",
-            parent.display()
-        ));
-    }
-
-    let spec = ModelDatabase::builtin()
-        .map_err(|error| error.to_string())?
-        .get(model)
-        .ok_or_else(|| format!("unknown model: {model}"))?
-        .clone();
-    let transport = reink_usb::ReadOnlyUsbTransport::open(
-        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
-        reink_platform::UsbInterfaceSelector {
-            number: interface,
-            alternate_setting,
+    validate_new_file_path(output_file, "EEPROM image")?;
+    let spec = selected_model(model)?;
+    let image = with_usb_eeprom_session(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        spec,
+        |session| {
+            verify_requested_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            session.dump_eeprom().map_err(|error| error.to_string())
         },
-    )
-    .map_err(|error| error.to_string())?;
-    let mut session = EpsonD4Session::connect(RecordingTransport::new(transport), spec)
-        .map_err(|error| error.to_string())?;
-    let dump = session.dump_eeprom();
-    let shutdown = session.shutdown();
-    let (mut transport, _) = session.into_transport().into_parts();
-    let close = transport.close();
-    let image = match (dump, shutdown, close) {
-        (Ok(image), Ok(()), Ok(())) => image,
-        (Err(dump), Ok(()), Ok(())) => return Err(format!("EEPROM dump failed: {dump}")),
-        (Ok(_), Err(shutdown), Ok(())) => return Err(format!("D4 shutdown failed: {shutdown}")),
-        (Ok(_), Ok(()), Err(close)) => return Err(format!("USB transport close failed: {close}")),
-        (Err(dump), Err(shutdown), Err(close)) => {
-            return Err(format!(
-                "EEPROM dump failed: {dump}; D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
-            ));
-        }
-        (Err(dump), Err(shutdown), Ok(())) => {
-            return Err(format!(
-                "EEPROM dump failed: {dump}; D4 shutdown failed: {shutdown}"
-            ));
-        }
-        (Err(dump), Ok(()), Err(close)) => {
-            return Err(format!(
-                "EEPROM dump failed: {dump}; USB transport close failed: {close}"
-            ));
-        }
-        (Ok(_), Err(shutdown), Err(close)) => {
-            return Err(format!(
-                "D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
-            ));
-        }
-    };
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output_file)
-        .and_then(|mut file| file.write_all(&image.bytes))
-        .map_err(|error| {
-            format!(
-                "could not save EEPROM image {}: {error}",
-                output_file.display()
-            )
-        })?;
+    )?;
+    write_new_binary_file(output_file, &image.bytes, "EEPROM image")?;
 
     Ok(if as_json {
         json!({
@@ -434,6 +594,236 @@ fn usb_eeprom_dump_output(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_write_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    updates: &[(u16, u8)],
+    backup_file: &Path,
+    confirmation: Option<&str>,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_confirmation(confirmation, EEPROM_WRITE_CONFIRMATION, "usb-eeprom-write")?;
+    validate_new_file_path(backup_file, "EEPROM backup")?;
+    let spec = selected_model(model)?;
+    validate_eeprom_updates(&spec, updates)?;
+
+    with_usb_eeprom_session(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        spec,
+        |session| {
+            verify_requested_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            let plan = session
+                .prepare_eeprom_write(updates)
+                .map_err(|error| format!("could not prepare EEPROM write: {error}"))?;
+            write_new_binary_file(backup_file, &plan.backup.bytes, "EEPROM backup")?;
+            session
+                .apply_eeprom_write(&plan)
+                .map_err(|error| format!("EEPROM write failed: {error}"))
+        },
+    )?;
+
+    Ok(eeprom_mutation_output(
+        "write",
+        model,
+        updates.len(),
+        "backup_file",
+        backup_file,
+        as_json,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_restore_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    input_file: &Path,
+    rollback_backup_file: &Path,
+    confirmation: Option<&str>,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_confirmation(
+        confirmation,
+        EEPROM_RESTORE_CONFIRMATION,
+        "usb-eeprom-restore",
+    )?;
+    validate_new_file_path(rollback_backup_file, "EEPROM rollback backup")?;
+    let spec = selected_model(model)?;
+    let updates = read_restore_image(input_file, &spec)?;
+
+    with_usb_eeprom_session(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        spec,
+        |session| {
+            verify_requested_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            let plan = session
+                .prepare_eeprom_write(&updates)
+                .map_err(|error| format!("could not prepare EEPROM restore: {error}"))?;
+            write_new_binary_file(
+                rollback_backup_file,
+                &plan.backup.bytes,
+                "EEPROM rollback backup",
+            )?;
+            session
+                .apply_eeprom_write(&plan)
+                .map_err(|error| format!("EEPROM restore failed: {error}"))
+        },
+    )?;
+
+    Ok(eeprom_mutation_output(
+        "restore",
+        model,
+        updates.len(),
+        "rollback_backup_file",
+        rollback_backup_file,
+        as_json,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn selected_model(model: &str) -> Result<EpsonSpec, String> {
+    ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .cloned()
+        .ok_or_else(|| format!("unknown model: {model}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_requested_model(identity: &PrinterIdentity, model: &str) -> Result<(), String> {
+    match identity.detected_model() {
+        Some(detected) if detected == model => Ok(()),
+        Some(detected) => Err(format!(
+            "D4 printer identity model {detected:?} does not match requested model {model:?}"
+        )),
+        None => Err(format!(
+            "D4 printer identity does not contain a model; requested model is {model:?}"
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_new_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("could not create {kind} {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist {kind} {}: {error}", path.display()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn eeprom_mutation_output(
+    operation: &str,
+    model: &str,
+    byte_count: usize,
+    backup_key: &str,
+    backup_file: &Path,
+    as_json: bool,
+) -> String {
+    if as_json {
+        json!({
+            "operation": operation,
+            "model": model,
+            "byte_count": byte_count,
+            (backup_key): backup_file,
+        })
+        .to_string()
+    } else {
+        format!(
+            "EEPROM {operation} completed for {model}: {byte_count} byte(s); {backup_key}: {}",
+            backup_file.display()
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn with_usb_eeprom_session<R>(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    spec: EpsonSpec,
+    operation: impl FnOnce(
+        &mut EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
+    ) -> Result<R, String>,
+) -> Result<R, String> {
+    let transport = reink_usb::ReadOnlyUsbTransport::open(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut session =
+        match EpsonD4Session::connect_recoverable(RecordingTransport::new(transport), spec) {
+            Ok(session) => session,
+            Err((setup, transport)) => {
+                let (mut transport, _) = transport.into_parts();
+                return match transport.close() {
+                    Ok(()) => Err(format!("D4 session setup failed: {setup}")),
+                    Err(close) => Err(format!(
+                        "D4 session setup failed: {setup}; USB transport close failed: {close}"
+                    )),
+                };
+            }
+        };
+    let result = operation(&mut session);
+    let shutdown = session.shutdown().map_err(|error| error.to_string());
+    let (mut transport, _) = session.into_transport().into_parts();
+    let close = transport.close().map_err(|error| error.to_string());
+    match (result, shutdown, close) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (result, shutdown, close) => {
+            let mut errors = Vec::new();
+            if let Err(error) = result {
+                errors.push(error);
+            }
+            if let Err(error) = shutdown {
+                errors.push(format!("D4 shutdown failed: {error}"));
+            }
+            if let Err(error) = close {
+                errors.push(format!("USB transport close failed: {error}"));
+            }
+            Err(errors.join("; "))
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[allow(clippy::too_many_arguments)]
 fn usb_eeprom_dump_output(
@@ -448,6 +838,42 @@ fn usb_eeprom_dump_output(
     _: bool,
 ) -> Result<String, String> {
     Err("USB EEPROM dumps are currently supported only on Linux or macOS".to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_write_output(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: &[(u16, u8)],
+    _: &Path,
+    _: Option<&str>,
+    _: bool,
+) -> Result<String, String> {
+    Err("USB EEPROM writes are currently supported only on Linux or macOS".to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_restore_output(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: &Path,
+    _: &Path,
+    _: Option<&str>,
+    _: bool,
+) -> Result<String, String> {
+    Err("USB EEPROM restores are currently supported only on Linux or macOS".to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -597,10 +1023,14 @@ mod tests {
 
     use reink_core::ModelDatabase;
 
-    use super::{Cli, Command, render_identity, render_models};
+    use super::{
+        Cli, Command, EEPROM_RESTORE_CONFIRMATION, EEPROM_WRITE_CONFIRMATION, parse_eeprom_update,
+        render_identity, render_models, validate_confirmation, validate_eeprom_updates,
+        validate_new_file_path,
+    };
 
     #[test]
-    fn parses_only_read_only_commands() {
+    fn parses_cli_commands() {
         let cli = Cli::try_parse_from(["reink", "models"]).unwrap();
         assert!(matches!(cli.command, Command::Models));
         let cli = Cli::try_parse_from(["reink", "discover", "--timeout-seconds", "1"]).unwrap();
@@ -635,6 +1065,59 @@ mod tests {
                 device_address: None,
             }
         ));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "usb-eeprom-write",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--update",
+            "0x000c=0xff",
+            "--backup-file",
+            "new-backup.bin",
+            "--confirmation",
+            EEPROM_WRITE_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::UsbEepromWrite {
+                update,
+                confirmation: Some(_),
+                ..
+            } if update == vec![(0x000c, 0xff)]
+        ));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "usb-eeprom-restore",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--input-file",
+            "image.bin",
+            "--rollback-backup-file",
+            "new-rollback.bin",
+            "--confirmation",
+            EEPROM_RESTORE_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::UsbEepromRestore {
+                confirmation: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -664,6 +1147,55 @@ mod tests {
         assert_eq!(super::parse_u16("0x04b8").unwrap(), 0x04b8);
         assert_eq!(super::parse_u16("1208").unwrap(), 1208);
         assert!(super::parse_u16("0xnope").is_err());
+    }
+
+    #[test]
+    fn parses_eeprom_updates_and_rejects_malformed_values() {
+        assert_eq!(parse_eeprom_update("0x000c=0xff").unwrap(), (0x000c, 0xff));
+        assert_eq!(parse_eeprom_update("12=34").unwrap(), (12, 34));
+        assert!(parse_eeprom_update("0x000c").is_err());
+        assert!(parse_eeprom_update("0x000c=0x100").is_err());
+    }
+
+    #[test]
+    fn validates_write_gates_before_usb_access() {
+        let database = ModelDatabase::builtin().unwrap();
+        let spec = database.get("C90").unwrap();
+        assert!(
+            validate_confirmation(
+                Some(EEPROM_WRITE_CONFIRMATION),
+                EEPROM_WRITE_CONFIRMATION,
+                "usb-eeprom-write"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_confirmation(
+                Some("I_CONFIRM_WRITES"),
+                EEPROM_WRITE_CONFIRMATION,
+                "usb-eeprom-write"
+            )
+            .is_err()
+        );
+        assert!(validate_eeprom_updates(spec, &[(spec.memory_low, 1)]).is_ok());
+        assert!(validate_eeprom_updates(spec, &[]).is_err());
+        assert!(
+            validate_eeprom_updates(spec, &[(spec.memory_low, 1), (spec.memory_low, 2)]).is_err()
+        );
+        assert!(validate_eeprom_updates(spec, &[(spec.memory_high.saturating_add(1), 1)]).is_err());
+    }
+
+    #[test]
+    fn refuses_existing_and_parentless_backup_paths() {
+        let existing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(validate_new_file_path(&existing, "EEPROM backup").is_err());
+        assert!(
+            validate_new_file_path(
+                std::path::Path::new("missing-parent-for-reink-cli-test\\backup.bin"),
+                "EEPROM backup"
+            )
+            .is_err()
+        );
     }
 
     #[test]

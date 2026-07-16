@@ -19,10 +19,10 @@ waste-ink pads.
 ## Status
 
 The workspace contains platform contracts, deterministic test doubles, Epson
-domain logic, and a read-only application service that composes a selected
-transport with the Epson D4 and control-channel layers. It includes read-only
-CLI and terminal UI surfaces; its scripted D4 entry exchange is not
-hardware-ready.
+domain logic, and an application service that composes a selected transport
+with the Epson D4 and control-channel layers. It includes an explicit
+EEPROM-operation CLI and a read-only terminal UI; its scripted D4 entry
+exchange is not hardware-ready.
 
 | Area | Status |
 | --- | --- |
@@ -32,11 +32,11 @@ hardware-ready.
 | Epson model database, command encoding, and EEPROM reply parsing | Implemented |
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
 | Epson command execution and EEPROM read/write orchestration | Implemented with scripted transports |
-| Read-only Epson D4 application service | Implemented with scripted transports |
+| Epson D4 application service with write plans | Implemented with scripted transports |
 | Linux and macOS USB bulk transport, descriptor selection, and candidate enumeration | Implemented; no hardware validation claimed |
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB | Planned |
-| Read-only CLI | Implemented |
+| CLI inspection and explicit EEPROM operations | Implemented with scripted transports |
 | Read-only terminal UI model browser | Implemented |
 
 ## Porting approach
@@ -91,12 +91,12 @@ Current and planned workspace crates:
 | `reink-platform-test` | Strict scripted transports, control channels, and discovery fakes for downstream tests |
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
-| `reink-app` | Read-only Epson D4 session and entry-probe application services |
+| `reink-app` | Epson D4 session, entry-probe, and validated write-plan application services |
 | `reink-usb` | Read-only Linux and macOS libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
 | `reink-hardware-test` | Opt-in Linux and macOS read-only validation driver; hardware validation remains unclaimed |
-| `reink-cli` | Read-only model, identity, and mDNS discovery commands |
+| `reink-cli` | Model, identity, discovery, and explicit USB EEPROM commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
 | `reink-gui` | Optional descriptor-only graphical read-only UI with a session-only future transport trace sink |
 
@@ -219,8 +219,8 @@ cargo test -p reink-d4
 `reink-app::EpsonD4Session` is the application-service boundary between a
 selected `ByteTransport` and the Epson controller. It sends the source-
 compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
-exposes read-only identity and EEPROM operations. It also closes the service
-channel and terminates D4 through `shutdown()`.
+exposes identity, EEPROM, and validated write-plan operations. It also closes
+the service channel and terminates D4 through `shutdown()`.
 
 On Linux and macOS, `probe_epson_d4_entry` is the separate safe entry-probe API used by
 the CLI and hardware-test driver. It owns the Epson request and reply
@@ -303,6 +303,30 @@ or a bounded byte count:
 ```powershell
 cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
+
+`usb-eeprom-dump` saves a complete model-bounded binary image. It reads the
+D4 identity in the same session and rejects a model mismatch before reading
+EEPROM. The output path must be new and have an existing parent directory.
+
+`usb-eeprom-write` and `usb-eeprom-restore` are the only CLI commands that
+mutate EEPROM. They require an exact D4 model match, an exact confirmation, and
+a new backup path before USB is opened. They always attempt orderly D4 shutdown
+and USB close; cleanup failures are included in the command error.
+
+```powershell
+cargo run -p reink-cli -- usb-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --output-file <new-image.bin>
+cargo run -p reink-cli -- usb-eeprom-write --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --update 0x000c=0x00 --backup-file <new-backup.bin> --confirmation I_CONFIRM_THIS_WILL_WRITE_EEPROM
+cargo run -p reink-cli -- usb-eeprom-restore --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --input-file <complete-image.bin> --rollback-backup-file <new-rollback.bin> --confirmation I_CONFIRM_THIS_WILL_RESTORE_EEPROM
+```
+
+Write updates must be unique and within the selected model range. Before any
+write, ReInk calls `prepare_eeprom_write`, saves and syncs the complete
+create-new backup, then calls `apply_eeprom_write`, which enables read-back
+verification and rollback. Restore rejects a missing or wrongly sized image
+before USB access and maps every image byte in order onto the selected declared
+range; it saves a complete create-new rollback backup before applying that
+plan. EEPROM images and backups are private device-specific data: retain them
+securely and never commit them.
 
 Before selecting a device for a hardware-test command, Linux and macOS can
 list descriptor-only USB printer candidates:
@@ -461,8 +485,9 @@ is needed, both `REINK_SNMP_PRIVACY_PROTOCOL` and
 `sha1`, `sha224`, `sha256`, `sha384`, and `sha512`; privacy algorithms are
 `des`, `aes128`, `aes192`, and `aes256`.
 
-The CLI never accepts credentials as arguments, emits no credentials in JSON
-or text output, and has no write/reset command.
+The CLI never accepts credentials as arguments and emits no credentials in JSON
+or text output. Its EEPROM write and restore commands require the explicit
+confirmations and backup workflow documented above.
 
 ### `reink-tui`
 
@@ -673,7 +698,7 @@ selected device.
 
 GitHub Actions runs this same formatting, Clippy, and test sequence on current
 Linux, macOS, and Windows runners. Tagged `v*` revisions and manual dispatch create
-release-build artifacts for the read-only CLI, hardware-test driver, and TUI;
+release-build artifacts for the CLI, hardware-test driver, and TUI;
 publishing a release remains a maintainer action after reviewing those
 artifacts.
 
