@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -8,17 +8,17 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
 use reink_core::{EpsonSpec, ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_platform::RecordingTransport;
 use reink_platform::{DeviceDiscovery, DeviceLocation, DiscoveryRequest};
 use reink_snmp::{SnmpConfig, SnmpControlChannel};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_usb::read_printer_device_id;
 use serde_json::json;
 
@@ -338,7 +338,7 @@ fn run(cli: Cli) -> Result<(), String> {
     write_stdout(&output)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn usb_d4_probe_output(
     vendor_id: u16,
     product_id: u16,
@@ -372,7 +372,7 @@ fn usb_d4_probe_output(
     })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn usb_d4_probe_output(
     _vendor_id: u16,
     _product_id: u16,
@@ -382,7 +382,7 @@ fn usb_d4_probe_output(
     _device_address: Option<u8>,
     _as_json: bool,
 ) -> Result<String, String> {
-    Err("USB D4 probing is currently supported only on Linux or macOS".to_owned())
+    Err("USB D4 probing is currently supported only on Linux, macOS, or Windows".to_owned())
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {
@@ -447,7 +447,7 @@ fn validate_confirmation(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
     if path.exists() {
         return Err(format!(
@@ -495,7 +495,7 @@ fn read_restore_image(path: &Path, spec: &EpsonSpec) -> Result<Vec<(u16, u8)>, S
         .collect())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn usb_device_selector(
     vendor_id: u16,
     product_id: u16,
@@ -514,7 +514,7 @@ fn usb_device_selector(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn usb_identity_output(
     vendor_id: u16,
     product_id: u16,
@@ -539,7 +539,7 @@ fn usb_identity_output(
     Ok(render_identity(&identity, &database, as_json))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn usb_eeprom_dump_output(
     vendor_id: u16,
@@ -708,7 +708,7 @@ fn usb_eeprom_restore_output(
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn selected_model(model: &str) -> Result<EpsonSpec, String> {
     ModelDatabase::builtin()
         .map_err(|error| error.to_string())?
@@ -717,7 +717,7 @@ fn selected_model(model: &str) -> Result<EpsonSpec, String> {
         .ok_or_else(|| format!("unknown model: {model}"))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn verify_requested_model(identity: &PrinterIdentity, model: &str) -> Result<(), String> {
     match identity.detected_model() {
         Some(detected) if detected == model => Ok(()),
@@ -730,7 +730,7 @@ fn verify_requested_model(identity: &PrinterIdentity, model: &str) -> Result<(),
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn write_new_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -767,7 +767,7 @@ fn eeprom_mutation_output(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn with_usb_eeprom_session<R>(
     vendor_id: u16,
@@ -824,7 +824,7 @@ fn with_usb_eeprom_session<R>(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[allow(clippy::too_many_arguments)]
 fn usb_eeprom_dump_output(
     _: u16,
@@ -837,7 +837,7 @@ fn usb_eeprom_dump_output(
     _: &Path,
     _: bool,
 ) -> Result<String, String> {
-    Err("USB EEPROM dumps are currently supported only on Linux or macOS".to_owned())
+    Err("USB EEPROM dumps are currently supported only on Linux, macOS, or Windows".to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -876,7 +876,7 @@ fn usb_eeprom_restore_output(
     Err("USB EEPROM restores are currently supported only on Linux or macOS".to_owned())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn usb_identity_output(
     _vendor_id: u16,
     _product_id: u16,
@@ -886,7 +886,10 @@ fn usb_identity_output(
     _device_address: Option<u8>,
     _as_json: bool,
 ) -> Result<String, String> {
-    Err("USB identity inspection is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "USB identity inspection is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
 #[cfg(target_os = "linux")]

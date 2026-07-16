@@ -33,9 +33,9 @@ exchange is not hardware-ready.
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
 | Epson command execution and EEPROM read/write orchestration | Implemented with scripted transports |
 | Epson D4 application service with write plans | Implemented with scripted transports |
-| Linux and macOS USB bulk transport, descriptor selection, and candidate enumeration | Implemented; no hardware validation claimed |
+| Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; no hardware validation claimed |
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
-| Windows native USB | Planned |
+| Windows native USB read-only sessions | Implemented through libusb; no hardware validation claimed |
 | CLI inspection and explicit EEPROM operations | Implemented with scripted transports |
 | Read-only terminal UI model browser | Implemented |
 
@@ -92,10 +92,10 @@ Current and planned workspace crates:
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
 | `reink-app` | Epson D4 session, entry-probe, and validated write-plan application services |
-| `reink-usb` | Read-only Linux and macOS libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
+| `reink-usb` | Read-only Linux, macOS, and Windows libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
-| `reink-hardware-test` | Opt-in Linux and macOS read-only validation driver; hardware validation remains unclaimed |
+| `reink-hardware-test` | Opt-in Linux, macOS, and Windows read-only validation driver; hardware validation remains unclaimed |
 | `reink-cli` | Model, identity, discovery, and explicit USB EEPROM commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
 | `reink-gui` | Optional descriptor-only graphical read-only UI with a session-only future transport trace sink |
@@ -107,22 +107,16 @@ than assuming a POSIX-style device path.
 
 ### USB backend and driver policy
 
-Linux and macOS USB support use a libusb-based adapter through `rusb` to select
-printer-class interfaces and exchange bulk-endpoint traffic. Linux permissions
-and kernel-driver handling remain the responsibility of that adapter.
+Linux, macOS, and Windows USB support use a libusb-based adapter through
+`rusb` to select printer-class interfaces and exchange bulk-endpoint traffic.
+Linux permissions and kernel-driver handling remain the responsibility of that
+adapter.
 
-Windows support will first investigate a native printer-stack adapter. It must
-prove that a normally installed printer can carry the D4 entry sequence,
-IEEE 1284.4 negotiation, and repeated bidirectional control-channel traffic
-without creating print jobs or disrupting ordinary printing. Until that
-prototype succeeds, Windows native USB access is not a supported transport.
-
-ReInk does not install drivers. A future Windows adapter may temporarily
-change the association or ownership of an explicitly selected printer interface
-only by using drivers already present on the system, then restore the prior
-association after the operation. If the selected adapter cannot access the
-device, it reports a precise error rather than silently switching transport
-methods.
+ReInk does not install drivers. On Windows and macOS it only attempts a libusb
+claim on an already accessible explicitly selected interface. It never
+installs, detaches, rebinds, changes, or restores a driver association on those
+platforms; a claim failure is a safe stop and ReInk does not silently switch
+transport methods.
 
 All concrete transports normalize their native implementation to
 `reink-platform::ByteTransport`. The D4 layer receives only ordered blocking
@@ -133,8 +127,8 @@ than USB vendor/product attributes.
 
 ### `reink-usb`
 
-`reink-usb` uses `rusb` on Linux and macOS. It selects alternate-setting-zero USB
-printer-class interfaces with both bulk-IN and bulk-OUT endpoints and
+`reink-usb` uses `rusb` on Linux, macOS, and Windows. It selects
+alternate-setting-zero USB printer-class interfaces with both bulk-IN and bulk-OUT endpoints and
 implements `ByteTransport` with bounded bulk I/O. Its optional bounded exchange
 probe is protocol-neutral: callers provide request bytes, expected reply bytes,
 and a read limit. After a Linux interface is explicitly selected, ReInk
@@ -142,20 +136,16 @@ automatically detaches an active driver for that interface, then releases and
 reattaches only the driver it detached after each operation. Reattachment
 failures report recovery guidance: reconnect or power-cycle the printer, then
 reboot the host if needed before retrying. macOS access currently uses only
-libusb's normal read/claim operations. A future selected-printer operation may
-use an existing system driver association when needed and must restore it after
-the operation.
-
-The Windows build contains no libusb transport and no driver-management code.
-Windows support remains contingent on the native printer-stack prototype
-described above.
+libusb's normal read/claim operations. Windows uses the same normal
+read/claim/release lifecycle and never performs driver installation, detach,
+rebind, or restoration.
 
 The concrete Linux transport must be built and exercised on Linux (or in
-Linux CI with libusb development headers). The macOS adapter is compiled in
-macOS CI using `rusb`'s vendored libusb support; this is compilation and
-scripted-test coverage only, not hardware validation. Cross-compiling the Linux
-adapter from Windows also requires a Linux C compiler and sysroot for
-`libusb1-sys`; the pure descriptor-selection tests remain host-independent.
+Linux CI with libusb development headers). The macOS and Windows adapters use
+`rusb`'s vendored libusb support. This is compilation and scripted-test
+coverage only, not hardware validation. Cross-compiling the Linux adapter from
+Windows also requires a Linux C compiler and sysroot for `libusb1-sys`; the
+pure descriptor-selection tests remain host-independent.
 
 For native Linux or WSL development, install `build-essential`, `pkg-config`,
 `libusb-1.0-0-dev`, and `libudev-dev`, then use the stable Linux Rust
@@ -165,8 +155,8 @@ For macOS development, use the stable Xcode command-line tools and Rust
 toolchain. No driver installation is part of setup. Use
 `system_profiler SPUSBDataType` to obtain the selected printer's vendor/product
 IDs and, when duplicate IDs are attached, its libusb-visible bus and address.
-The current macOS adapter reports a claim failure; a future selected-printer
-operation may use and restore an existing system driver association.
+On macOS and Windows, a claim failure is a safe stop: do not install or change
+a driver to work around it.
 
 ### `reink-core`
 
@@ -222,7 +212,7 @@ compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
 exposes identity, EEPROM, and validated write-plan operations. It also closes
 the service channel and terminates D4 through `shutdown()`.
 
-On Linux and macOS, `probe_epson_d4_entry` is the separate safe entry-probe API used by
+On Linux, macOS, and Windows, `probe_epson_d4_entry` is the separate safe entry-probe API used by
 the CLI and hardware-test driver. It owns the Epson request and reply
 semantics while delegating bounded USB I/O to `reink-usb`; it stops before D4
 Init or service setup. The D4 entry exchange is tested only with scripted
@@ -279,21 +269,21 @@ cargo run -p reink-cli -- local-devices
 
 For a standard USB Printer Class identity read, select the exact device and
 interface. The command never enters Epson D4 mode. On Linux, it automatically
-detaches and reattaches an active driver only for that selected interface. If
-multiple devices share vendor/product IDs, add both `--bus-number` and
-`--device-address`; ReInk refuses to choose one arbitrarily:
+detaches and reattaches an active driver only for that selected interface. On
+Windows and macOS, it only claims an already libusb-accessible interface and
+never changes a driver. If multiple devices share vendor/product IDs, add both
+`--bus-number` and `--device-address`; ReInk refuses to choose one arbitrarily:
 
 ```powershell
 cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
 
-Use your platform's USB listing tool to obtain the product, interface, and any
-needed location values. Do not guess them and do not use this command on
-Windows; its USB path is not supported. On Linux, failure to detach, claim, or
-reattach the selected interface reports reconnect, power-cycle, and reboot
-remediation. The current macOS adapter reports a claim failure; a future
-selected-printer operation may use and restore an existing system driver
-association.
+Use your platform's USB listing tool or ReInk's descriptor-only candidate
+listing to obtain the product, interface, and required location values. Do not
+guess them. On Windows and macOS, an access or claim failure is a safe stop;
+do not install, detach, rebind, or change a driver to work around it. On Linux,
+failure to detach, claim, or reattach the selected interface reports reconnect,
+power-cycle, and reboot remediation.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service
@@ -328,7 +318,8 @@ range; it saves a complete create-new rollback backup before applying that
 plan. EEPROM images and backups are private device-specific data: retain them
 securely and never commit them.
 
-Before selecting a device for a hardware-test command, Linux and macOS can
+Before selecting a device for a hardware-test command, Linux, macOS, and
+Windows can
 list descriptor-only USB printer candidates:
 
 ```powershell
@@ -341,7 +332,7 @@ result alias (`usb-1`, and so on) is stable only within that report. Select a
 candidate later with its complete shown selector. `model_hints` are bundled
 database label/filter hints for an exact vendor/product mapping, not identity
 or automatic selection; they may be empty. A later IEEE 1284 identity read
-confirms the model. Windows returns the standard unsupported USB error.
+confirms the model.
 
 For a complete Linux evidence run, the companion `reink-results` repository
 provides `run-linux-read-evidence.sh`. With the repositories checked out as
@@ -357,6 +348,15 @@ one exact bundled model hint exist; otherwise it requires
 preflight, identity, selected-read, dump, and boundary-probe results in an
 ignored timestamped private directory, and never performs a write or reset.
 The identity result remains the authoritative model confirmation.
+
+For native Windows, use the same repository's
+`run-windows-read-evidence.ps1` with explicit vendor/product/interface/
+alternate-setting/bus/device/model parameters. It first confirms that the full
+explicit selector identifies exactly one descriptor candidate, keeps its raw
+output in ignored private evidence, skips the standalone D4 probe during
+preflight, and invokes the durable `reink-cli usb-eeprom-dump` only after every
+hardware-test evidence stage succeeds. It never installs, detaches, rebinds, or
+changes a driver.
 
 For a single structured read-only preflight report, use:
 
@@ -442,9 +442,11 @@ each operation. Schema-version-3 reports include
 `linux_driver_handoff` with automatic, detached, and reattached outcomes; they
 never contain raw traffic. If detach, claim, release, or reattachment fails,
 reconnect or power-cycle the printer, then reboot the host if needed before
-retrying. The current macOS adapter does not attempt a kernel-driver handoff;
-future selected-printer operations may use and restore existing system driver
-associations.
+retrying. On Windows and macOS, these commands only claim and release an
+already libusb-accessible selected interface. The same report field remains
+present for schema compatibility, with `detached: false` and
+`reattached: null`; no driver is installed, detached, rebound, changed, or
+restored.
 
 Concrete commands return nonzero for operational failures. When `--report-file`
 is supplied after a D4 operation begins, they preserve a structured failure
@@ -510,18 +512,17 @@ runs them or opens a device.
 
 `reink-gui` is an optional native GUI built with `egui`/`eframe`. It defaults to
 descriptor/real mode with **no printer selected** and is separate from
-`reink-tui`. On Linux and macOS it asynchronously lists
+`reink-tui`. On Linux, macOS, and Windows it asynchronously lists
 printer-class USB **descriptor-only candidates** with
 `reink_usb::list_printer_candidates()`. This scan reads descriptors only: it
 does not open or claim a device, detach or hand off a driver, send control, D4,
 or EEPROM traffic, or enable writes. Candidates use a session-only alias and
 show only VID/PID, bus/address, interface/alternate setting, and exact bundled
 VID/PID model hints; hints are not identity confirmation. The GUI has no
-driver-handoff control. Identity and EEPROM reads require a future explicit
-read-only operation, which must automatically detach and reattach the selected
-Linux interface driver without adding a separate handoff action. On Windows,
-USB descriptor enumeration is unavailable and no printer is selected by
-default. Default mode never opens or claims a device,
+driver-handoff control. Its explicit read-only EEPROM operation automatically
+hands off only a selected Linux interface driver when necessary; on Windows
+and macOS it only claims an already libusb-accessible selected interface and
+never changes a driver. Default mode never opens or claims a device,
 hands off a driver, or sends traffic.
 
 Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
@@ -567,13 +568,13 @@ These instructions assume a stock operating system and a new checkout. Linux
 diagnostics and repair automatically hand off only an explicitly selected Linux
 printer interface; ordinary development does not modify USB drivers.
 
-### Windows: build, test, and read-only UIs
+### Windows: build, test, and read-only USB evidence
 
 Windows supports the workspace's pure crates, CLI, terminal UI, descriptor/real
-GUI (with explicit fixture opt-in), mDNS, and SNMP paths. Native Windows USB
-access is **not supported**. Future Windows support may use existing system
-drivers for a selected-printer lifecycle and restore the prior association; it
-must not install a new driver.
+GUI (with explicit fixture opt-in), mDNS, SNMP, and selected read-only libusb
+USB sessions. Windows USB access claims only an already libusb-accessible
+selected interface. It never installs, detaches, rebinds, changes, or restores
+a driver; an access failure is a safe stop.
 
 1. Install [Git for Windows](https://git-scm.com/download/win).
 2. Install the current stable Rust MSVC toolchain from
@@ -605,8 +606,14 @@ cargo run -p reink-tui
 cargo run -p reink-gui
 ```
 
-`local-devices` and `usb-id` return an unsupported-platform error on Windows;
-that is intentional.
+`local-devices` remains Linux-only because it enumerates Linux device files.
+`usb-id`, `usb-d4-probe`, and the read-only `usb-eeprom-dump` workflow are
+available on Windows for an explicitly selected libusb-accessible interface.
+`usb-eeprom-write` and `usb-eeprom-restore` remain unavailable on Windows.
+For the complete hardware-test evidence sequence, use the sibling
+`reink-results\run-windows-read-evidence.ps1` runner with its explicit
+selector and model parameters. It keeps raw paths, reports, traces, and EEPROM
+values in ignored private evidence.
 
 ### macOS: descriptor-only GUI candidates
 
@@ -719,7 +726,7 @@ let values = session.read_eeprom(&[0x000c])?;
 session.shutdown()?;
 ```
 
-`transport` must come from an explicitly selected adapter such as the Linux
+`transport` must come from an explicitly selected adapter such as the libusb
 USB backend. This API is read-only; no CLI command or application-level
 hardware write/reset path exists yet.
 

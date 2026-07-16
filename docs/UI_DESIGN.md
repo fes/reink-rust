@@ -40,11 +40,10 @@ when switching tabs.
 ## Source modes
 
 The GUI starts in descriptor/real mode with no selected printer or fixture. On
-Linux and macOS it may enumerate descriptor-only candidates automatically; on
-Windows it states that native USB enumeration is unavailable. Fixtures are
-hidden unless the GUI is launched with `--fixtures`; only that explicit opt-in
-permits selecting a fixture and running fixture validation. Raw EEPROM file
-inspection remains available in both modes.
+Linux, macOS, and Windows it may enumerate descriptor-only candidates
+automatically. Fixtures are hidden unless the GUI is launched with `--fixtures`;
+only that explicit opt-in permits selecting a fixture and running fixture
+validation. Raw EEPROM file inspection remains available in both modes.
 
 Default mode never opens or claims a device, hands off a driver, sends control,
 D4, or EEPROM traffic, and does not render fixture EEPROM bytes. Selecting a
@@ -59,8 +58,8 @@ three-pane layout.
 
 ## Descriptor-only USB candidates
 
-On Linux and macOS, startup and **Refresh USB candidates** asynchronously call
-only `reink_usb::list_printer_candidates()`. The selector shows this distinct
+On Linux, macOS, and Windows, startup and **Refresh USB candidates**
+asynchronously call only `reink_usb::list_printer_candidates()`. The selector shows this distinct
 group before fixtures. Each candidate gets a session-only alias and shows only
 VID/PID, bus/address, interface/alternate setting, and exact bundled VID/PID
 model hints. It must not show USB manufacturer, product, or serial strings.
@@ -74,9 +73,9 @@ clears the candidate. A candidate has no identity or EEPROM data and makes
 fixture validation unavailable until an explicit read-only operation is selected.
 For a candidate with exactly one model hint, **Read EEPROM** confirms the
 printer identity, performs the model-bounded dump, restores the selected
-interface association, and shows the in-memory image. On Windows, native USB
-descriptor enumeration is unavailable; raw EEPROM inspection remains available, while fixtures require
-the explicit `--fixtures` launch mode.
+interface association on Linux, and shows the in-memory image. On Windows and
+macOS it only claims and releases an already libusb-accessible interface; it
+never installs, detaches, rebinds, or changes a driver.
 
 ## Safety and diagnostics
 

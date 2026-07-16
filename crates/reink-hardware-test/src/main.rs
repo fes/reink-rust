@@ -8,28 +8,28 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_core::PrinterIdentity;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use reink_core::{EpsonSpec, ModelDatabase};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_platform::RecordingTransport;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use reink_platform::TransportEvent;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_usb::read_printer_device_id;
 use serde_json::{Value, json};
 
 const NON_EXECUTABLE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES";
 const TRACE_SANITIZATION_CONFIRMATION: &str = "I_CONFIRM_TRACE_IS_SANITIZED";
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", test)),
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
     allow(dead_code)
 )]
 const DRIVER_RECOVERY_REMEDIATION: &str = "Reconnect the printer, power-cycle it if needed, then reboot the host before retrying. This does not authorize a write, restore, or reset.";
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const OUT_OF_RANGE_READ_CONFIRMATION: &str = "I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE";
 
 #[derive(Parser)]
@@ -525,7 +525,7 @@ fn write_new_file(path: &Path, contents: &str, kind: &str) -> Result<(), String>
         .map_err(|error| format!("could not write {kind} file {}: {error}", path.display()))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn trace_json(command: &str, events: &[TransportEvent]) -> Value {
     let events = events
         .iter()
@@ -548,17 +548,17 @@ fn trace_json(command: &str, events: &[TransportEvent]) -> Value {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_trace_file_path(path: &Path) -> Result<(), String> {
     validate_private_new_file_path(path, "trace")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_report_file_path(path: &Path) -> Result<(), String> {
     validate_private_new_file_path(path, "report")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_private_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
     if path.exists() {
         return Err(format!(
@@ -578,7 +578,7 @@ fn validate_private_new_file_path(path: &Path, kind: &str) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn write_report_file(path: &Path, report: &str) -> Result<(), String> {
     validate_report_file_path(path)?;
     let mut file = OpenOptions::new()
@@ -599,7 +599,7 @@ fn write_report_file(path: &Path, report: &str) -> Result<(), String> {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn emit_report(report: String, report_file: Option<&Path>) -> Result<String, String> {
     if let Some(path) = report_file {
         write_report_file(path, &report)?;
@@ -607,8 +607,11 @@ fn emit_report(report: String, report_file: Option<&Path>) -> Result<String, Str
     Ok(report)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 fn fail_with_report(
     report: String,
     primary_error: String,
@@ -625,12 +628,12 @@ fn fail_with_report(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn driver_recovery_error(error: impl std::fmt::Display) -> String {
     format!("{error}; {DRIVER_RECOVERY_REMEDIATION}")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn write_trace_file(path: &Path, command: &str, events: &[TransportEvent]) -> Result<(), String> {
     validate_trace_file_path(path)?;
     let contents = serde_json::to_vec(&trace_json(command, events))
@@ -653,7 +656,7 @@ fn write_trace_file(path: &Path, command: &str, events: &[TransportEvent]) -> Re
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn finish_trace<T>(
     mut operation: D4Operation<T>,
     trace_file: Option<&Path>,
@@ -678,26 +681,29 @@ fn finish_trace<T>(
     operation
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn usb_candidates() -> Result<String, String> {
     let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
     let candidates = reink_usb::list_printer_candidates().map_err(|error| error.to_string())?;
     Ok(usb_candidates_report(&candidates, &database))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn usb_candidates() -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct D4Operation<T> {
     result: Result<T, String>,
     events: Vec<TransportEvent>,
     driver_handoff: DriverHandoffReport,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn finish_d4_operation<T, E: std::fmt::Display>(
     mut session: reink_app::EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
     operation: Result<T, E>,
@@ -738,7 +744,7 @@ fn finish_d4_operation<T, E: std::fmt::Display>(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_d4_operation<T, E: std::fmt::Display, F>(
     transport: reink_usb::ReadOnlyUsbTransport,
     spec: reink_core::EpsonSpec,
@@ -776,7 +782,7 @@ where
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_read(
     vendor_id: u16,
@@ -856,7 +862,7 @@ fn d4_eeprom_read(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_dump(
     vendor_id: u16,
@@ -973,7 +979,7 @@ fn d4_eeprom_dump(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_dump(
     _: u16,
@@ -988,10 +994,13 @@ fn d4_eeprom_dump(
     _: Option<&Path>,
     _: Option<&Path>,
 ) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_read(
     _: u16,
@@ -1005,10 +1014,13 @@ fn d4_eeprom_read(
     _: Option<&Path>,
     _: Option<&Path>,
 ) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn d4_identity(
     vendor_id: u16,
     product_id: u16,
@@ -1073,7 +1085,7 @@ fn d4_identity(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn d4_identity(
     _: u16,
     _: u16,
@@ -1085,10 +1097,13 @@ fn d4_identity(
     _: Option<&Path>,
     _: Option<&Path>,
 ) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_boundary_probe(
     vendor_id: u16,
@@ -1169,7 +1184,7 @@ fn d4_eeprom_boundary_probe(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[allow(clippy::too_many_arguments)]
 fn d4_eeprom_boundary_probe(
     _: u16,
@@ -1184,10 +1199,13 @@ fn d4_eeprom_boundary_probe(
     _: Option<&Path>,
     _: Option<&Path>,
 ) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn read_sequence(
     vendor_id: u16,
     product_id: u16,
@@ -1231,7 +1249,7 @@ fn read_sequence(
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn read_sequence(
     _: u16,
     _: u16,
@@ -1241,7 +1259,10 @@ fn read_sequence(
     _: Option<u8>,
     _: bool,
 ) -> Result<String, String> {
-    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {
@@ -1252,7 +1273,7 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn eeprom_dump_addresses(
     spec: &EpsonSpec,
     start_address: Option<u16>,
@@ -1274,7 +1295,7 @@ fn eeprom_dump_addresses(
     Ok((start..=end).collect())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_eeprom_read_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result<(), String> {
     for &address in addresses {
         if !(spec.memory_low..=spec.memory_high).contains(&address) {
@@ -1287,7 +1308,7 @@ fn validate_eeprom_read_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_boundary_probe(
     spec: &EpsonSpec,
     address: u16,
@@ -1307,7 +1328,7 @@ fn validate_boundary_probe(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn usb_device_selector(
     vendor_id: u16,
     product_id: u16,
@@ -1330,7 +1351,7 @@ fn is_sha256_reference(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn candidate_model_hints(
     candidate: &reink_usb::UsbPrinterCandidate,
     database: &ModelDatabase,
@@ -1347,7 +1368,7 @@ fn candidate_model_hints(
         .collect()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn usb_candidates_report(
     candidates: &[reink_usb::UsbPrinterCandidate],
     database: &ModelDatabase,
@@ -1423,7 +1444,7 @@ fn write_validation_plan_report(
     .to_string()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn completed_step(name: &str, result: Value) -> Value {
     json!({"name": name, "status": "completed", "result": result})
 }
@@ -1459,7 +1480,7 @@ fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DriverHandoffReport {
     automatic: bool,
@@ -1467,9 +1488,12 @@ struct DriverHandoffReport {
     reattached: Option<bool>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl DriverHandoffReport {
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+        allow(dead_code)
+    )]
     const fn automatic() -> Self {
         Self {
             automatic: true,
@@ -1478,7 +1502,7 @@ impl DriverHandoffReport {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     const fn from_usb(outcome: reink_usb::UsbDriverHandoffOutcome) -> Self {
         Self {
             automatic: outcome.requested,
@@ -1496,7 +1520,7 @@ impl DriverHandoffReport {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl From<bool> for DriverHandoffReport {
     fn from(automatic: bool) -> Self {
         Self {
@@ -1507,7 +1531,7 @@ impl From<bool> for DriverHandoffReport {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn read_only_report(
     command: &str,
     driver_handoff: impl Into<DriverHandoffReport>,
@@ -1526,7 +1550,7 @@ fn read_only_report(
     .to_string()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn d4_failure_report(
     command: &str,
     driver_handoff: DriverHandoffReport,
@@ -1554,7 +1578,7 @@ fn d4_failure_report(
     .to_string()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn dump_progress(completed_address_count: usize, failed_address: Option<u16>) -> Value {
     json!({
         "completed_address_count": completed_address_count,
@@ -1578,7 +1602,7 @@ fn simulated_read_only_report(
     read_only_report(command, false, steps, next_step)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn read_sequence_report(
     usb: Value,
     identity: Value,
@@ -1602,7 +1626,7 @@ fn read_sequence_report(
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn d4_identity_report(identity: Value, driver_handoff: impl Into<DriverHandoffReport>) -> String {
     read_only_report(
         "d4-identity",
@@ -1619,7 +1643,7 @@ fn d4_identity_report(identity: Value, driver_handoff: impl Into<DriverHandoffRe
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn d4_eeprom_read_report(
     values: Vec<Value>,
     driver_handoff: impl Into<DriverHandoffReport>,
@@ -1639,7 +1663,7 @@ fn d4_eeprom_read_report(
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn d4_eeprom_dump_report(
     model: &str,
     start_address: u16,
@@ -1673,7 +1697,7 @@ fn d4_eeprom_dump_report(
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn d4_eeprom_boundary_probe_report(
     address: u16,
     value: u8,

@@ -82,7 +82,7 @@ cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 
 
 ## USB identity preflight
 
-On Linux or macOS, first list candidates without opening a device:
+On Linux, macOS, or Windows, first list candidates without opening a device:
 
 ```powershell
 cargo run -p reink-hardware-test -- usb-candidates
@@ -94,18 +94,17 @@ D4 traffic. Its `usb-1`-style aliases are session/report-only: select a later
 operation using the complete displayed selector. `model_hints` are only
 bundled-database vendor/product label/filter hints; they are not identity,
 cannot select a device automatically, and may be empty even for Epson devices.
-A later IEEE 1284 identity read is required to confirm the model. Windows has
-no fallback enumeration and returns the established unsupported USB error.
+A later IEEE 1284 identity read is required to confirm the model.
 
-Before any D4 interaction, use the Linux or macOS `usb-id` command with an
+Before any D4 interaction, use the Linux, macOS, or Windows `usb-id` command with an
 exact vendor/product/interface selection to request the standard USB Printer
 Class device ID. If vendor/product IDs match more than one attached device,
 also provide the matching `--bus-number` and `--device-address`; ReInk refuses
 to select one arbitrarily. It must remain separate from Epson D4 traffic. If
-an active Linux kernel driver owns the interface or macOS rejects the libusb
-claim, it remains a safe stop on macOS. On Linux, an active driver for the
-explicitly selected interface is automatically detached and reattached for each
-operation.
+an active Linux kernel driver owns the interface, ReInk automatically detaches
+and reattaches it for each operation. On macOS and Windows, ReInk only attempts
+to claim an already libusb-accessible interface. A claim failure is a safe stop:
+do not install, detach, rebind, or otherwise change a driver.
 
 For selected Linux read-only hardware-test commands (`read-sequence`,
 `d4-identity`, `d4-eeprom-read`, `d4-eeprom-dump`, and
@@ -116,15 +115,16 @@ operation. Schema-version-3 D4 reports record
 without raw traffic. No external manual unbind is required. On failure, the
 report directs the operator to reconnect or power-cycle the printer and reboot
 the host if needed before retrying. The current macOS implementation does not
-detach a driver; a future selected-printer operation may use and restore an
-existing system driver association. This does not enable writes or resets.
+detach a driver. Windows also never installs, detaches, rebinds, changes, or
+restores a driver. This does not enable writes or resets.
 
 `read-sequence` includes an isolated D4 entry probe by default. That probe
 stops before D4 Init and may leave a printer awaiting D4 traffic, so the
 automated runner passes `--skip-d4-entry-probe` and lets each later D4 command
 start and close its own session.
 
-After every evidence command succeeds, the automated Linux runner invokes the
+After every evidence command succeeds, the automated Linux and Windows runners
+invoke the
 durable `reink-cli usb-eeprom-dump` workflow and saves a new private
 `eeprom-image.bin` beside the reports. It is a model-bounded read-only image,
 not a hardware-test report or write authorization.
@@ -148,6 +148,19 @@ hint; provide `--candidate-alias` and/or `--model` for any ambiguity. A model
 hint is still not identity confirmation: review the identity report before
 using the capture as model-specific evidence. Raw output remains private and
 must not be committed.
+
+### Automated Windows run
+
+For native Windows, use the companion
+`reink-results/run-windows-read-evidence.ps1` runner with explicit
+vendor/product/interface/alternate-setting/bus/device/model parameters. It
+records descriptor candidates first and rejects a selector that does not match
+exactly one candidate. It captures the same preflight (with the D4 entry probe
+skipped), identity, selected reads, model-bounded dump, boundary probe, and
+conditional durable image. All output remains in an ignored private evidence
+directory; the runner does not print private paths or values. Windows commands
+only claim an already libusb-accessible interface and never install, detach,
+rebind, or change a driver.
 
 ## Read-only validation matrix
 
