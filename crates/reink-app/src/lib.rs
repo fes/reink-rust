@@ -193,11 +193,13 @@ impl<T: ByteTransport> EpsonD4Session<T> {
 fn wait_for_entry_reply<T: ByteTransport>(target: &mut T) -> Result<(), ApplicationError> {
     let mut reply = Vec::new();
     let mut buffer = [0; 256];
+    let mut received_data = false;
     for _ in 0..ENTRY_REPLY_READ_LIMIT {
         let read = target.read(&mut buffer)?;
         if read == 0 {
-            return Err(ApplicationError::EntryReplyMissing);
+            continue;
         }
+        received_data = true;
         reply.extend_from_slice(&buffer[..read]);
         if reply
             .windows(EPSON_D4_ENTRY_REPLY.len())
@@ -206,7 +208,11 @@ fn wait_for_entry_reply<T: ByteTransport>(target: &mut T) -> Result<(), Applicat
             return Ok(());
         }
     }
-    Err(ApplicationError::EntryReplyInvalid)
+    if received_data {
+        Err(ApplicationError::EntryReplyInvalid)
+    } else {
+        Err(ApplicationError::EntryReplyMissing)
+    }
 }
 
 /// Failure while composing the transport, D4, and Epson layers.
@@ -288,7 +294,7 @@ impl From<reink_usb::UsbOpenError> for ApplicationError {
 mod tests {
     use reink_core::{ModelDatabase, encode_command, encode_eeprom_read};
     use reink_d4::{Packet, ProtocolRevision, TransactionMessage};
-    use reink_platform_test::{SanitizedTranscript, TranscriptTransport};
+    use reink_platform_test::{SanitizedTranscript, ScriptedTransport, TranscriptTransport};
 
     use super::{
         ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session,
@@ -312,6 +318,16 @@ mod tests {
         gate.record_backup_declined();
 
         assert!(!gate.requires_backup_choice());
+    }
+
+    #[test]
+    fn entry_probe_retries_an_empty_read_before_the_reply() {
+        let mut target = ScriptedTransport::new("scripted");
+        target.push_read_data(Vec::new());
+        target.push_read_data(EPSON_D4_ENTRY_REPLY);
+
+        super::wait_for_entry_reply(&mut target).unwrap();
+        target.assert_finished();
     }
 
     fn spec() -> reink_core::EpsonSpec {
