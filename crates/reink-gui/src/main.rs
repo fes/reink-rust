@@ -537,11 +537,14 @@ impl ReinkGui {
                             let combo_id = ui.make_persistent_id("eeprom-model");
                             let focus_filter = selected_model.is_none()
                                 && !egui::ComboBox::is_open(ui.ctx(), combo_id);
+                            let model_popup_height =
+                                72.0 + 5.0 * ui.spacing().interact_size.y;
                             egui::ComboBox::from_id_salt("eeprom-model")
                                 .selected_text(
                                     selected_model.as_deref().unwrap_or("Select model..."),
                                 )
                                 .width(180.0)
+                                .height(model_popup_height)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show_ui(ui, |ui| {
                                     ui.label("Filter (regex)");
