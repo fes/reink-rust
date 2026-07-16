@@ -115,6 +115,26 @@ recording raw traffic. Reattachment
 failure may require manual driver recovery or a reboot. The flag has no
 kernel-handoff effect on macOS and never enables writes or resets.
 
+### Automated Linux run
+
+For the standard complete evidence sequence, use the companion
+`reink-results/run-linux-read-evidence.sh` runner with both repositories
+checked out as siblings:
+
+```bash
+cd ../reink-results
+./run-linux-read-evidence.sh --allow-driver-handoff
+```
+
+It captures the descriptor report, preflight, identity, selected reads,
+model-bounded dump, and one derived out-of-range boundary probe in a
+timestamped ignored `private-evidence/` directory. The runner automatically
+selects only an unambiguous single candidate with a single exact bundled model
+hint; provide `--candidate-alias` and/or `--model` for any ambiguity. A model
+hint is still not identity confirmation: review the identity report before
+using the capture as model-specific evidence. Raw output remains private and
+must not be committed.
+
 ## Read-only validation matrix
 
 For each accessible printer, collect two complete structured runs of device-ID,

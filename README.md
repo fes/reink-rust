@@ -315,6 +315,21 @@ database label/filter hints for an exact vendor/product mapping, not identity
 or automatic selection; they may be empty. A later IEEE 1284 identity read
 confirms the model. Windows returns the standard unsupported USB error.
 
+For a complete Linux evidence run, the companion `reink-results` repository
+provides `run-linux-read-evidence.sh`. With the repositories checked out as
+siblings, run it from `reink-results`:
+
+```bash
+./run-linux-read-evidence.sh --allow-driver-handoff
+```
+
+The script selects a candidate only when exactly one descriptor candidate and
+one exact bundled model hint exist; otherwise it requires
+`--candidate-alias` and/or `--model`. It derives the model range, preserves
+preflight, identity, selected-read, dump, and boundary-probe results in an
+ignored timestamped private directory, and never performs a write or reset.
+The identity result remains the authoritative model confirmation.
+
 For a single structured read-only preflight report, use:
 
 ```powershell
