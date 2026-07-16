@@ -2,18 +2,18 @@
 
 use eframe::egui::{self, Color32, RichText};
 use regex::RegexBuilder;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EepromImage, EpsonD4Session};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_core::ModelDatabase;
 use reink_gui::{
     DebugTrafficTrace, DescriptorCandidate, GuiState, Page, SourceMode, ValidationStatus,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_platform::RecordingTransport;
 use reink_platform::TransportEvent;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 fn main() -> eframe::Result {
@@ -41,10 +41,10 @@ pub struct ReinkGui {
     usb_candidates: Vec<DescriptorCandidate>,
     selected_usb_candidate: Option<usize>,
     usb_scan_status: UsbScanStatus,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     usb_scan_receiver: Option<Receiver<Result<Vec<reink_usb::UsbPrinterCandidate>, String>>>,
     file_error: Option<String>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     usb_dump_receiver: Option<Receiver<UsbEepromDumpOutcome>>,
     usb_dump_error: Option<String>,
     model_filter: String,
@@ -66,16 +66,16 @@ struct EepromFileField {
 }
 
 enum UsbScanStatus {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Scanning,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Ready,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Failed(String),
     Unavailable,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct UsbEepromDumpOutcome {
     result: Result<EepromImage, String>,
     events: Vec<TransportEvent>,
@@ -103,10 +103,10 @@ impl ReinkGui {
             usb_candidates: Vec::new(),
             selected_usb_candidate: None,
             usb_scan_status: UsbScanStatus::Unavailable,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             usb_scan_receiver: None,
             file_error: None,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             usb_dump_receiver: None,
             usb_dump_error: None,
             model_filter: String::new(),
@@ -148,14 +148,14 @@ impl ReinkGui {
 
     fn usb_scan_status_label(&self) -> String {
         match &self.usb_scan_status {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             UsbScanStatus::Scanning => "Scanning USB printer descriptors…".to_owned(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             UsbScanStatus::Ready => format!(
                 "{} USB descriptor candidate(s) found",
                 self.usb_candidates.len()
             ),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             UsbScanStatus::Failed(error) => format!("USB descriptor scan failed: {error}"),
             UsbScanStatus::Unavailable => {
                 "USB descriptor enumeration is unavailable on Windows.".to_owned()
@@ -275,7 +275,7 @@ impl ReinkGui {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn refresh_usb_candidates(&mut self) {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         self.usb_scan_receiver = Some(receiver);
@@ -286,12 +286,12 @@ impl ReinkGui {
         });
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn refresh_usb_candidates(&mut self) {
         self.usb_scan_status = UsbScanStatus::Unavailable;
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn poll_usb_candidates(&mut self) {
         let result =
             self.usb_scan_receiver
@@ -334,15 +334,15 @@ impl ReinkGui {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn poll_usb_candidates(&mut self) {}
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn usb_dump_in_progress(&self) -> bool {
         self.usb_dump_receiver.is_some()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn poll_usb_eeprom_dump(&mut self) {
         let result =
             self.usb_dump_receiver
@@ -386,10 +386,10 @@ impl ReinkGui {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn poll_usb_eeprom_dump(&mut self) {}
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn start_selected_usb_eeprom_dump(&mut self) {
         if self.usb_dump_receiver.is_some() {
             return;
@@ -446,12 +446,12 @@ impl ReinkGui {
                             .show_ui(ui, |ui| {
                                 ui.strong("USB descriptor candidates");
                                 if self.usb_candidates.is_empty() {
-                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                                     ui.label(match &self.usb_scan_status {
                                         UsbScanStatus::Scanning => "Scanning…",
                                         _ => "No USB descriptor candidates",
                                     });
-                                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                                     ui.label("No USB descriptor candidates");
                                 }
                                 for (index, candidate) in self.usb_candidates.iter().enumerate() {
@@ -508,7 +508,7 @@ impl ReinkGui {
                             self.open_eeprom_file();
                         }
                         ui.label("Printer");
-                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                         if ui
                             .add_enabled(
                                 !matches!(&self.usb_scan_status, UsbScanStatus::Scanning),
@@ -518,7 +518,7 @@ impl ReinkGui {
                         {
                             self.refresh_usb_candidates();
                         }
-                        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                         ui.add_enabled(false, egui::Button::new("Refresh USB candidates"));
                         ui.label(self.usb_scan_status_label());
 
@@ -638,7 +638,7 @@ impl ReinkGui {
             ui.label("Identity/EEPROM reads require a future explicit read-only operation.");
             if candidate.model_hints.len() == 1 {
                 ui.label(format!("Resolved model hint: {}", candidate.model_hints[0]));
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 {
                     if self.usb_dump_in_progress() {
                         ui.label("Dumping selected printer EEPROM…");
@@ -1127,7 +1127,7 @@ impl ReinkGui {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn dump_selected_usb_eeprom(candidate: DescriptorCandidate) -> UsbEepromDumpOutcome {
     let hint = candidate
         .model_hints
@@ -1233,7 +1233,7 @@ impl eframe::App for ReinkGui {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.poll_usb_candidates();
         self.poll_usb_eeprom_dump();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         if matches!(&self.usb_scan_status, UsbScanStatus::Scanning) || self.usb_dump_in_progress() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));

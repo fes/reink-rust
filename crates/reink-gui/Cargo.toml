@@ -14,5 +14,5 @@ reink-core = { path = "../reink-core" }
 reink-platform = { path = "../reink-platform" }
 rfd = "0.15"
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 reink-usb = { path = "../reink-usb" }

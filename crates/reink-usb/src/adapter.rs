@@ -86,6 +86,7 @@ pub struct ReadOnlyUsbTransport {
     input_packet_size: usize,
     timeout: Duration,
     claimed: bool,
+    #[cfg(target_os = "linux")]
     detached_kernel_driver: bool,
     driver_handoff: UsbDriverHandoffOutcome,
 }
@@ -94,8 +95,9 @@ impl ReadOnlyUsbTransport {
     /// Opens a selected printer interface.
     ///
     /// On Linux, this automatically detaches an active driver for the selected
-    /// interface and reattaches it on close. On macOS, libusb claim failure is
-    /// returned without a driver workaround.
+    /// interface and reattaches it on close. On macOS and Windows, a claim is
+    /// attempted only against an existing libusb-accessible interface; no driver
+    /// is installed, detached, or rebound.
     pub fn open(
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
@@ -107,7 +109,8 @@ impl ReadOnlyUsbTransport {
     ///
     /// On Linux, `TemporarilyDetach` detaches an active kernel driver only for
     /// this interface. Call [`Self::close`] to report release or reattach
-    /// failures. On macOS the policy does not change normal claim behavior.
+    /// failures. On macOS and Windows the policy does not change normal claim
+    /// behavior.
     pub fn open_with_policy(
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
@@ -125,20 +128,21 @@ impl ReadOnlyUsbTransport {
         handoff: UsbDriverHandoff,
     ) -> Result<Self, UsbOpenError> {
         let selected = selected_interface(&device, interface)?;
-        let mut handle = device.open().map_err(UsbOpenError::Open)?;
+        let handle = device.open().map_err(UsbOpenError::Open)?;
+        #[cfg(target_os = "linux")]
+        let mut handle = handle;
         #[cfg(target_os = "linux")]
         let detached_kernel_driver =
             claim_interface_with_policy(&mut handle, selected.number, handoff, |handle| {
                 handle.claim_interface(selected.number)
             })?;
-        #[cfg(target_os = "macos")]
-        let detached_kernel_driver = {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
             let _ = handoff;
             handle
                 .claim_interface(selected.number)
                 .map_err(UsbOpenError::Claim)?;
-            false
-        };
+        }
 
         Ok(Self {
             _context: context,
@@ -149,9 +153,13 @@ impl ReadOnlyUsbTransport {
             input_packet_size: usize::from(selected.input.max_packet_size),
             timeout: DEFAULT_TIMEOUT,
             claimed: true,
+            #[cfg(target_os = "linux")]
             detached_kernel_driver,
+            #[cfg(target_os = "linux")]
             driver_handoff: UsbDriverHandoffOutcome::requested(handoff)
                 .with_detached(detached_kernel_driver),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            driver_handoff: UsbDriverHandoffOutcome::requested(handoff),
         })
     }
 
@@ -185,7 +193,7 @@ impl ReadOnlyUsbTransport {
         } else {
             None
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let reattach: Option<UsbOpenError> = None;
 
         match (release, reattach) {

@@ -3,12 +3,12 @@
 //!
 //! On Linux, operations on an explicitly selected interface temporarily detach
 //! and restore only the active kernel driver that they detached. Its concrete
-//! libusb transport is available on Linux and macOS.
+//! libusb transport is available on Linux, macOS, and Windows.
 
 mod descriptor;
 mod selection;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod adapter;
 
 /// Controls whether an active Linux kernel driver may be temporarily detached.
@@ -49,13 +49,13 @@ impl UsbDriverHandoffOutcome {
         }
     }
 
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const fn with_detached(mut self, detached: bool) -> Self {
         self.detached = detached;
         self
     }
 
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn record_reattach(&mut self, succeeded: bool) {
         if self.detached {
             self.reattached = Some(succeeded);
@@ -73,7 +73,7 @@ pub use selection::{
     select_usb_device,
 };
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use adapter::{
     BoundedExchangeProbeResult, ReadOnlyUsbTransport, UsbOpenError, list_printer_candidates,
     probe_bounded_exchange, probe_bounded_exchange_with_policy, read_printer_device_id,
@@ -85,6 +85,9 @@ pub type LinuxUsbTransport = ReadOnlyUsbTransport;
 
 #[cfg(target_os = "macos")]
 pub type MacOsUsbTransport = ReadOnlyUsbTransport;
+
+#[cfg(target_os = "windows")]
+pub type WindowsUsbTransport = ReadOnlyUsbTransport;
 
 #[cfg(test)]
 mod tests {

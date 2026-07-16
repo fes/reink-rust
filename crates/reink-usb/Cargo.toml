@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only Linux and macOS libusb transport for ReInk printer interfaces"
+description = "Read-only libusb transport for ReInk printer interfaces"
 
 [dependencies]
 reink-platform = { path = "../reink-platform" }
@@ -13,4 +13,7 @@ reink-platform = { path = "../reink-platform" }
 rusb = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+rusb = { version = "0.9", features = ["vendored"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
 rusb = { version = "0.9", features = ["vendored"] }

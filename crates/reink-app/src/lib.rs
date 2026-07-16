@@ -8,7 +8,7 @@ use reink_core::{
     EepromReadReply, EepromWriteOptions, EpsonController, EpsonError, EpsonSpec, PrinterIdentity,
 };
 use reink_d4::{ChannelId, D4Error, D4Link};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_platform::UsbInterfaceSelector;
 use reink_platform::{ByteTransport, TransportError};
 
@@ -61,12 +61,12 @@ pub enum EpsonD4EntryProbeResult {
     Unrecognized { received_bytes: usize },
 }
 
-/// Probes Epson D4 entry on a selected Linux or macOS USB interface without initializing D4.
+/// Probes Epson D4 entry on a selected Linux, macOS, or Windows USB interface without initializing D4.
 ///
 /// The probe sends only the source-compatible Epson entry exchange. It does
 /// not initialize D4, open a service, access EEPROM, write printer state, or
 /// reset counters.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn probe_epson_d4_entry(
     device: reink_usb::UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -87,7 +87,7 @@ pub fn probe_epson_d4_entry(
 }
 
 /// Probes Epson D4 entry with an explicit USB driver-handoff policy.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn probe_epson_d4_entry_with_policy(
     device: reink_usb::UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -345,7 +345,7 @@ pub enum ApplicationError {
     },
     Epson(EpsonError),
     WritePlan(String),
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Usb(reink_usb::UsbOpenError),
     EntryReplyMissing,
     EntryReplyInvalid,
@@ -362,7 +362,7 @@ impl fmt::Display for ApplicationError {
             ),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
             Self::WritePlan(error) => write!(formatter, "invalid EEPROM write plan: {error}"),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Self::Usb(error) => write!(formatter, "USB error: {error}"),
             Self::EntryReplyMissing => formatter.write_str("Epson D4 entry reply was not received"),
             Self::EntryReplyInvalid => {
@@ -380,7 +380,7 @@ impl Error for ApplicationError {
             Self::SetupRecovery { setup, .. } => Some(setup),
             Self::Epson(error) => Some(error),
             Self::WritePlan(_) => None,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Self::Usb(error) => Some(error),
             Self::EntryReplyMissing | Self::EntryReplyInvalid => None,
         }
@@ -405,7 +405,7 @@ impl From<EpsonError> for ApplicationError {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl From<reink_usb::UsbOpenError> for ApplicationError {
     fn from(error: reink_usb::UsbOpenError) -> Self {
         Self::Usb(error)
