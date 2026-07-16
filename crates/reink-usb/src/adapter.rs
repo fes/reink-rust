@@ -8,14 +8,73 @@ use rusb::{
 };
 
 use crate::{
-    EndpointDescriptor, SelectedUsbInterface, UsbDeviceDescriptor, UsbDeviceLocation,
-    UsbDeviceSelectionError, UsbDeviceSelector, UsbInterfaceDescriptor, select_printer_interface,
-    select_usb_device,
+    EndpointDescriptor, SelectedUsbInterface, UsbCandidateDeviceDescriptor, UsbDeviceDescriptor,
+    UsbDeviceLocation, UsbDeviceSelectionError, UsbDeviceSelector, UsbDriverHandoff,
+    UsbDriverHandoffOutcome, UsbInterfaceDescriptor, UsbPrinterCandidate,
+    select_printer_candidates, select_printer_interface, select_usb_device,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const GET_DEVICE_ID_REQUEST: u8 = 0;
 const DEVICE_ID_BUFFER_CAPACITY: usize = 1024;
+
+/// Lists USB printer candidates using libusb descriptors only.
+///
+/// This function does not open or claim a device, detach a driver, issue a USB
+/// control request, or perform any printer protocol traffic.
+pub fn list_printer_candidates() -> Result<Vec<UsbPrinterCandidate>, UsbOpenError> {
+    let context = Context::new().map_err(UsbOpenError::Context)?;
+    let devices = context.devices().map_err(UsbOpenError::Context)?;
+    let descriptors = devices
+        .iter()
+        .map(candidate_device_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(select_printer_candidates(&descriptors))
+}
+
+fn candidate_device_descriptor(
+    device: Device<Context>,
+) -> Result<UsbCandidateDeviceDescriptor, UsbOpenError> {
+    let descriptor = device
+        .device_descriptor()
+        .map_err(UsbOpenError::Descriptor)?;
+    let configuration = device
+        .config_descriptor(0)
+        .map_err(UsbOpenError::Descriptor)?;
+    Ok(UsbCandidateDeviceDescriptor {
+        vendor_id: descriptor.vendor_id(),
+        product_id: descriptor.product_id(),
+        bus_number: device.bus_number(),
+        device_address: device.address(),
+        device_class: descriptor.class_code(),
+        interfaces: configuration
+            .interfaces()
+            .flat_map(|interface| interface.descriptors())
+            .map(usb_interface_descriptor)
+            .collect(),
+    })
+}
+
+fn usb_interface_descriptor(interface: rusb::InterfaceDescriptor<'_>) -> UsbInterfaceDescriptor {
+    UsbInterfaceDescriptor {
+        number: interface.interface_number(),
+        alternate_setting: interface.setting_number(),
+        class_code: interface.class_code(),
+        endpoints: interface
+            .endpoint_descriptors()
+            .map(|endpoint| EndpointDescriptor {
+                address: endpoint.address(),
+                attributes: match endpoint.transfer_type() {
+                    rusb::TransferType::Control => 0,
+                    rusb::TransferType::Isochronous => 1,
+                    rusb::TransferType::Bulk => 2,
+                    rusb::TransferType::Interrupt => 3,
+                },
+                max_packet_size: endpoint.max_packet_size(),
+            })
+            .collect(),
+    }
+}
 
 /// A claimed read-only USB printer interface backed by libusb.
 pub struct ReadOnlyUsbTransport {
@@ -26,6 +85,9 @@ pub struct ReadOnlyUsbTransport {
     output_endpoint: u8,
     input_packet_size: usize,
     timeout: Duration,
+    claimed: bool,
+    detached_kernel_driver: bool,
+    driver_handoff: UsbDriverHandoffOutcome,
 }
 
 impl ReadOnlyUsbTransport {
@@ -37,23 +99,45 @@ impl ReadOnlyUsbTransport {
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
     ) -> Result<Self, UsbOpenError> {
-        let context = Context::new().map_err(UsbOpenError::Context)?;
-        let usb_device = find_device(&context, device)?;
-        Self::open_device(context, usb_device, interface)
+        Self::open_with_policy(device, interface, UsbDriverHandoff::Refuse)
     }
 
-    fn open_device(
+    /// Opens a selected printer interface with an explicit driver-handoff policy.
+    ///
+    /// On Linux, `TemporarilyDetach` detaches an active kernel driver only for
+    /// this interface. Call [`Self::close`] to report release or reattach
+    /// failures. On macOS the policy does not change normal claim behavior.
+    pub fn open_with_policy(
+        device: UsbDeviceSelector,
+        interface: UsbInterfaceSelector,
+        handoff: UsbDriverHandoff,
+    ) -> Result<Self, UsbOpenError> {
+        let context = Context::new().map_err(UsbOpenError::Context)?;
+        let usb_device = find_device(&context, device)?;
+        Self::open_device_with_policy(context, usb_device, interface, handoff)
+    }
+
+    fn open_device_with_policy(
         context: Context,
         device: Device<Context>,
         interface: UsbInterfaceSelector,
+        handoff: UsbDriverHandoff,
     ) -> Result<Self, UsbOpenError> {
         let selected = selected_interface(&device, interface)?;
         let mut handle = device.open().map_err(UsbOpenError::Open)?;
         #[cfg(target_os = "linux")]
-        ensure_kernel_driver_inactive(&mut handle, selected.number)?;
-        handle
-            .claim_interface(selected.number)
-            .map_err(UsbOpenError::Claim)?;
+        let detached_kernel_driver =
+            claim_interface_with_policy(&mut handle, selected.number, handoff, |handle| {
+                handle.claim_interface(selected.number)
+            })?;
+        #[cfg(target_os = "macos")]
+        let detached_kernel_driver = {
+            let _ = handoff;
+            handle
+                .claim_interface(selected.number)
+                .map_err(UsbOpenError::Claim)?;
+            false
+        };
 
         Ok(Self {
             _context: context,
@@ -63,36 +147,83 @@ impl ReadOnlyUsbTransport {
             output_endpoint: selected.output.address,
             input_packet_size: usize::from(selected.input.max_packet_size),
             timeout: DEFAULT_TIMEOUT,
+            claimed: true,
+            detached_kernel_driver,
+            driver_handoff: UsbDriverHandoffOutcome::requested(handoff)
+                .with_detached(detached_kernel_driver),
         })
+    }
+
+    /// Releases the claimed interface and reattaches a driver this transport detached.
+    ///
+    /// Both cleanup operations are attempted. This is the only cleanup API
+    /// that reports failures; `Drop` is best effort only.
+    pub fn close(&mut self) -> Result<(), UsbOpenError> {
+        let release = if self.claimed {
+            self.claimed = false;
+            self.handle
+                .release_interface(self.interface)
+                .map_err(UsbOpenError::Release)
+                .err()
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let reattach = if self.detached_kernel_driver {
+            match self.handle.attach_kernel_driver(self.interface) {
+                Ok(()) => {
+                    self.detached_kernel_driver = false;
+                    self.driver_handoff.record_reattach(true);
+                    None
+                }
+                Err(error) => {
+                    self.driver_handoff.record_reattach(false);
+                    Some(UsbOpenError::ReattachKernelDriver(error))
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let reattach: Option<UsbOpenError> = None;
+
+        match (release, reattach) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(error),
+            (Some(release), Some(reattach)) => Err(UsbOpenError::ReleaseAndReattach {
+                release: Box::new(release),
+                reattach: Box::new(reattach),
+            }),
+        }
+    }
+
+    /// Returns the actual driver-handoff lifecycle observed by this transport.
+    pub const fn driver_handoff_outcome(&self) -> UsbDriverHandoffOutcome {
+        self.driver_handoff
     }
 }
 
 /// Reads the standard USB Printer Class device identifier without a protocol session.
 ///
 /// On Linux, the selected interface must not have an active kernel driver.
-/// This function never detaches, rebinds, or otherwise modifies a driver.
+/// Use [`read_printer_device_id_with_policy`] for the explicit maintenance
+/// handoff variant.
 pub fn read_printer_device_id(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<Vec<u8>, UsbOpenError> {
-    let context = Context::new().map_err(UsbOpenError::Context)?;
-    let usb_device = find_device(&context, device)?;
-    let selected = selected_interface(&usb_device, interface)?;
-    let mut handle = usb_device.open().map_err(UsbOpenError::Open)?;
-    #[cfg(target_os = "linux")]
-    ensure_kernel_driver_inactive(&mut handle, selected.number)?;
-    handle
-        .claim_interface(selected.number)
-        .map_err(UsbOpenError::Claim)?;
+    read_printer_device_id_with_policy(device, interface, UsbDriverHandoff::Refuse)
+}
 
-    let result = read_device_id_from_claimed_handle(&mut handle, selected.number);
-    let release = handle
-        .release_interface(selected.number)
-        .map_err(UsbOpenError::Release);
-    match result {
-        Err(error) => Err(error),
-        Ok(device_id) => release.map(|()| device_id),
-    }
+/// Reads a printer device identifier with an explicit driver-handoff policy.
+pub fn read_printer_device_id_with_policy(
+    device: UsbDeviceSelector,
+    interface: UsbInterfaceSelector,
+    handoff: UsbDriverHandoff,
+) -> Result<Vec<u8>, UsbOpenError> {
+    let mut transport = ReadOnlyUsbTransport::open_with_policy(device, interface, handoff)?;
+    let result = read_device_id_from_claimed_handle(&mut transport.handle, transport.interface);
+    finish_operation(result, &mut transport)
 }
 
 /// Outcome of a bounded request/reply probe.
@@ -107,8 +238,8 @@ pub enum BoundedExchangeProbeResult {
 /// Sends a request and looks for an expected reply across at most `max_reads`.
 ///
 /// On Linux, the selected interface must not have an active kernel driver.
-/// This function never detaches, rebinds, or otherwise modifies a driver. It
-/// never returns the collected reply bytes.
+/// Use [`probe_bounded_exchange_with_policy`] for the explicit maintenance
+/// handoff variant. This function never returns collected reply bytes.
 pub fn probe_bounded_exchange(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -116,47 +247,67 @@ pub fn probe_bounded_exchange(
     expected_reply: &[u8],
     max_reads: usize,
 ) -> Result<BoundedExchangeProbeResult, UsbOpenError> {
+    probe_bounded_exchange_with_policy(
+        device,
+        interface,
+        request,
+        expected_reply,
+        max_reads,
+        UsbDriverHandoff::Refuse,
+    )
+}
+
+/// Runs a bounded exchange with an explicit driver-handoff policy.
+pub fn probe_bounded_exchange_with_policy(
+    device: UsbDeviceSelector,
+    interface: UsbInterfaceSelector,
+    request: &[u8],
+    expected_reply: &[u8],
+    max_reads: usize,
+    handoff: UsbDriverHandoff,
+) -> Result<BoundedExchangeProbeResult, UsbOpenError> {
     if expected_reply.is_empty() {
         return Err(UsbOpenError::EmptyExpectedReply);
     }
-    let context = Context::new().map_err(UsbOpenError::Context)?;
-    let usb_device = find_device(&context, device)?;
-    let selected = selected_interface(&usb_device, interface)?;
-    let mut handle = usb_device.open().map_err(UsbOpenError::Open)?;
-    #[cfg(target_os = "linux")]
-    ensure_kernel_driver_inactive(&mut handle, selected.number)?;
-    handle
-        .claim_interface(selected.number)
-        .map_err(UsbOpenError::Claim)?;
-
-    let result = probe_bounded_exchange_with_claimed_handle(
-        &mut handle,
-        &selected,
+    let mut transport = ReadOnlyUsbTransport::open_with_policy(device, interface, handoff)?;
+    let result = probe_bounded_exchange_with_claimed_transport(
+        &mut transport,
         request,
         expected_reply,
         max_reads,
     );
-    let release = handle
-        .release_interface(selected.number)
-        .map_err(UsbOpenError::Release);
-    match result {
-        Err(error) => Err(error),
-        Ok(outcome) => release.map(|()| outcome),
+    finish_operation(result, &mut transport)
+}
+
+fn finish_operation<T>(
+    result: Result<T, UsbOpenError>,
+    transport: &mut ReadOnlyUsbTransport,
+) -> Result<T, UsbOpenError> {
+    match (result, transport.close()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(close)) => Err(close),
+        (Err(operation), Err(close)) => Err(UsbOpenError::OperationAndClose {
+            operation: Box::new(operation),
+            close: Box::new(close),
+        }),
     }
 }
 
-fn probe_bounded_exchange_with_claimed_handle(
-    handle: &mut DeviceHandle<Context>,
-    selected: &SelectedUsbInterface,
+fn probe_bounded_exchange_with_claimed_transport(
+    transport: &mut ReadOnlyUsbTransport,
     request: &[u8],
     expected_reply: &[u8],
     max_reads: usize,
 ) -> Result<BoundedExchangeProbeResult, UsbOpenError> {
-    handle
-        .write_bulk(selected.output.address, request, DEFAULT_TIMEOUT)
+    transport
+        .handle
+        .write_bulk(transport.output_endpoint, request, DEFAULT_TIMEOUT)
         .map_err(UsbOpenError::WriteExchange)?;
     read_bounded_reply(expected_reply, max_reads, |buffer| {
-        handle.read_bulk(selected.input.address, buffer, DEFAULT_TIMEOUT)
+        transport
+            .handle
+            .read_bulk(transport.input_endpoint, buffer, DEFAULT_TIMEOUT)
     })
     .map_err(UsbOpenError::ReadExchange)
 }
@@ -221,7 +372,7 @@ impl ByteTransport for ReadOnlyUsbTransport {
 
 impl Drop for ReadOnlyUsbTransport {
     fn drop(&mut self) {
-        let _ = self.handle.release_interface(self.interface);
+        let _ = self.close();
     }
 }
 
@@ -272,24 +423,7 @@ fn selected_interface(
     let interfaces = configuration
         .interfaces()
         .flat_map(|interface| interface.descriptors())
-        .map(|interface| UsbInterfaceDescriptor {
-            number: interface.interface_number(),
-            alternate_setting: interface.setting_number(),
-            class_code: interface.class_code(),
-            endpoints: interface
-                .endpoint_descriptors()
-                .map(|endpoint| EndpointDescriptor {
-                    address: endpoint.address(),
-                    attributes: match endpoint.transfer_type() {
-                        rusb::TransferType::Control => 0,
-                        rusb::TransferType::Isochronous => 1,
-                        rusb::TransferType::Bulk => 2,
-                        rusb::TransferType::Interrupt => 3,
-                    },
-                    max_packet_size: endpoint.max_packet_size(),
-                })
-                .collect(),
-        })
+        .map(usb_interface_descriptor)
         .collect::<Vec<_>>();
     select_printer_interface(descriptor.class_code(), &interfaces)
         .filter(|selected| {
@@ -302,6 +436,8 @@ fn selected_interface(
 #[cfg(target_os = "linux")]
 trait KernelDriver {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error>;
+    fn detach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error>;
+    fn attach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error>;
 }
 
 #[cfg(target_os = "linux")]
@@ -309,17 +445,47 @@ impl KernelDriver for DeviceHandle<Context> {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error> {
         DeviceHandle::kernel_driver_active(self, interface)
     }
+
+    fn detach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error> {
+        DeviceHandle::detach_kernel_driver(self, interface)
+    }
+
+    fn attach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error> {
+        DeviceHandle::attach_kernel_driver(self, interface)
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_kernel_driver_inactive<H: KernelDriver>(
+fn claim_interface_with_policy<H, F>(
     handle: &mut H,
     interface: u8,
-) -> Result<(), UsbOpenError> {
-    match handle.kernel_driver_active(interface) {
-        Ok(true) => Err(UsbOpenError::KernelDriverActive { interface }),
-        Ok(false) | Err(rusb::Error::NotSupported) => Ok(()),
-        Err(error) => Err(UsbOpenError::KernelDriverQuery(error)),
+    handoff: UsbDriverHandoff,
+    claim: F,
+) -> Result<bool, UsbOpenError>
+where
+    H: KernelDriver,
+    F: FnOnce(&mut H) -> Result<(), rusb::Error>,
+{
+    let detached_kernel_driver = match handle.kernel_driver_active(interface) {
+        Ok(true) if handoff == UsbDriverHandoff::Refuse => {
+            return Err(UsbOpenError::KernelDriverActive { interface });
+        }
+        Ok(true) => {
+            handle
+                .detach_kernel_driver(interface)
+                .map_err(UsbOpenError::DetachKernelDriver)?;
+            true
+        }
+        Ok(false) | Err(rusb::Error::NotSupported) => false,
+        Err(error) => return Err(UsbOpenError::KernelDriverQuery(error)),
+    };
+    match claim(handle) {
+        Ok(()) => Ok(detached_kernel_driver),
+        Err(claim) if detached_kernel_driver => match handle.attach_kernel_driver(interface) {
+            Ok(()) => Err(UsbOpenError::Claim(claim)),
+            Err(reattach) => Err(UsbOpenError::ClaimAndReattach { claim, reattach }),
+        },
+        Err(claim) => Err(UsbOpenError::Claim(claim)),
     }
 }
 
@@ -382,11 +548,25 @@ pub enum UsbOpenError {
     KernelDriverActive {
         interface: u8,
     },
+    DetachKernelDriver(rusb::Error),
     Claim(rusb::Error),
+    ClaimAndReattach {
+        claim: rusb::Error,
+        reattach: rusb::Error,
+    },
     ReadDeviceId(rusb::Error),
     WriteExchange(rusb::Error),
     ReadExchange(rusb::Error),
     Release(rusb::Error),
+    ReattachKernelDriver(rusb::Error),
+    ReleaseAndReattach {
+        release: Box<UsbOpenError>,
+        reattach: Box<UsbOpenError>,
+    },
+    OperationAndClose {
+        operation: Box<UsbOpenError>,
+        close: Box<UsbOpenError>,
+    },
     EmptyExpectedReply,
     InvalidDeviceIdLength {
         received: usize,
@@ -423,7 +603,14 @@ impl fmt::Display for UsbOpenError {
                 formatter,
                 "USB interface {interface} is owned by an active kernel driver; ReInk will not detach it"
             ),
+            Self::DetachKernelDriver(error) => {
+                write!(formatter, "detaching USB kernel driver failed: {error}")
+            }
             Self::Claim(error) => write!(formatter, "claiming USB interface failed: {error}"),
+            Self::ClaimAndReattach { claim, reattach } => write!(
+                formatter,
+                "claiming USB interface failed: {claim}; reattaching the detached kernel driver also failed: {reattach}"
+            ),
             Self::ReadDeviceId(error) => {
                 write!(formatter, "reading USB printer device ID failed: {error}")
             }
@@ -440,6 +627,18 @@ impl fmt::Display for UsbOpenError {
                 )
             }
             Self::Release(error) => write!(formatter, "releasing USB interface failed: {error}"),
+            Self::ReattachKernelDriver(error) => {
+                write!(
+                    formatter,
+                    "reattaching the detached USB kernel driver failed: {error}"
+                )
+            }
+            Self::ReleaseAndReattach { release, reattach } => {
+                write!(formatter, "{release}; {reattach}")
+            }
+            Self::OperationAndClose { operation, close } => {
+                write!(formatter, "{operation}; cleanup also failed: {close}")
+            }
             Self::EmptyExpectedReply => {
                 formatter.write_str("bounded USB exchange expected reply must not be empty")
             }
@@ -485,27 +684,153 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    use super::{KernelDriver, ensure_kernel_driver_inactive};
+    use super::{KernelDriver, UsbDriverHandoff, claim_interface_with_policy};
 
     #[cfg(target_os = "linux")]
-    struct ActiveKernelDriver;
+    struct MockKernelDriver {
+        detach_fails: bool,
+        attach_fails: bool,
+        events: Vec<&'static str>,
+    }
 
     #[cfg(target_os = "linux")]
-    impl KernelDriver for ActiveKernelDriver {
+    impl MockKernelDriver {
+        fn active() -> Self {
+            Self {
+                detach_fails: false,
+                attach_fails: false,
+                events: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl KernelDriver for MockKernelDriver {
         fn kernel_driver_active(&mut self, _: u8) -> Result<bool, rusb::Error> {
+            self.events.push("active");
             Ok(true)
+        }
+
+        fn detach_kernel_driver(&mut self, _: u8) -> Result<(), rusb::Error> {
+            self.events.push("detach");
+            if self.detach_fails {
+                Err(rusb::Error::Access)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn attach_kernel_driver(&mut self, _: u8) -> Result<(), rusb::Error> {
+            self.events.push("attach");
+            if self.attach_fails {
+                Err(rusb::Error::Access)
+            } else {
+                Ok(())
+            }
         }
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn refuses_to_detach_an_active_kernel_driver() {
-        let error = ensure_kernel_driver_inactive(&mut ActiveKernelDriver, 3).unwrap_err();
+    fn default_policy_refuses_an_active_kernel_driver() {
+        let mut driver = MockKernelDriver::active();
+        let error =
+            claim_interface_with_policy(&mut driver, 3, UsbDriverHandoff::default(), |_| Ok(()))
+                .unwrap_err();
 
         assert!(matches!(
             error,
             UsbOpenError::KernelDriverActive { interface: 3 }
         ));
+        assert_eq!(driver.events, ["active"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn opt_in_policy_detaches_before_claiming() {
+        let mut driver = MockKernelDriver::active();
+        let detached = claim_interface_with_policy(
+            &mut driver,
+            3,
+            UsbDriverHandoff::TemporarilyDetach,
+            |driver| {
+                driver.events.push("claim");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(detached);
+        assert_eq!(driver.events, ["active", "detach", "claim"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn claim_failure_reattaches_a_driver_detached_by_the_transport() {
+        let mut driver = MockKernelDriver::active();
+        let error = claim_interface_with_policy(
+            &mut driver,
+            3,
+            UsbDriverHandoff::TemporarilyDetach,
+            |driver| {
+                driver.events.push("claim");
+                Err(rusb::Error::Busy)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UsbOpenError::Claim(rusb::Error::Busy)));
+        assert_eq!(driver.events, ["active", "detach", "claim", "attach"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn claim_and_reattach_failures_are_both_reported() {
+        let mut driver = MockKernelDriver {
+            attach_fails: true,
+            ..MockKernelDriver::active()
+        };
+        let error = claim_interface_with_policy(
+            &mut driver,
+            3,
+            UsbDriverHandoff::TemporarilyDetach,
+            |_| Err(rusb::Error::Busy),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsbOpenError::ClaimAndReattach {
+                claim: rusb::Error::Busy,
+                reattach: rusb::Error::Access,
+            }
+        ));
+        assert_eq!(driver.events, ["active", "detach", "attach"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detach_failure_does_not_attempt_claim_or_reattach() {
+        let mut driver = MockKernelDriver {
+            detach_fails: true,
+            ..MockKernelDriver::active()
+        };
+        let error = claim_interface_with_policy(
+            &mut driver,
+            3,
+            UsbDriverHandoff::TemporarilyDetach,
+            |driver| {
+                driver.events.push("claim");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsbOpenError::DetachKernelDriver(rusb::Error::Access)
+        ));
+        assert_eq!(driver.events, ["active", "detach"]);
     }
 
     #[test]

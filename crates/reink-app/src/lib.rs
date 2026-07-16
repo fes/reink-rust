@@ -14,6 +14,42 @@ const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@
 const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
 const ENTRY_REPLY_READ_LIMIT: usize = 5;
 
+/// Session-scoped guard for the first persistent write to a connected printer.
+///
+/// A UI must obtain a backup choice before it can dispatch its first write.
+/// Selecting a backup is not enough by itself: callers only record it after
+/// the EEPROM image has been saved successfully.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirstWriteBackupGate {
+    resolved: bool,
+}
+
+impl Default for FirstWriteBackupGate {
+    fn default() -> Self {
+        Self { resolved: false }
+    }
+}
+
+impl FirstWriteBackupGate {
+    /// Returns whether the caller must show the EEPROM-backup choice.
+    pub const fn requires_backup_choice(self) -> bool {
+        !self.resolved
+    }
+
+    /// Records that the user successfully saved an EEPROM backup.
+    pub fn record_backup_saved(&mut self) {
+        self.resolved = true;
+    }
+
+    /// Records that the user explicitly chose to continue without a backup.
+    ///
+    /// The UI must make this an intentional, separate acknowledgement rather
+    /// than treating a canceled save dialog as a decline.
+    pub fn record_backup_declined(&mut self) {
+        self.resolved = true;
+    }
+}
+
 /// Outcome of the Epson D4 entry probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpsonD4EntryProbeResult {
@@ -33,12 +69,23 @@ pub fn probe_epson_d4_entry(
     device: reink_usb::UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<EpsonD4EntryProbeResult, ApplicationError> {
-    let result = reink_usb::probe_bounded_exchange(
+    probe_epson_d4_entry_with_policy(device, interface, reink_usb::UsbDriverHandoff::Refuse)
+}
+
+/// Probes Epson D4 entry with an explicit USB driver-handoff policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn probe_epson_d4_entry_with_policy(
+    device: reink_usb::UsbDeviceSelector,
+    interface: UsbInterfaceSelector,
+    handoff: reink_usb::UsbDriverHandoff,
+) -> Result<EpsonD4EntryProbeResult, ApplicationError> {
+    let result = reink_usb::probe_bounded_exchange_with_policy(
         device,
         interface,
         EPSON_D4_ENTRY_COMMAND,
         EPSON_D4_ENTRY_REPLY,
         ENTRY_REPLY_READ_LIMIT,
+        handoff,
     )?;
     Ok(match result {
         reink_usb::BoundedExchangeProbeResult::Recognized => EpsonD4EntryProbeResult::Recognized,
@@ -57,17 +104,36 @@ pub struct EpsonD4Session<T> {
 
 impl<T: ByteTransport> EpsonD4Session<T> {
     /// Enters Epson D4 mode, initializes the link, and opens `EPSON-CTRL`.
+    pub fn connect(target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
+        Self::connect_recoverable(target, spec).map_err(|(error, _)| error)
+    }
+
+    /// Connects while returning the transport if D4 setup fails.
     ///
-    /// The Epson entry exchange is source-compatible with ReInkPy and is
-    /// intentionally exercised only with scripted transports until hardware
-    /// evidence is available for a selected printer family.
-    pub fn connect(mut target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
-        target.write_all(EPSON_D4_ENTRY_COMMAND)?;
-        wait_for_entry_reply(&mut target)?;
+    /// Callers with explicit transport cleanup can use the returned transport
+    /// to report cleanup failures. The Epson entry exchange is
+    /// source-compatible with ReInkPy and is intentionally exercised only with
+    /// scripted transports until hardware evidence is available for a selected
+    /// printer family.
+    pub fn connect_recoverable(
+        mut target: T,
+        spec: EpsonSpec,
+    ) -> Result<Self, (ApplicationError, T)> {
+        if let Err(error) = target.write_all(EPSON_D4_ENTRY_COMMAND) {
+            return Err((error.into(), target));
+        }
+        if let Err(error) = wait_for_entry_reply(&mut target) {
+            return Err((error, target));
+        }
 
         let mut link = D4Link::new(target);
-        link.initialize()?;
-        let control_channel = link.open_service("EPSON-CTRL")?;
+        if let Err(error) = link.initialize() {
+            return Err((error.into(), link.target()));
+        }
+        let control_channel = match link.open_service("EPSON-CTRL") {
+            Ok(control_channel) => control_channel,
+            Err(error) => return Err((error.into(), link.target())),
+        };
         Ok(Self {
             link,
             control_channel,
@@ -195,7 +261,29 @@ mod tests {
     use reink_d4::{Packet, ProtocolRevision, TransactionMessage};
     use reink_platform_test::{SanitizedTranscript, TranscriptTransport};
 
-    use super::{ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session};
+    use super::{
+        ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session,
+        FirstWriteBackupGate,
+    };
+
+    #[test]
+    fn first_write_requires_an_explicit_backup_decision() {
+        let mut gate = FirstWriteBackupGate::default();
+        assert!(gate.requires_backup_choice());
+
+        gate.record_backup_saved();
+
+        assert!(!gate.requires_backup_choice());
+    }
+
+    #[test]
+    fn explicit_backup_decline_resolves_the_first_write_prompt() {
+        let mut gate = FirstWriteBackupGate::default();
+
+        gate.record_backup_declined();
+
+        assert!(!gate.requires_backup_choice());
+    }
 
     fn spec() -> reink_core::EpsonSpec {
         ModelDatabase::builtin()
@@ -353,5 +441,27 @@ mod tests {
         };
 
         assert!(matches!(error, ApplicationError::EntryReplyInvalid));
+    }
+
+    #[test]
+    fn recoverable_connect_returns_the_transport_after_setup_failure() {
+        let mut target = SanitizedTranscript::new("recoverable Epson D4 setup failure");
+        target.expect_write(EPSON_D4_ENTRY_COMMAND);
+        target.respond_fragmented([
+            b"\x00".to_vec(),
+            b"\x00".to_vec(),
+            b"\x00".to_vec(),
+            b"\x08".to_vec(),
+            b"\x01".to_vec(),
+        ]);
+
+        let (error, target) =
+            match EpsonD4Session::connect_recoverable(target.into_transport(), spec()) {
+                Ok(_) => panic!("unrecognized Epson entry reply unexpectedly opened a D4 session"),
+                Err(recovery) => recovery,
+            };
+
+        assert!(matches!(error, ApplicationError::EntryReplyInvalid));
+        target.assert_finished();
     }
 }

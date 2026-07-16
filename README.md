@@ -12,7 +12,9 @@ waste-ink pads.
 > [!WARNING]
 > ReInk will eventually write persistent printer state. EEPROM writes and
 > counter resets must remain explicit user actions, verify their result by
-> default, and be used only after appropriate physical maintenance.
+> default, and be used only after appropriate physical maintenance. Before the
+> first connected-printer write in a session, ReInk must offer an EEPROM backup;
+> declining it requires a separate explicit acknowledgement.
 
 ## Status
 
@@ -31,7 +33,7 @@ hardware-ready.
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
 | Epson command execution and EEPROM read/write orchestration | Implemented with scripted transports |
 | Read-only Epson D4 application service | Implemented with scripted transports |
-| Linux and macOS USB bulk transport and descriptor selection | Implemented; no hardware validation claimed |
+| Linux and macOS USB bulk transport, descriptor selection, and candidate enumeration | Implemented; no hardware validation claimed |
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB | Planned |
 | Read-only CLI | Implemented |
@@ -96,7 +98,7 @@ Current and planned workspace crates:
 | `reink-hardware-test` | Opt-in Linux and macOS read-only validation driver; hardware validation remains unclaimed |
 | `reink-cli` | Read-only model, identity, and mDNS discovery commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
-| `reink-gui` | Optional fixture-backed graphical read-only mockup with no transport dependencies |
+| `reink-gui` | Optional descriptor-only graphical read-only UI with a session-only future transport trace sink |
 
 `reink-platform` supports USB selectors, explicit device paths, and IPv4/IPv6
 network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
@@ -132,15 +134,16 @@ than USB vendor/product attributes.
 ### `reink-usb`
 
 `reink-usb` uses `rusb` on Linux and macOS. It selects alternate-setting-zero USB
-printer-class interfaces with both bulk-IN and bulk-OUT endpoints, refuses a
-Linux interface with an active kernel driver, and implements `ByteTransport`
-with bounded bulk I/O. Its optional bounded exchange probe is protocol-neutral:
-callers provide request bytes, expected reply bytes, and a read limit.
-It refuses to claim an interface with an active Linux kernel driver and never
-detaches, reattaches, rebinds, installs, or otherwise modifies drivers on
-either platform. macOS access uses only libusb's normal read/claim operations;
-if the system declines the claim, ReInk reports the error and provides no
-driver workaround.
+printer-class interfaces with both bulk-IN and bulk-OUT endpoints and
+implements `ByteTransport` with bounded bulk I/O. Its optional bounded exchange
+probe is protocol-neutral: callers provide request bytes, expected reply bytes,
+and a read limit. By default, it refuses a Linux interface with an active
+kernel driver. The read-only hardware driver can opt in with
+`--allow-driver-handoff`, which temporarily detaches that selected Linux
+interface's driver, then releases and reattaches only the driver it detached.
+Reattachment failures are reported and may require recovery or a reboot. macOS
+access uses only libusb's normal read/claim operations; the handoff flag does
+not modify a macOS driver.
 
 The Windows build contains no libusb transport and no driver-management code.
 Windows support remains contingent on the native printer-stack prototype
@@ -285,8 +288,8 @@ cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --
 Use your platform's USB listing tool to obtain the product, interface, and any
 needed location values. Do not guess them and do not use this command on
 Windows; its USB path is not supported. An active Linux kernel driver or a
-failed macOS claim is a deliberate stop condition: ReInk will not detach,
-rebind, install, or work around a driver for any command.
+failed macOS claim is a deliberate stop condition for these `reink-cli`
+commands: they will not detach, rebind, install, or work around a driver.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service
@@ -296,6 +299,21 @@ or a bounded byte count:
 ```powershell
 cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
+
+Before selecting a device for a hardware-test command, Linux and macOS can
+list descriptor-only USB printer candidates:
+
+```powershell
+cargo run -p reink-hardware-test -- usb-candidates
+```
+
+This command only reads libusb descriptors; it does not open or claim a
+device, hand off a driver, send a control request, or send D4 traffic. Each
+result alias (`usb-1`, and so on) is stable only within that report. Select a
+candidate later with its complete shown selector. `model_hints` are bundled
+database label/filter hints for an exact vendor/product mapping, not identity
+or automatic selection; they may be empty. A later IEEE 1284 identity read
+confirms the model. Windows returns the standard unsupported USB error.
 
 For a single structured read-only preflight report, use:
 
@@ -313,16 +331,82 @@ cargo run -p reink-hardware-test -- d4-identity --vendor-id 0x04b8 --product-id 
 cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0x000c
 ```
 
+After successful identity and selected-address validation, `d4-eeprom-dump`
+reads the selected model's declared EEPROM range one address at a time. It is
+read-only, bounded to `mem_low..=mem_high`, and may be narrowed with
+`--start-address` and `--end-address`. Preserve a successful dump privately:
+EEPROM data may contain device-specific information and is not permission to
+restore or write it.
+
+```powershell
+cargo run -p reink-hardware-test -- d4-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model>
+```
+
+For private protocol evidence, `d4-identity`, `d4-eeprom-read`,
+`d4-eeprom-dump`, and the boundary probe accept an explicit `--trace-file
+<outside-repository-path>`; those commands also accept `--report-file
+<outside-repository-path>`. The report file contains exactly the structured
+JSON printed on stdout on success. Both paths refuse overwrite and require an
+existing parent directory.
+The file is written only after D4 shutdown and USB close/driver-handoff cleanup
+have been attempted, refuses to overwrite an existing path, and requires an
+existing parent directory. It contains ordered `tx`/`rx` byte events as
+uppercase hex in a versioned read-only JSON schema; it is not added to normal
+stdout reports. Original traces are private, potentially device-specific
+evidence and must remain outside and never be committed to this repository.
+
+After manually redacting and reviewing a private trace, an operator can create a
+local Rust transcript template. This command does **not** sanitize traffic: the
+exact confirmation acknowledges that the operator already removed and reviewed
+device-specific data. It validates the trace schema and byte-event boundaries,
+refuses to overwrite the output path, and preserves every event in order. The
+template is not automatically committable source; review every byte, add
+assertions for the protected behavior, and review the resulting test before
+adding it to the repository.
+
+```powershell
+cargo run -p reink-hardware-test -- trace-to-transcript --trace-file <reviewed-private-trace> --output-file <new-local-template.rs> --confirmation I_CONFIRM_TRACE_IS_SANITIZED --description "sanitized fixture"
+```
+
+```powershell
+cargo run -p reink-hardware-test -- d4-identity --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --trace-file <outside-repository-path>
+cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0x000c --report-file <outside-repository-path>
+```
+
 All successful reports use schema version 2 with `mode: "read_only"` and
 ordered step objects (`name`, `status`, and `result`). Preserve those reports as
 hardware evidence. The driver performs no physical write or reset operation;
-its `write-sequence` command is deliberately unavailable.
+its `write-sequence` command is deliberately unavailable. Failure reports are
+also schema version 2 and record the failing stage without raw trace bytes or
+invented successful EEPROM values.
 
-The report schema also reserves `blocked`, `timeout`, and `malformed` step
-statuses for a future opt-in runner that can preserve partial read-only
-evidence. Deterministic hardware-independent simulations verify these result
-shapes; the current concrete commands still return a nonzero process result for
-an operational USB failure rather than presenting it as success.
+Normal `d4-eeprom-read` rejects addresses outside the selected model's
+`mem_low..=mem_high` range before opening USB. The separate
+`d4-eeprom-boundary-probe` performs exactly one explicitly acknowledged
+out-of-range read; it has no default address and rejects in-range addresses.
+Its result is observed behavior only, never proof that an out-of-range read is
+safe.
+
+```powershell
+cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE --report-file <outside-repository-path>
+```
+
+By default, `read-sequence`, `d4-identity`, `d4-eeprom-read`, and
+`d4-eeprom-dump` refuse an interface with an active Linux kernel driver.
+`--allow-driver-handoff` is an explicit maintenance acknowledgement for those
+read-only commands only: on Linux it temporarily detaches, claims, releases,
+then reattaches only the driver ReInk detached. D4 reports retain
+`driver_handoff_enabled` and add `driver_handoff` with requested, detached, and
+reattached (or not-applicable) outcomes; they never contain raw traffic. If reattachment
+fails, recover the driver manually and a reboot may be required. On macOS the
+flag does not attempt a kernel-driver handoff and normal claiming continues.
+
+Concrete commands return nonzero for operational failures. When `--report-file`
+is supplied after a D4 operation begins, they preserve a structured failure
+report before returning nonzero. In particular, a failed EEPROM dump records
+only completed-address count and failed address, never a partial values list.
+If its explicit trace capture succeeds, the process still fails and labels that
+file as incomplete private evidence.
 
 `write-validation-plan` is a separate **non-executable** safety-gate report.
 It never selects a USB device, opens a session, queues a write, or resets a
@@ -378,19 +462,41 @@ runs them or opens a device.
 
 ### `reink-gui`
 
-`reink-gui` is an optional native GUI built with `egui`/`eframe`. It is
-separate from `reink-tui` and depends only on `reink-core`; it has no USB,
-SNMP, D4, or other transport dependency. It uses deterministic internal
-fixtures to display the safety boundary, select a fixture device, resolve its
-IEEE 1284 identity against the bundled model database, inspect an ordered
-success/blocked/failure validation report, and browse mock EEPROM rows. It
-contains no write or reset control.
+`reink-gui` is an optional native GUI built with `egui`/`eframe`. It defaults to
+descriptor/real mode with **no printer selected** and is separate from
+`reink-tui`. On Linux and macOS it asynchronously lists
+printer-class USB **descriptor-only candidates** with
+`reink_usb::list_printer_candidates()`. This scan reads descriptors only: it
+does not open or claim a device, detach or hand off a driver, send control, D4,
+or EEPROM traffic, or enable writes. Candidates use a session-only alias and
+show only VID/PID, bus/address, interface/alternate setting, and exact bundled
+VID/PID model hints; hints are not identity confirmation. The GUI has no
+driver-handoff control. Identity and EEPROM reads require a future explicit
+read-only operation. On Windows, USB descriptor enumeration is unavailable and
+no printer is selected by default. Default mode never opens or claims a device,
+hands off a driver, or sends traffic.
+
+Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
+`Tools` tabs. Bundled fixtures are hidden unless explicitly enabled with
+`--fixtures`; only that opt-in mode resolves fixture identity and runs
+deterministic fixture validation. Local raw EEPROM images are inspected
+read-only after an explicit model selection. The editing, reset, backup, and
+restore controls remain unavailable; the GUI contains no write or reset path.
+
+Its persistent shell and tab-specific sub-pane rules are documented in
+[UI design](docs/UI_DESIGN.md).
+
+The GUI also has a bottom **Debug traffic** panel: a live, bounded in-memory,
+session-only sink for future recorded-session TX/RX events. Capture is disabled
+until explicitly enabled. Selecting a descriptor candidate alone produces no
+traffic, and no current GUI operation emits events or exports them.
 
 The GUI is excluded from the workspace default members, so base CLI builds do
 not require it. Build and run it explicitly on Windows, Linux, or macOS:
 
 ```powershell
 cargo run -p reink-gui
+cargo run -p reink-gui -- --fixtures
 ```
 
 ## Protocol provenance
@@ -409,14 +515,15 @@ replay approach before any hardware-derived fixture is committed.
 
 ## Fresh-system setup
 
-These instructions assume a stock operating system and a new checkout. They
-are deliberately explicit so a human or coding agent can follow them without
-making USB-driver changes.
+These instructions assume a stock operating system and a new checkout. Linux
+hardware maintenance may explicitly opt into the documented read-only driver
+handoff; ordinary development does not modify USB drivers.
 
 ### Windows: build, test, and read-only UIs
 
-Windows supports the workspace's pure crates, CLI, terminal UI, fixture GUI, mDNS, and SNMP
-paths. Native Windows USB access is **not supported**. Do not install, replace,
+Windows supports the workspace's pure crates, CLI, terminal UI, descriptor/real
+GUI (with explicit fixture opt-in), mDNS, and SNMP paths. Native Windows USB
+access is **not supported**. Do not install, replace,
 detach, rebind, or restore a printer driver for ReInk.
 
 1. Install [Git for Windows](https://git-scm.com/download/win).
@@ -452,11 +559,11 @@ cargo run -p reink-gui
 `local-devices` and `usb-id` return an unsupported-platform error on Windows;
 that is intentional.
 
-### macOS: fixture GUI
+### macOS: descriptor-only GUI candidates
 
-The optional fixture GUI is supported on macOS and requires no USB access or
-printer configuration. Install the current stable Xcode command-line tools and
-Rust toolchain, then run:
+The optional GUI can list descriptor-only USB printer candidates on macOS
+without opening or configuring a printer. Install the current stable Xcode
+command-line tools and Rust toolchain, then run:
 
 ```bash
 cargo run -p reink-gui

@@ -16,4 +16,4 @@ pub use device::{
 };
 pub use discovery::{DeviceDiscovery, DiscoveryError, DiscoveryRequest};
 pub use error::{TransportError, TransportErrorKind};
-pub use transport::ByteTransport;
+pub use transport::{ByteTransport, RecordingTransport, TransportEvent};

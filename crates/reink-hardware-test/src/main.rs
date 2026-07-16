@@ -1,17 +1,31 @@
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use clap::{Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
+use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry_with_policy};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use reink_core::{ModelDatabase, PrinterIdentity};
+use reink_core::PrinterIdentity;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use reink_core::{EpsonSpec, ModelDatabase};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use reink_usb::read_printer_device_id;
+use reink_platform::RecordingTransport;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use reink_platform::TransportEvent;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reink_usb::{UsbDriverHandoff, read_printer_device_id_with_policy};
 use serde_json::{Value, json};
 
 const NON_EXECUTABLE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES";
+const TRACE_SANITIZATION_CONFIRMATION: &str = "I_CONFIRM_TRACE_IS_SANITIZED";
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const OUT_OF_RANGE_READ_CONFIRMATION: &str = "I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE";
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +39,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Convert an operator-reviewed trace into a local sanitized transcript template.
+    TraceToTranscript {
+        /// Existing local trace JSON produced by --trace-file.
+        #[arg(long)]
+        trace_file: PathBuf,
+        /// New local Rust template path; this command refuses to overwrite.
+        #[arg(long)]
+        output_file: PathBuf,
+        /// Exact acknowledgement that the trace was manually redacted and reviewed.
+        #[arg(long)]
+        confirmation: Option<String>,
+        /// Generic fixture description placed in the generated template.
+        #[arg(long, default_value = "sanitized fixture")]
+        description: String,
+    },
+    /// List descriptor-only USB printer candidates without opening a device.
+    UsbCandidates,
     /// Run the currently supported read-only USB preflight sequence.
     ReadSequence {
         #[arg(long, value_parser = parse_u16)]
@@ -39,6 +70,9 @@ enum Command {
         bus_number: Option<u8>,
         #[arg(long)]
         device_address: Option<u8>,
+        /// Temporarily detach an active Linux kernel driver for this read-only maintenance operation.
+        #[arg(long)]
+        allow_driver_handoff: bool,
     },
     /// Explain why write validation is not available.
     WriteSequence,
@@ -67,6 +101,15 @@ enum Command {
         device_address: Option<u8>,
         #[arg(long)]
         model: String,
+        /// Temporarily detach an active Linux kernel driver for this read-only maintenance operation.
+        #[arg(long)]
+        allow_driver_handoff: bool,
+        /// Save a private, ordered D4 byte trace after cleanup; refuses to overwrite.
+        #[arg(long)]
+        trace_file: Option<PathBuf>,
+        /// Save the structured report after cleanup; refuses to overwrite.
+        #[arg(long)]
+        report_file: Option<PathBuf>,
     },
     /// Read explicitly selected EEPROM addresses over a read-only D4 session.
     D4EepromRead {
@@ -86,6 +129,78 @@ enum Command {
         model: String,
         #[arg(long, required = true, value_parser = parse_u16)]
         address: Vec<u16>,
+        /// Temporarily detach an active Linux kernel driver for this read-only maintenance operation.
+        #[arg(long)]
+        allow_driver_handoff: bool,
+        /// Save a private, ordered D4 byte trace after cleanup; refuses to overwrite.
+        #[arg(long)]
+        trace_file: Option<PathBuf>,
+        /// Save the structured report after cleanup; refuses to overwrite.
+        #[arg(long)]
+        report_file: Option<PathBuf>,
+    },
+    /// Read every EEPROM address in a model-bounded range without writing.
+    D4EepromDump {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        #[arg(long)]
+        model: String,
+        /// First address to read; defaults to the model's declared lower bound.
+        #[arg(long, value_parser = parse_u16)]
+        start_address: Option<u16>,
+        /// Last address to read; defaults to the model's declared upper bound.
+        #[arg(long, value_parser = parse_u16)]
+        end_address: Option<u16>,
+        /// Temporarily detach an active Linux kernel driver for this read-only maintenance operation.
+        #[arg(long)]
+        allow_driver_handoff: bool,
+        /// Save a private, ordered D4 byte trace after cleanup; refuses to overwrite.
+        #[arg(long)]
+        trace_file: Option<PathBuf>,
+        /// Save the structured report after cleanup; refuses to overwrite.
+        #[arg(long)]
+        report_file: Option<PathBuf>,
+    },
+    /// Make one explicitly acknowledged, out-of-model-range EEPROM read.
+    D4EepromBoundaryProbe {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, value_parser = parse_u16)]
+        address: u16,
+        /// Exact acknowledgement required before this single read-only boundary probe.
+        #[arg(long)]
+        confirm_out_of_range_read: Option<String>,
+        /// Temporarily detach an active Linux kernel driver for this read-only maintenance operation.
+        #[arg(long)]
+        allow_driver_handoff: bool,
+        /// Save a private, ordered D4 byte trace after cleanup; refuses to overwrite.
+        #[arg(long)]
+        trace_file: Option<PathBuf>,
+        /// Save the structured report after cleanup; refuses to overwrite.
+        #[arg(long)]
+        report_file: Option<PathBuf>,
     },
 }
 
@@ -104,6 +219,18 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<String, String> {
     match cli.command {
+        Command::TraceToTranscript {
+            trace_file,
+            output_file,
+            confirmation,
+            description,
+        } => trace_to_transcript(
+            &trace_file,
+            &output_file,
+            confirmation.as_deref(),
+            &description,
+        ),
+        Command::UsbCandidates => usb_candidates(),
         Command::ReadSequence {
             vendor_id,
             product_id,
@@ -111,6 +238,7 @@ fn run(cli: Cli) -> Result<String, String> {
             alternate_setting,
             bus_number,
             device_address,
+            allow_driver_handoff,
         } => read_sequence(
             vendor_id,
             product_id,
@@ -118,6 +246,7 @@ fn run(cli: Cli) -> Result<String, String> {
             alternate_setting,
             bus_number,
             device_address,
+            allow_driver_handoff,
         ),
         Command::WriteSequence => Err(
             "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
@@ -137,6 +266,9 @@ fn run(cli: Cli) -> Result<String, String> {
             bus_number,
             device_address,
             model,
+            allow_driver_handoff,
+            trace_file,
+            report_file,
         } => d4_identity(
             vendor_id,
             product_id,
@@ -145,6 +277,9 @@ fn run(cli: Cli) -> Result<String, String> {
             bus_number,
             device_address,
             &model,
+            allow_driver_handoff,
+            trace_file.as_deref(),
+            report_file.as_deref(),
         ),
         Command::D4EepromRead {
             vendor_id,
@@ -155,6 +290,9 @@ fn run(cli: Cli) -> Result<String, String> {
             device_address,
             model,
             address,
+            allow_driver_handoff,
+            trace_file,
+            report_file,
         } => d4_eeprom_read(
             vendor_id,
             product_id,
@@ -164,7 +302,494 @@ fn run(cli: Cli) -> Result<String, String> {
             device_address,
             &model,
             &address,
+            allow_driver_handoff,
+            trace_file.as_deref(),
+            report_file.as_deref(),
         ),
+        Command::D4EepromDump {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            start_address,
+            end_address,
+            allow_driver_handoff,
+            trace_file,
+            report_file,
+        } => d4_eeprom_dump(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            start_address,
+            end_address,
+            allow_driver_handoff,
+            trace_file.as_deref(),
+            report_file.as_deref(),
+        ),
+        Command::D4EepromBoundaryProbe {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            address,
+            confirm_out_of_range_read,
+            allow_driver_handoff,
+            trace_file,
+            report_file,
+        } => d4_eeprom_boundary_probe(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            address,
+            confirm_out_of_range_read.as_deref(),
+            allow_driver_handoff,
+            trace_file.as_deref(),
+            report_file.as_deref(),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SanitizedTraceEvent {
+    is_write: bool,
+    bytes: Vec<u8>,
+}
+
+fn trace_to_transcript(
+    trace_file: &Path,
+    output_file: &Path,
+    confirmation: Option<&str>,
+    description: &str,
+) -> Result<String, String> {
+    if confirmation != Some(TRACE_SANITIZATION_CONFIRMATION) {
+        return Err(format!(
+            "refusing to convert trace: pass --confirmation {TRACE_SANITIZATION_CONFIRMATION} exactly after manually redacting and reviewing it"
+        ));
+    }
+    if description.trim().is_empty() {
+        return Err("fixture description must not be empty".to_owned());
+    }
+    validate_new_file_path(output_file, "transcript template")?;
+    let source = std::fs::read_to_string(trace_file).map_err(|error| {
+        format!(
+            "could not read trace file {}: {error}",
+            trace_file.display()
+        )
+    })?;
+    let events = parse_trace_events(&source)?;
+    let template = transcript_template(description, &events);
+    write_new_file(output_file, &template, "transcript template")?;
+    Ok(format!(
+        "local transcript template written to {}; review it, add assertions, and do not commit it until it has been reviewed",
+        output_file.display()
+    ))
+}
+
+fn parse_trace_events(source: &str) -> Result<Vec<SanitizedTraceEvent>, String> {
+    let trace: Value =
+        serde_json::from_str(source).map_err(|error| format!("invalid trace JSON: {error}"))?;
+    let object = trace
+        .as_object()
+        .ok_or_else(|| "invalid trace schema: root must be an object".to_owned())?;
+    for required in ["schema_version", "mode", "command", "events"] {
+        if !object.contains_key(required) {
+            return Err(format!("invalid trace schema: missing {required}"));
+        }
+    }
+    if object.len() != 4 {
+        return Err("invalid trace schema: root has unexpected fields".to_owned());
+    }
+    if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err("invalid trace schema: schema_version must be 1".to_owned());
+    }
+    if object.get("mode").and_then(Value::as_str) != Some("read_only") {
+        return Err("invalid trace schema: mode must be read_only".to_owned());
+    }
+    if object
+        .get("command")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("invalid trace schema: command must be a non-empty string".to_owned());
+    }
+    let events = object
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid trace schema: events must be an array".to_owned())?;
+
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| parse_trace_event(index, event))
+        .collect()
+}
+
+fn parse_trace_event(index: usize, event: &Value) -> Result<SanitizedTraceEvent, String> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| format!("invalid trace event {index}: must be an object"))?;
+    if object.len() != 2 || !object.contains_key("direction") || !object.contains_key("bytes") {
+        return Err(format!(
+            "invalid trace event {index}: expected only direction and bytes"
+        ));
+    }
+    let is_write = match object.get("direction").and_then(Value::as_str) {
+        Some("tx") => true,
+        Some("rx") => false,
+        _ => {
+            return Err(format!(
+                "invalid trace event {index}: direction must be tx or rx"
+            ));
+        }
+    };
+    let hex = object
+        .get("bytes")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("invalid trace event {index}: bytes must be a string"))?;
+    if hex.len() % 2 != 0 {
+        return Err(format!(
+            "invalid trace event {index}: bytes must contain an even number of hexadecimal characters"
+        ));
+    }
+    if !hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+    {
+        return Err(format!(
+            "invalid trace event {index}: bytes must be uppercase hexadecimal"
+        ));
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&hex[offset..offset + 2], 16).map_err(|_| {
+                format!("invalid trace event {index}: bytes must be valid hexadecimal")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SanitizedTraceEvent { is_write, bytes })
+}
+
+fn transcript_template(description: &str, events: &[SanitizedTraceEvent]) -> String {
+    let escaped_description = format!("{description:?}");
+    let mut template = String::from(
+        "// Local template only. The operator confirmed this evidence was manually sanitized.\n\
+    // Review every byte, add behavior assertions, and do not commit this template without review.\n\
+    let mut transcript = SanitizedTranscript::new(",
+    );
+    template.push_str(&escaped_description);
+    template.push_str(");\n");
+    for event in events {
+        let bytes = event
+            .bytes
+            .iter()
+            .map(|byte| format!("0x{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let method = if event.is_write {
+            "expect_write"
+        } else {
+            "respond"
+        };
+        template.push_str(&format!("transcript.{method}(vec![{bytes}]);\n"));
+    }
+    template.push_str("// Add assertions for the behavior this transcript protects.\n");
+    template
+}
+
+fn validate_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing {kind} file: {}",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "{kind} file parent directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, contents: &str, kind: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("could not create {kind} file {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("could not write {kind} file {}: {error}", path.display()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn trace_json(command: &str, events: &[TransportEvent]) -> Value {
+    let events = events
+        .iter()
+        .map(|event| match event {
+            TransportEvent::Tx(bytes) => json!({
+                "direction": "tx",
+                "bytes": bytes.iter().map(|byte| format!("{byte:02X}")).collect::<String>(),
+            }),
+            TransportEvent::Rx(bytes) => json!({
+                "direction": "rx",
+                "bytes": bytes.iter().map(|byte| format!("{byte:02X}")).collect::<String>(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "mode": "read_only",
+        "command": command,
+        "events": events,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_trace_file_path(path: &Path) -> Result<(), String> {
+    validate_private_new_file_path(path, "trace")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_report_file_path(path: &Path) -> Result<(), String> {
+    validate_private_new_file_path(path, "report")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_private_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing private {kind} file: {}",
+            path.display(),
+        ));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "private {kind} file parent directory does not exist: {}",
+            parent.display(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn write_report_file(path: &Path, report: &str) -> Result<(), String> {
+    validate_report_file_path(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "could not create private report file {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(report.as_bytes()).map_err(|error| {
+        format!(
+            "could not write private report file {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn emit_report(report: String, report_file: Option<&Path>) -> Result<String, String> {
+    if let Some(path) = report_file {
+        write_report_file(path, &report)?;
+    }
+    Ok(report)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn fail_with_report(
+    report: String,
+    primary_error: String,
+    report_file: Option<&Path>,
+) -> Result<String, String> {
+    match report_file {
+        None => Err(primary_error),
+        Some(path) => match write_report_file(path, &report) {
+            Ok(()) => Err(primary_error),
+            Err(report_error) => Err(format!("{primary_error}; {report_error}")),
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_trace_file(path: &Path, command: &str, events: &[TransportEvent]) -> Result<(), String> {
+    validate_trace_file_path(path)?;
+    let contents = serde_json::to_vec(&trace_json(command, events))
+        .map_err(|error| format!("could not encode private trace: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "could not create private trace file {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(&contents).map_err(|error| {
+        format!(
+            "could not write private trace file {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_trace<T>(
+    mut operation: D4Operation<T>,
+    trace_file: Option<&Path>,
+    command: &str,
+) -> D4Operation<T> {
+    let trace_result = trace_file.map(|path| {
+        write_trace_file(path, command, &operation.events)
+            .map(|()| format!("incomplete private trace saved to {}", path.display()))
+    });
+
+    match (&mut operation.result, trace_result) {
+        (Ok(_), None | Some(Ok(_))) => {}
+        (result @ Ok(_), Some(Err(error))) => *result = Err(error),
+        (Err(error), Some(Ok(trace_message))) => {
+            *error = format!("{error}; {trace_message}");
+        }
+        (Err(error), Some(Err(trace_error))) => {
+            *error = format!("{error}; private trace could not be saved: {trace_error}");
+        }
+        (Err(_), None) => {}
+    }
+    operation
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn usb_candidates() -> Result<String, String> {
+    let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+    let candidates = reink_usb::list_printer_candidates().map_err(|error| error.to_string())?;
+    Ok(usb_candidates_report(&candidates, &database))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn usb_candidates() -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn driver_handoff_policy(allow_driver_handoff: bool) -> UsbDriverHandoff {
+    if allow_driver_handoff {
+        UsbDriverHandoff::TemporarilyDetach
+    } else {
+        UsbDriverHandoff::Refuse
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct D4Operation<T> {
+    result: Result<T, String>,
+    events: Vec<TransportEvent>,
+    driver_handoff: DriverHandoffReport,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_d4_operation<T, E: std::fmt::Display>(
+    mut session: reink_app::EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
+    operation: Result<T, E>,
+) -> D4Operation<T> {
+    let shutdown = session.shutdown();
+    let (mut transport, events) = session.into_transport().into_parts();
+    let close = transport.close();
+    if close.is_err() {
+        // Match Drop's best-effort retry before recording the final lifecycle.
+        let _ = transport.close();
+    }
+    let driver_handoff = DriverHandoffReport::from_usb(transport.driver_handoff_outcome());
+
+    let result = match operation {
+        Ok(value) => match (shutdown, close) {
+            (Ok(()), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(format!("D4 shutdown failed: {error}")),
+            (Ok(()), Err(error)) => Err(format!("USB transport close failed: {error}")),
+            (Err(shutdown), Err(close)) => Err(format!(
+                "D4 shutdown failed: {shutdown}; USB transport close also failed: {close}"
+            )),
+        },
+        Err(operation) => {
+            let mut errors = vec![format!("D4 operation failed: {operation}")];
+            if let Err(error) = shutdown {
+                errors.push(format!("D4 shutdown also failed: {error}"));
+            }
+            if let Err(error) = close {
+                errors.push(format!("USB transport close also failed: {error}"));
+            }
+            Err(errors.join("; "))
+        }
+    };
+    D4Operation {
+        result,
+        events,
+        driver_handoff,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_d4_operation<T, E: std::fmt::Display, F>(
+    transport: reink_usb::ReadOnlyUsbTransport,
+    spec: reink_core::EpsonSpec,
+    operation: F,
+) -> D4Operation<T>
+where
+    F: FnOnce(
+        &mut reink_app::EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
+    ) -> Result<T, E>,
+{
+    match reink_app::EpsonD4Session::connect_recoverable(RecordingTransport::new(transport), spec) {
+        Ok(mut session) => {
+            let operation = operation(&mut session);
+            finish_d4_operation(session, operation)
+        }
+        Err((error, transport)) => {
+            let (mut transport, events) = transport.into_parts();
+            let close = transport.close();
+            if close.is_err() {
+                // Match Drop's best-effort retry before recording the final lifecycle.
+                let _ = transport.close();
+            }
+            let result = match close {
+                Ok(()) => Err(format!("D4 session setup failed: {error}")),
+                Err(close) => Err(format!(
+                    "D4 session setup failed: {error}; USB transport close also failed: {close}"
+                )),
+            };
+            D4Operation {
+                result,
+                events,
+                driver_handoff: DriverHandoffReport::from_usb(transport.driver_handoff_outcome()),
+            }
+        }
     }
 }
 
@@ -179,30 +804,213 @@ fn d4_eeprom_read(
     device_address: Option<u8>,
     model: &str,
     addresses: &[u16],
+    allow_driver_handoff: bool,
+    trace_file: Option<&Path>,
+    report_file: Option<&Path>,
 ) -> Result<String, String> {
+    if let Some(path) = trace_file {
+        validate_trace_file_path(path)?;
+    }
+    if let Some(path) = report_file {
+        validate_report_file_path(path)?;
+    }
     let spec = ModelDatabase::builtin()
         .map_err(|e| e.to_string())?
         .get(model)
         .ok_or_else(|| format!("unknown model: {model}"))?
         .clone();
-    let transport = reink_usb::ReadOnlyUsbTransport::open(
+    validate_eeprom_read_addresses(&spec, addresses)?;
+    let requested_handoff = DriverHandoffReport::requested(allow_driver_handoff);
+    let transport = match reink_usb::ReadOnlyUsbTransport::open_with_policy(
         usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
         },
-    )
-    .map_err(|e| e.to_string())?;
-    let mut session =
-        reink_app::EpsonD4Session::connect(transport, spec).map_err(|e| e.to_string())?;
-    let values = session.read_eeprom(addresses).map_err(|e| e.to_string())?;
-    session.shutdown().map_err(|e| e.to_string())?;
-    Ok(d4_eeprom_read_report(
-        values
+        driver_handoff_policy(allow_driver_handoff),
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            let primary = format!("USB transport open failed: {error}");
+            return fail_with_report(
+                d4_failure_report(
+                    "d4-eeprom-read",
+                    requested_handoff,
+                    "usb-open",
+                    &primary,
+                    None,
+                ),
+                primary,
+                report_file,
+            );
+        }
+    };
+    let operation = finish_trace(
+        run_d4_operation(transport, spec, |session| session.read_eeprom(addresses)),
+        trace_file,
+        "d4-eeprom-read",
+    );
+    match operation.result {
+        Ok(values) => emit_report(
+            d4_eeprom_read_report(
+                values
             .iter()
             .map(|value| json!({"address": format!("{:04X}", value.address), "value": value.value}))
             .collect(),
-    ))
+                operation.driver_handoff,
+            ),
+            report_file,
+        ),
+        Err(error) => fail_with_report(
+            d4_failure_report(
+                "d4-eeprom-read",
+                operation.driver_handoff,
+                "d4-eeprom-read",
+                &error,
+                None,
+            ),
+            error,
+            report_file,
+        ),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_dump(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    start_address: Option<u16>,
+    end_address: Option<u16>,
+    allow_driver_handoff: bool,
+    trace_file: Option<&Path>,
+    report_file: Option<&Path>,
+) -> Result<String, String> {
+    if let Some(path) = trace_file {
+        validate_trace_file_path(path)?;
+    }
+    if let Some(path) = report_file {
+        validate_report_file_path(path)?;
+    }
+    let spec = ModelDatabase::builtin()
+        .map_err(|e| e.to_string())?
+        .get(model)
+        .ok_or_else(|| format!("unknown model: {model}"))?
+        .clone();
+    let addresses = eeprom_dump_addresses(&spec, start_address, end_address)?;
+    let first_address = *addresses
+        .first()
+        .expect("validated EEPROM dump ranges are never empty");
+    let last_address = *addresses
+        .last()
+        .expect("validated EEPROM dump ranges are never empty");
+    let requested_handoff = DriverHandoffReport::requested(allow_driver_handoff);
+    let transport = match reink_usb::ReadOnlyUsbTransport::open_with_policy(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+        driver_handoff_policy(allow_driver_handoff),
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            let primary = format!("USB transport open failed: {error}");
+            return fail_with_report(
+                d4_failure_report(
+                    "d4-eeprom-dump",
+                    requested_handoff,
+                    "usb-open",
+                    &primary,
+                    Some(dump_progress(0, None)),
+                ),
+                primary,
+                report_file,
+            );
+        }
+    };
+    let mut dump_failure = None;
+    let mut completed_address_count = 0;
+    let operation = finish_trace(
+        run_d4_operation(transport, spec, |session| {
+            let mut values = Vec::with_capacity(addresses.len());
+            for &address in &addresses {
+                match session.read_eeprom(&[address]) {
+                    Ok(mut read) => {
+                        values.push(read.remove(0));
+                        completed_address_count = values.len();
+                    }
+                    Err(read_error) => {
+                        dump_failure = Some((values.len(), address));
+                        return Err(format!(
+                            "EEPROM dump failed after {} successful reads; failed address {address:#06x}: {read_error}",
+                            values.len()
+                        ));
+                    }
+                }
+            }
+            Ok(values)
+        }),
+        trace_file,
+        "d4-eeprom-dump",
+    );
+    match operation.result {
+        Ok(values) => emit_report(
+            d4_eeprom_dump_report(
+                model,
+                first_address,
+                last_address,
+                values
+            .iter()
+            .map(|value| json!({"address": format!("{:04X}", value.address), "value": value.value}))
+            .collect(),
+                operation.driver_handoff,
+            ),
+            report_file,
+        ),
+        Err(error) => fail_with_report(
+            d4_failure_report(
+                "d4-eeprom-dump",
+                operation.driver_handoff,
+                if dump_failure.is_some() {
+                    "eeprom-dump-read"
+                } else {
+                    "d4-eeprom-dump"
+                },
+                &error,
+                Some(dump_progress(
+                    completed_address_count,
+                    dump_failure.map(|(_, failed_address)| failed_address),
+                )),
+            ),
+            error,
+            report_file,
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_dump(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: Option<u16>,
+    _: Option<u16>,
+    _: bool,
+    _: Option<&Path>,
+    _: Option<&Path>,
+) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -216,6 +1024,9 @@ fn d4_eeprom_read(
     _: Option<u8>,
     _: &str,
     _: &[u16],
+    _: bool,
+    _: Option<&Path>,
+    _: Option<&Path>,
 ) -> Result<String, String> {
     Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
@@ -229,25 +1040,62 @@ fn d4_identity(
     bus_number: Option<u8>,
     device_address: Option<u8>,
     model: &str,
+    allow_driver_handoff: bool,
+    trace_file: Option<&Path>,
+    report_file: Option<&Path>,
 ) -> Result<String, String> {
+    if let Some(path) = trace_file {
+        validate_trace_file_path(path)?;
+    }
+    if let Some(path) = report_file {
+        validate_report_file_path(path)?;
+    }
     let spec = ModelDatabase::builtin()
         .map_err(|e| e.to_string())?
         .get(model)
         .ok_or_else(|| format!("unknown model: {model}"))?
         .clone();
-    let transport = reink_usb::ReadOnlyUsbTransport::open(
+    let requested_handoff = DriverHandoffReport::requested(allow_driver_handoff);
+    let transport = match reink_usb::ReadOnlyUsbTransport::open_with_policy(
         usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
         reink_platform::UsbInterfaceSelector {
             number: interface,
             alternate_setting,
         },
-    )
-    .map_err(|e| e.to_string())?;
-    let mut session =
-        reink_app::EpsonD4Session::connect(transport, spec).map_err(|e| e.to_string())?;
-    let identity = session.read_identity().map_err(|e| e.to_string())?;
-    session.shutdown().map_err(|e| e.to_string())?;
-    Ok(d4_identity_report(json!(identity.fields())))
+        driver_handoff_policy(allow_driver_handoff),
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            let primary = format!("USB transport open failed: {error}");
+            return fail_with_report(
+                d4_failure_report("d4-identity", requested_handoff, "usb-open", &primary, None),
+                primary,
+                report_file,
+            );
+        }
+    };
+    let operation = finish_trace(
+        run_d4_operation(transport, spec, |session| session.read_identity()),
+        trace_file,
+        "d4-identity",
+    );
+    match operation.result {
+        Ok(identity) => emit_report(
+            d4_identity_report(json!(identity.fields()), operation.driver_handoff),
+            report_file,
+        ),
+        Err(error) => fail_with_report(
+            d4_failure_report(
+                "d4-identity",
+                operation.driver_handoff,
+                "d4-identity",
+                &error,
+                None,
+            ),
+            error,
+            report_file,
+        ),
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -259,6 +1107,111 @@ fn d4_identity(
     _: Option<u8>,
     _: Option<u8>,
     _: &str,
+    _: bool,
+    _: Option<&Path>,
+    _: Option<&Path>,
+) -> Result<String, String> {
+    Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_boundary_probe(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    address: u16,
+    confirmation: Option<&str>,
+    allow_driver_handoff: bool,
+    trace_file: Option<&Path>,
+    report_file: Option<&Path>,
+) -> Result<String, String> {
+    if let Some(path) = trace_file {
+        validate_trace_file_path(path)?;
+    }
+    if let Some(path) = report_file {
+        validate_report_file_path(path)?;
+    }
+    let spec = ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .ok_or_else(|| format!("unknown model: {model}"))?
+        .clone();
+    validate_boundary_probe(&spec, address, confirmation)?;
+
+    let requested_handoff = DriverHandoffReport::requested(allow_driver_handoff);
+    let transport = match reink_usb::ReadOnlyUsbTransport::open_with_policy(
+        usb_device_selector(vendor_id, product_id, bus_number, device_address)?,
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+        driver_handoff_policy(allow_driver_handoff),
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            let primary = format!("USB transport open failed: {error}");
+            return fail_with_report(
+                d4_failure_report(
+                    "d4-eeprom-boundary-probe",
+                    requested_handoff,
+                    "usb-open",
+                    &primary,
+                    None,
+                ),
+                primary,
+                report_file,
+            );
+        }
+    };
+    let operation = finish_trace(
+        run_d4_operation(transport, spec, |session| session.read_eeprom(&[address])),
+        trace_file,
+        "d4-eeprom-boundary-probe",
+    );
+    match operation.result {
+        Ok(mut values) => {
+            let value = values
+                .pop()
+                .expect("a successful single-address EEPROM read has one reply");
+            emit_report(
+                d4_eeprom_boundary_probe_report(address, value.value, operation.driver_handoff),
+                report_file,
+            )
+        }
+        Err(error) => fail_with_report(
+            d4_failure_report(
+                "d4-eeprom-boundary-probe",
+                operation.driver_handoff,
+                "eeprom-boundary-probe-read",
+                &error,
+                None,
+            ),
+            error,
+            report_file,
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_boundary_probe(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: u16,
+    _: Option<&str>,
+    _: bool,
+    _: Option<&Path>,
+    _: Option<&Path>,
 ) -> Result<String, String> {
     Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
@@ -271,13 +1224,16 @@ fn read_sequence(
     alternate_setting: u8,
     bus_number: Option<u8>,
     device_address: Option<u8>,
+    allow_driver_handoff: bool,
 ) -> Result<String, String> {
     let selector = reink_platform::UsbInterfaceSelector {
         number: interface,
         alternate_setting,
     };
     let device = usb_device_selector(vendor_id, product_id, bus_number, device_address)?;
-    let bytes = read_printer_device_id(device, selector).map_err(|error| error.to_string())?;
+    let handoff = driver_handoff_policy(allow_driver_handoff);
+    let bytes = read_printer_device_id_with_policy(device, selector, handoff)
+        .map_err(|error| error.to_string())?;
     let identity = PrinterIdentity::parse(
         std::str::from_utf8(&bytes).map_err(|_| "USB device ID is not UTF-8")?,
     )
@@ -286,7 +1242,8 @@ fn read_sequence(
     let resolved_model = database
         .resolve_identity(&identity)
         .map(|spec| spec.model.as_str());
-    let entry = probe_epson_d4_entry(device, selector).map_err(|error| error.to_string())?;
+    let entry = probe_epson_d4_entry_with_policy(device, selector, handoff)
+        .map_err(|error| error.to_string())?;
     let d4_entry = match entry {
         EpsonD4EntryProbeResult::Recognized => json!({"status": "recognized"}),
         EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
@@ -298,6 +1255,7 @@ fn read_sequence(
         json!(identity.fields()),
         json!({"detected_model": identity.detected_model(), "resolved_model": resolved_model}),
         d4_entry,
+        allow_driver_handoff,
     ))
 }
 
@@ -309,6 +1267,7 @@ fn read_sequence(
     _: u8,
     _: Option<u8>,
     _: Option<u8>,
+    _: bool,
 ) -> Result<String, String> {
     Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
@@ -319,6 +1278,61 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_or((value, 10), |value| (value, 16));
     u16::from_str_radix(value, radix)
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn eeprom_dump_addresses(
+    spec: &EpsonSpec,
+    start_address: Option<u16>,
+    end_address: Option<u16>,
+) -> Result<Vec<u16>, String> {
+    let start = start_address.unwrap_or(spec.memory_low);
+    let end = end_address.unwrap_or(spec.memory_high);
+    if start > end {
+        return Err(format!(
+            "EEPROM dump start address {start:#06x} exceeds end address {end:#06x}"
+        ));
+    }
+    if start < spec.memory_low || end > spec.memory_high {
+        return Err(format!(
+            "EEPROM dump range {start:#06x}..={end:#06x} is outside the model range {:#06x}..={:#06x}",
+            spec.memory_low, spec.memory_high
+        ));
+    }
+    Ok((start..=end).collect())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_eeprom_read_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result<(), String> {
+    for &address in addresses {
+        if !(spec.memory_low..=spec.memory_high).contains(&address) {
+            return Err(format!(
+                "EEPROM address {address:#06x} is outside model {} range {:#06x}..={:#06x}",
+                spec.model, spec.memory_low, spec.memory_high
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn validate_boundary_probe(
+    spec: &EpsonSpec,
+    address: u16,
+    confirmation: Option<&str>,
+) -> Result<(), String> {
+    if confirmation != Some(OUT_OF_RANGE_READ_CONFIRMATION) {
+        return Err(format!(
+            "boundary probe requires --confirm-out-of-range-read {OUT_OF_RANGE_READ_CONFIRMATION}"
+        ));
+    }
+    if (spec.memory_low..=spec.memory_high).contains(&address) {
+        return Err(format!(
+            "boundary probe address {address:#06x} is within model {} range {:#06x}..={:#06x}; use d4-eeprom-read instead",
+            spec.model, spec.memory_low, spec.memory_high
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -342,6 +1356,57 @@ fn usb_device_selector(
 
 fn is_sha256_reference(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn candidate_model_hints(
+    candidate: &reink_usb::UsbPrinterCandidate,
+    database: &ModelDatabase,
+) -> Vec<String> {
+    database
+        .models()
+        .filter(|model| {
+            let spec = database
+                .get(model)
+                .expect("model database iterator returns known model names");
+            spec.vendor_id == candidate.vendor_id && spec.product_id == Some(candidate.product_id)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn usb_candidates_report(
+    candidates: &[reink_usb::UsbPrinterCandidate],
+    database: &ModelDatabase,
+) -> String {
+    let candidates = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            json!({
+                "alias": format!("usb-{}", index + 1),
+                "selector": {
+                    "vendor_id": format!("{:04x}", candidate.vendor_id),
+                    "product_id": format!("{:04x}", candidate.product_id),
+                    "bus_number": candidate.bus_number,
+                    "device_address": candidate.device_address,
+                    "interface": candidate.interface_number,
+                    "alternate_setting": candidate.alternate_setting,
+                },
+                "model_hints": candidate_model_hints(candidate, database),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 2,
+        "mode": "read_only",
+        "command": "usb-candidates",
+        "driver_handoff_enabled": false,
+        "candidates": candidates,
+        "next_step": "Select one candidate by its shown selector; its alias is session/report-only and a later IEEE 1284 identity read confirms the model.",
+    })
+    .to_string()
 }
 
 fn safety_gate(name: &str, satisfied: bool, requirement: &str) -> Value {
@@ -424,15 +1489,102 @@ fn failed_step(name: &str, kind: ReadOnlyFailureKind, message: &str) -> Value {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn read_only_report(command: &str, steps: Vec<Value>, next_step: &str) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DriverHandoffReport {
+    requested: bool,
+    detached: bool,
+    reattached: Option<bool>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl DriverHandoffReport {
+    const fn requested(requested: bool) -> Self {
+        Self {
+            requested,
+            detached: false,
+            reattached: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const fn from_usb(outcome: reink_usb::UsbDriverHandoffOutcome) -> Self {
+        Self {
+            requested: outcome.requested,
+            detached: outcome.detached,
+            reattached: outcome.reattached,
+        }
+    }
+
+    fn json(self) -> Value {
+        json!({
+            "requested": self.requested,
+            "detached": self.detached,
+            "reattached": self.reattached,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl From<bool> for DriverHandoffReport {
+    fn from(requested: bool) -> Self {
+        Self::requested(requested)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn read_only_report(
+    command: &str,
+    driver_handoff: impl Into<DriverHandoffReport>,
+    steps: Vec<Value>,
+    next_step: &str,
+) -> String {
+    let driver_handoff = driver_handoff.into();
     json!({
         "schema_version": 2,
         "mode": "read_only",
         "command": command,
+        "driver_handoff_enabled": driver_handoff.requested,
+        "driver_handoff": driver_handoff.json(),
         "steps": steps,
         "next_step": next_step,
     })
     .to_string()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn d4_failure_report(
+    command: &str,
+    driver_handoff: DriverHandoffReport,
+    stage: &str,
+    error: &str,
+    dump_progress: Option<Value>,
+) -> String {
+    let mut failure = json!({
+        "stage": stage,
+        "error": error,
+    });
+    if let Some(progress) = dump_progress {
+        failure["dump_progress"] = progress;
+    }
+    json!({
+        "schema_version": 2,
+        "mode": "read_only",
+        "command": command,
+        "status": "failed",
+        "driver_handoff_enabled": driver_handoff.requested,
+        "driver_handoff": driver_handoff.json(),
+        "failure": failure,
+        "next_step": "Resolve the observed read-only failure before retrying. This report does not authorize any EEPROM write, restore, reset, or other state change.",
+    })
+    .to_string()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn dump_progress(completed_address_count: usize, failed_address: Option<u16>) -> Value {
+    json!({
+        "completed_address_count": completed_address_count,
+        "failed_address": failed_address.map(|address| format!("{address:04X}")),
+    })
 }
 
 /// Produces a deterministic report for a hardware-independent driver simulation.
@@ -452,7 +1604,7 @@ fn simulated_read_only_report(
         .map(|(name, result)| completed_step(name, result))
         .collect::<Vec<_>>();
     steps.push(failed_step(failure.0, failure.1, failure.2));
-    read_only_report(command, steps, next_step)
+    read_only_report(command, false, steps, next_step)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -461,9 +1613,11 @@ fn read_sequence_report(
     identity: Value,
     model_resolution: Value,
     d4_entry: Value,
+    driver_handoff_enabled: bool,
 ) -> String {
     read_only_report(
         "read-sequence",
+        driver_handoff_enabled,
         vec![
             completed_step("usb-device-id", usb),
             completed_step("parse-device-id", identity),
@@ -475,9 +1629,10 @@ fn read_sequence_report(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn d4_identity_report(identity: Value) -> String {
+fn d4_identity_report(identity: Value, driver_handoff: impl Into<DriverHandoffReport>) -> String {
     read_only_report(
         "d4-identity",
+        driver_handoff,
         vec![
             completed_step(
                 "d4-session-connect",
@@ -491,9 +1646,13 @@ fn d4_identity_report(identity: Value) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn d4_eeprom_read_report(values: Vec<Value>) -> String {
+fn d4_eeprom_read_report(
+    values: Vec<Value>,
+    driver_handoff: impl Into<DriverHandoffReport>,
+) -> String {
     read_only_report(
         "d4-eeprom-read",
+        driver_handoff,
         vec![
             completed_step(
                 "d4-session-connect",
@@ -506,15 +1665,88 @@ fn d4_eeprom_read_report(values: Vec<Value>) -> String {
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn d4_eeprom_dump_report(
+    model: &str,
+    start_address: u16,
+    end_address: u16,
+    values: Vec<Value>,
+    driver_handoff: impl Into<DriverHandoffReport>,
+) -> String {
+    read_only_report(
+        "d4-eeprom-dump",
+        driver_handoff,
+        vec![
+            completed_step(
+                "d4-session-connect",
+                json!({"init": "completed", "service": "EPSON-CTRL"}),
+            ),
+            completed_step(
+                "eeprom-dump",
+                json!({
+                    "model": model,
+                    "range": {
+                        "start_address": format!("{start_address:04X}"),
+                        "end_address": format!("{end_address:04X}"),
+                    },
+                    "value_count": values.len(),
+                    "values": values,
+                }),
+            ),
+            completed_step("d4-session-shutdown", json!({"exit": "completed"})),
+        ],
+        "Retain this read-only EEPROM dump privately. It is not authorization for any EEPROM write, restore, or reset.",
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn d4_eeprom_boundary_probe_report(
+    address: u16,
+    value: u8,
+    driver_handoff: impl Into<DriverHandoffReport>,
+) -> String {
+    read_only_report(
+        "d4-eeprom-boundary-probe",
+        driver_handoff,
+        vec![
+            completed_step(
+                "d4-session-connect",
+                json!({"init": "completed", "service": "EPSON-CTRL"}),
+            ),
+            completed_step(
+                "out-of-range-eeprom-read",
+                json!({
+                    "address": format!("{address:04X}"),
+                    "value": value,
+                    "interpretation": "observed behavior only; this successful reply is not proof that out-of-range EEPROM reads are safe.",
+                }),
+            ),
+            completed_step("d4-session-shutdown", json!({"exit": "completed"})),
+        ],
+        "Treat this as observed behavior only, not proof that out-of-range reads are safe. It does not authorize any EEPROM write, restore, reset, or other state change.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
     use clap::Parser;
+    use reink_platform::TransportEvent;
     use serde_json::{Value, json};
 
     use super::{
-        Cli, Command, NON_EXECUTABLE_WRITE_CONFIRMATION, ReadOnlyFailureKind,
-        d4_eeprom_read_report, d4_identity_report, parse_u16, read_sequence_report,
-        simulated_read_only_report, usb_device_selector, write_validation_plan_report,
+        Cli, Command, DriverHandoffReport, NON_EXECUTABLE_WRITE_CONFIRMATION,
+        OUT_OF_RANGE_READ_CONFIRMATION, ReadOnlyFailureKind, TRACE_SANITIZATION_CONFIRMATION,
+        d4_eeprom_boundary_probe_report, d4_eeprom_dump_report, d4_eeprom_read_report,
+        d4_failure_report, d4_identity_report, dump_progress, eeprom_dump_addresses, emit_report,
+        parse_trace_events, parse_u16, read_sequence_report, simulated_read_only_report,
+        trace_json, trace_to_transcript, transcript_template, usb_candidates_report,
+        usb_device_selector, validate_boundary_probe, validate_eeprom_read_addresses,
+        validate_report_file_path, validate_trace_file_path, write_validation_plan_report,
     };
 
     fn report(output: String) -> Value {
@@ -540,9 +1772,14 @@ mod tests {
             json!({"MFG": "EPSON", "MDL": "C90"}),
             json!({"detected_model": "C90", "resolved_model": "C90"}),
             json!({"status": "recognized"}),
+            true,
         ));
 
         assert_eq!(output["command"], "read-sequence");
+        assert_eq!(output["driver_handoff_enabled"], true);
+        assert_eq!(output["driver_handoff"]["requested"], true);
+        assert_eq!(output["driver_handoff"]["detached"], false);
+        assert!(output["driver_handoff"]["reattached"].is_null());
         assert_completed_steps(
             &output,
             &[
@@ -563,7 +1800,10 @@ mod tests {
 
     #[test]
     fn d4_reports_preserve_read_only_step_evidence() {
-        let identity = report(d4_identity_report(json!({"MFG": "EPSON", "MDL": "C90"})));
+        let identity = report(d4_identity_report(
+            json!({"MFG": "EPSON", "MDL": "C90"}),
+            false,
+        ));
         assert_eq!(identity["command"], "d4-identity");
         assert_completed_steps(
             &identity,
@@ -571,15 +1811,34 @@ mod tests {
         );
         assert_eq!(identity["steps"][1]["result"]["MDL"], "C90");
 
-        let eeprom = report(d4_eeprom_read_report(vec![
-            json!({"address": "000C", "value": 66}),
-        ]));
+        let eeprom = report(d4_eeprom_read_report(
+            vec![json!({"address": "000C", "value": 66})],
+            false,
+        ));
         assert_eq!(eeprom["command"], "d4-eeprom-read");
         assert_completed_steps(
             &eeprom,
             &["d4-session-connect", "eeprom-read", "d4-session-shutdown"],
         );
         assert_eq!(eeprom["steps"][1]["result"]["values"][0]["address"], "000C");
+
+        let dump = report(d4_eeprom_dump_report(
+            "L1300",
+            0x0100,
+            0x0101,
+            vec![
+                json!({"address": "0100", "value": 1}),
+                json!({"address": "0101", "value": 2}),
+            ],
+            false,
+        ));
+        assert_eq!(dump["command"], "d4-eeprom-dump");
+        assert_completed_steps(
+            &dump,
+            &["d4-session-connect", "eeprom-dump", "d4-session-shutdown"],
+        );
+        assert_eq!(dump["steps"][1]["result"]["value_count"], 2);
+        assert_eq!(dump["steps"][1]["result"]["range"]["start_address"], "0100");
     }
 
     #[test]
@@ -621,7 +1880,95 @@ mod tests {
     }
 
     #[test]
+    fn usb_candidates_use_result_only_aliases_and_exact_product_model_hints() {
+        let database = reink_core::ModelDatabase::from_toml(
+            r#"
+[[EPSON]]
+models = ["Candidate A", "Candidate B"]
+idVendor = 0x04b8
+idProduct = 0x1234
+"#,
+        )
+        .unwrap();
+        let output = report(usb_candidates_report(
+            &[
+                reink_usb::UsbPrinterCandidate {
+                    vendor_id: 0x04b8,
+                    product_id: 0x1234,
+                    bus_number: 1,
+                    device_address: 2,
+                    interface_number: 3,
+                    alternate_setting: 0,
+                },
+                reink_usb::UsbPrinterCandidate {
+                    vendor_id: 0x04b8,
+                    product_id: 0xffff,
+                    bus_number: 4,
+                    device_address: 5,
+                    interface_number: 6,
+                    alternate_setting: 0,
+                },
+            ],
+            &database,
+        ));
+
+        assert_eq!(output["schema_version"], 2);
+        assert_eq!(output["mode"], "read_only");
+        assert_eq!(output["command"], "usb-candidates");
+        assert_eq!(output["driver_handoff_enabled"], false);
+        assert_eq!(output["candidates"][0]["alias"], "usb-1");
+        assert_eq!(output["candidates"][1]["alias"], "usb-2");
+        assert_eq!(output["candidates"][0]["selector"]["vendor_id"], "04b8");
+        assert_eq!(output["candidates"][0]["selector"]["product_id"], "1234");
+        assert_eq!(output["candidates"][0]["selector"]["bus_number"], 1);
+        assert_eq!(output["candidates"][0]["selector"]["device_address"], 2);
+        assert_eq!(output["candidates"][0]["selector"]["interface"], 3);
+        assert_eq!(output["candidates"][0]["selector"]["alternate_setting"], 0);
+        assert_eq!(
+            output["candidates"][0]["model_hints"],
+            json!(["Candidate A", "Candidate B"])
+        );
+        assert_eq!(output["candidates"][1]["model_hints"], json!([]));
+        assert!(
+            output["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("session/report-only")
+        );
+        assert!(output["candidates"][0].get("manufacturer").is_none());
+        assert!(output["candidates"][0].get("product").is_none());
+        assert!(output["candidates"][0].get("serial_number").is_none());
+    }
+
+    #[test]
     fn parses_only_explicit_read_only_commands() {
+        let cli = Cli::try_parse_from(["reink-hardware-test", "usb-candidates"]).unwrap();
+        assert!(matches!(cli.command, Command::UsbCandidates));
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "trace-to-transcript",
+            "--trace-file",
+            "private/reviewed-trace.json",
+            "--output-file",
+            "private/template.rs",
+            "--confirmation",
+            TRACE_SANITIZATION_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::TraceToTranscript {
+                trace_file,
+                output_file,
+                confirmation: Some(ref confirmation),
+                description,
+            } if trace_file == Path::new("private/reviewed-trace.json")
+                && output_file == Path::new("private/template.rs")
+                && confirmation == TRACE_SANITIZATION_CONFIRMATION
+                && description == "sanitized fixture"
+        ));
+
         let cli = Cli::try_parse_from([
             "reink-hardware-test",
             "d4-eeprom-read",
@@ -635,6 +1982,11 @@ mod tests {
             "C90",
             "--address",
             "0x000c",
+            "--allow-driver-handoff",
+            "--trace-file",
+            "private/eeprom-read.json",
+            "--report-file",
+            "private/eeprom-read-report.json",
         ])
         .unwrap();
         assert!(matches!(
@@ -646,12 +1998,389 @@ mod tests {
                 alternate_setting: 0,
                 bus_number: None,
                 device_address: None,
+                allow_driver_handoff: true,
+                trace_file: Some(ref trace_file),
+                report_file: Some(ref report_file),
                 ref model,
                 ref address,
+                ..
             } if model == "C90" && address == &[0x000c]
+                && trace_file == Path::new("private/eeprom-read.json")
+                && report_file == Path::new("private/eeprom-read-report.json")
         ));
         assert_eq!(parse_u16("0x04b8").unwrap(), 0x04b8);
         assert!(parse_u16("not-a-number").is_err());
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "d4-eeprom-dump",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "L1300",
+            "--start-address",
+            "0x0100",
+            "--end-address",
+            "0x0101",
+            "--allow-driver-handoff",
+            "--trace-file",
+            "private/eeprom-dump.json",
+            "--report-file",
+            "private/eeprom-dump-report.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::D4EepromDump {
+                model,
+                start_address: Some(0x0100),
+                end_address: Some(0x0101),
+                allow_driver_handoff: true,
+                trace_file: Some(ref trace_file),
+                report_file: Some(ref report_file),
+                ..
+            } if model == "L1300" && trace_file == Path::new("private/eeprom-dump.json")
+                && report_file == Path::new("private/eeprom-dump-report.json")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "read-sequence",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--allow-driver-handoff",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ReadSequence {
+                allow_driver_handoff: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "d4-identity",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--allow-driver-handoff",
+            "--trace-file",
+            "private/identity.json",
+            "--report-file",
+            "private/identity-report.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::D4Identity {
+                allow_driver_handoff: true,
+                trace_file: Some(ref trace_file),
+                report_file: Some(ref report_file),
+                ..
+            } if trace_file == Path::new("private/identity.json")
+                && report_file == Path::new("private/identity-report.json")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "d4-eeprom-boundary-probe",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--address",
+            "0xffff",
+            "--confirm-out-of-range-read",
+            OUT_OF_RANGE_READ_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::D4EepromBoundaryProbe {
+                address: 0xffff,
+                confirm_out_of_range_read: Some(ref confirmation),
+                ..
+            } if confirmation == OUT_OF_RANGE_READ_CONFIRMATION
+        ));
+    }
+
+    #[test]
+    fn trace_json_is_ordered_read_only_and_uses_uppercase_hex() {
+        let trace = trace_json(
+            "d4-identity",
+            &[
+                TransportEvent::Tx(vec![0x1b, 0x40]),
+                TransportEvent::Rx(vec![0xa0]),
+                TransportEvent::Rx(vec![]),
+            ],
+        );
+
+        assert_eq!(trace["schema_version"], 1);
+        assert_eq!(trace["mode"], "read_only");
+        assert_eq!(trace["command"], "d4-identity");
+        assert_eq!(
+            trace["events"][0],
+            json!({"direction": "tx", "bytes": "1B40"})
+        );
+        assert_eq!(
+            trace["events"][1],
+            json!({"direction": "rx", "bytes": "A0"})
+        );
+        assert_eq!(trace["events"][2], json!({"direction": "rx", "bytes": ""}));
+        assert!(trace.get("usb_path").is_none());
+        assert!(trace.get("host").is_none());
+    }
+
+    #[test]
+    fn trace_file_refuses_an_existing_path_without_writing() {
+        let existing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert!(
+            validate_trace_file_path(&existing)
+                .unwrap_err()
+                .contains("refusing to overwrite")
+        );
+    }
+
+    #[test]
+    fn trace_to_transcript_parses_schema_and_preserves_event_boundaries_in_order() {
+        let events = parse_trace_events(
+            r#"{"schema_version":1,"mode":"read_only","command":"d4-identity","events":[{"direction":"tx","bytes":"1B40"},{"direction":"rx","bytes":"06"},{"direction":"rx","bytes":""},{"direction":"tx","bytes":"AA"}]}"#,
+        )
+        .unwrap();
+
+        let template = transcript_template("sanitized fixture", &events);
+
+        assert_eq!(
+            template,
+            "// Local template only. The operator confirmed this evidence was manually sanitized.\n\
+// Review every byte, add behavior assertions, and do not commit this template without review.\n\
+let mut transcript = SanitizedTranscript::new(\"sanitized fixture\");\n\
+transcript.expect_write(vec![0x1B, 0x40]);\n\
+transcript.respond(vec![0x06]);\n\
+transcript.respond(vec![]);\n\
+transcript.expect_write(vec![0xAA]);\n\
+// Add assertions for the behavior this transcript protects.\n"
+        );
+    }
+
+    #[test]
+    fn trace_to_transcript_rejects_invalid_schema_direction_and_hex() {
+        for (trace, expected) in [
+            (
+                r#"{"schema_version":2,"mode":"read_only","command":"d4","events":[]}"#,
+                "schema_version",
+            ),
+            (
+                r#"{"schema_version":1,"mode":"read_only","command":"d4","events":[{"direction":"write","bytes":"AA"}]}"#,
+                "direction",
+            ),
+            (
+                r#"{"schema_version":1,"mode":"read_only","command":"d4","events":[{"direction":"rx","bytes":"0a"}]}"#,
+                "uppercase hexadecimal",
+            ),
+            (
+                r#"{"schema_version":1,"mode":"read_only","command":"d4","events":[{"direction":"rx","bytes":"ABC"}]}"#,
+                "even number",
+            ),
+        ] {
+            assert!(parse_trace_events(trace).unwrap_err().contains(expected));
+        }
+    }
+
+    #[test]
+    fn trace_to_transcript_requires_confirmation_and_never_overwrites() {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let input = directory.join(format!(
+            "trace-to-transcript-input-{}.json",
+            std::process::id()
+        ));
+        let output = directory.join(format!(
+            "trace-to-transcript-output-{}.rs",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&output);
+        fs::write(
+            &input,
+            r#"{"schema_version":1,"mode":"read_only","command":"d4","events":[{"direction":"tx","bytes":"AA"}]}"#,
+        )
+        .unwrap();
+
+        let refused = trace_to_transcript(&input, &output, None, "sanitized fixture").unwrap_err();
+        assert!(refused.contains(TRACE_SANITIZATION_CONFIRMATION));
+        assert!(!output.exists());
+
+        trace_to_transcript(
+            &input,
+            &output,
+            Some(TRACE_SANITIZATION_CONFIRMATION),
+            "sanitized fixture",
+        )
+        .unwrap();
+        let generated = fs::read_to_string(&output).unwrap();
+        assert!(generated.contains("transcript.expect_write(vec![0xAA]);"));
+
+        let missing_parent = directory
+            .join(format!(
+                "missing-transcript-template-parent-{}",
+                std::process::id()
+            ))
+            .join("template.rs");
+        let missing_parent_error = trace_to_transcript(
+            &input,
+            &missing_parent,
+            Some(TRACE_SANITIZATION_CONFIRMATION),
+            "sanitized fixture",
+        )
+        .unwrap_err();
+        assert!(missing_parent_error.contains("parent directory does not exist"));
+
+        let overwrite = trace_to_transcript(
+            &input,
+            &output,
+            Some(TRACE_SANITIZATION_CONFIRMATION),
+            "sanitized fixture",
+        )
+        .unwrap_err();
+        assert!(overwrite.contains("refusing to overwrite"));
+        assert_eq!(fs::read_to_string(&output).unwrap(), generated);
+
+        fs::remove_file(input).unwrap();
+        fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn report_file_requires_a_new_path_with_an_existing_parent_and_writes_exact_json() {
+        let existing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(
+            validate_report_file_path(&existing)
+                .unwrap_err()
+                .contains("refusing to overwrite")
+        );
+        let missing_parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("does-not-exist-for-report-test")
+            .join("report.json");
+        assert!(
+            validate_report_file_path(&missing_parent)
+                .unwrap_err()
+                .contains("parent directory does not exist")
+        );
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("report-file-test-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let report = "{\"schema_version\":2,\"mode\":\"read_only\"}".to_owned();
+        assert_eq!(emit_report(report.clone(), Some(&path)).unwrap(), report);
+        assert_eq!(fs::read_to_string(&path).unwrap(), report);
+        assert!(emit_report("{}".to_owned(), Some(&path)).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn address_and_boundary_probe_validation_stay_local_and_explicit() {
+        let database = reink_core::ModelDatabase::builtin().unwrap();
+        let spec = database.get("L1300").unwrap();
+        assert!(validate_eeprom_read_addresses(spec, &[spec.memory_low, spec.memory_high]).is_ok());
+        let outside = spec
+            .memory_high
+            .checked_add(1)
+            .unwrap_or_else(|| spec.memory_low - 1);
+        assert!(validate_eeprom_read_addresses(spec, &[outside]).is_err());
+        assert!(validate_boundary_probe(spec, outside, None).is_err());
+        assert!(validate_boundary_probe(spec, outside, Some("I_CONFIRM")).is_err());
+        assert!(
+            validate_boundary_probe(spec, spec.memory_low, Some(OUT_OF_RANGE_READ_CONFIRMATION))
+                .is_err()
+        );
+        assert!(
+            validate_boundary_probe(spec, outside, Some(OUT_OF_RANGE_READ_CONFIRMATION)).is_ok()
+        );
+    }
+
+    #[test]
+    fn failure_reports_are_schema_v2_and_exclude_success_values_and_raw_trace() {
+        let failure_report = report(d4_failure_report(
+            "d4-eeprom-dump",
+            DriverHandoffReport {
+                requested: true,
+                detached: true,
+                reattached: Some(false),
+            },
+            "eeprom-dump-read",
+            "read timed out",
+            Some(dump_progress(3, Some(0x0103))),
+        ));
+        assert_eq!(failure_report["schema_version"], 2);
+        assert_eq!(failure_report["status"], "failed");
+        assert_eq!(failure_report["driver_handoff"]["detached"], true);
+        assert_eq!(failure_report["driver_handoff"]["reattached"], false);
+        assert_eq!(
+            failure_report["failure"]["dump_progress"]["completed_address_count"],
+            3
+        );
+        assert!(failure_report.get("values").is_none());
+        assert!(failure_report.get("events").is_none());
+        let setup_failure = report(d4_failure_report(
+            "d4-eeprom-dump",
+            DriverHandoffReport::requested(false),
+            "d4-session-connect",
+            "entry reply missing",
+            Some(dump_progress(0, None)),
+        ));
+        assert!(setup_failure["failure"]["dump_progress"]["failed_address"].is_null());
+    }
+
+    #[test]
+    fn boundary_probe_report_labels_observation_without_safety_claim() {
+        let report = report(d4_eeprom_boundary_probe_report(0xffff, 42, false));
+        assert_eq!(report["command"], "d4-eeprom-boundary-probe");
+        assert_eq!(report["steps"][1]["result"]["address"], "FFFF");
+        assert!(
+            report["steps"][1]["result"]["interpretation"]
+                .as_str()
+                .unwrap()
+                .contains("not proof")
+        );
+    }
+
+    #[test]
+    fn dump_range_defaults_to_and_stays_within_the_model_bounds() {
+        let database = reink_core::ModelDatabase::builtin().unwrap();
+        let spec = database.get("L1300").unwrap();
+
+        let default_range = eeprom_dump_addresses(spec, None, None).unwrap();
+        assert_eq!(default_range.first(), Some(&spec.memory_low));
+        assert_eq!(default_range.last(), Some(&spec.memory_high));
+
+        assert!(
+            eeprom_dump_addresses(spec, Some(spec.memory_high), Some(spec.memory_low)).is_err()
+        );
+        if let Some(before_low) = spec.memory_low.checked_sub(1) {
+            assert!(eeprom_dump_addresses(spec, Some(before_low), None).is_err());
+        }
+        if let Some(after_high) = spec.memory_high.checked_add(1) {
+            assert!(eeprom_dump_addresses(spec, None, Some(after_high)).is_err());
+        }
     }
 
     #[test]

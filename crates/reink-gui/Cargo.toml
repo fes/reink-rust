@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only fixture-backed graphical user interface for ReInk"
+description = "Read-only graphical user interface for ReInk"
 
 [dependencies]
 eframe = "0.35"
 reink-core = { path = "../reink-core" }
+reink-platform = { path = "../reink-platform" }
+rfd = "0.15"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+reink-usb = { path = "../reink-usb" }
