@@ -4,7 +4,9 @@
 use std::error::Error;
 use std::fmt;
 
-use reink_core::{EepromReadReply, EpsonController, EpsonError, EpsonSpec, PrinterIdentity};
+use reink_core::{
+    EepromReadReply, EepromWriteOptions, EpsonController, EpsonError, EpsonSpec, PrinterIdentity,
+};
 use reink_d4::{ChannelId, D4Error, D4Link};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_platform::UsbInterfaceSelector;
@@ -137,6 +139,13 @@ impl EepromImage {
     }
 }
 
+/// A model-bounded EEPROM write prepared from a complete read-only backup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EepromWritePlan {
+    pub backup: EepromImage,
+    pub updates: Vec<(u16, u8)>,
+}
+
 impl<T: ByteTransport> EpsonD4Session<T> {
     /// Enters Epson D4 mode, initializes the link, and opens `EPSON-CTRL`.
     pub fn connect(target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
@@ -223,6 +232,45 @@ impl<T: ByteTransport> EpsonD4Session<T> {
         })
     }
 
+    /// Reads a complete backup and validates every requested update before any
+    /// EEPROM write is sent.
+    pub fn prepare_eeprom_write(
+        &mut self,
+        updates: &[(u16, u8)],
+    ) -> Result<EepromWritePlan, ApplicationError> {
+        validate_eeprom_updates(&self.spec, updates)?;
+        Ok(EepromWritePlan {
+            backup: self.dump_eeprom()?,
+            updates: updates.to_vec(),
+        })
+    }
+
+    /// Applies a previously prepared plan with read-back verification and
+    /// rollback of completed updates if a write fails.
+    pub fn apply_eeprom_write(&mut self, plan: &EepromWritePlan) -> Result<(), ApplicationError> {
+        if plan.backup.model != self.spec.model
+            || plan.backup.start_address != self.spec.memory_low
+            || plan.backup.bytes.len()
+                != usize::from(self.spec.memory_high)
+                    .saturating_sub(usize::from(self.spec.memory_low))
+                    + 1
+        {
+            return Err(ApplicationError::WritePlan(
+                "backup does not match the active model range".to_owned(),
+            ));
+        }
+        validate_eeprom_updates(&self.spec, &plan.updates)?;
+        let mut channel = self.link.control_channel(self.control_channel)?;
+        EpsonController::new(&mut channel, &self.spec).write_eeprom(
+            &plan.updates,
+            EepromWriteOptions {
+                verify_read_back: true,
+                atomic: true,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Closes the control channel and terminates the D4 conversation.
     pub fn shutdown(&mut self) -> Result<(), ApplicationError> {
         self.link.close_channel(self.control_channel)?;
@@ -233,6 +281,32 @@ impl<T: ByteTransport> EpsonD4Session<T> {
     pub fn into_transport(self) -> T {
         self.link.target()
     }
+}
+
+fn validate_eeprom_updates(
+    spec: &EpsonSpec,
+    updates: &[(u16, u8)],
+) -> Result<(), ApplicationError> {
+    if updates.is_empty() {
+        return Err(ApplicationError::WritePlan(
+            "at least one EEPROM update is required".to_owned(),
+        ));
+    }
+    let mut addresses = std::collections::BTreeSet::new();
+    for &(address, _) in updates {
+        if address < spec.memory_low || address > spec.memory_high {
+            return Err(ApplicationError::WritePlan(format!(
+                "EEPROM update address {address:#06x} is outside model range {:#06x}..={:#06x}",
+                spec.memory_low, spec.memory_high
+            )));
+        }
+        if !addresses.insert(address) {
+            return Err(ApplicationError::WritePlan(format!(
+                "EEPROM update address {address:#06x} is duplicated"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_entry_reply<T: ByteTransport>(target: &mut T) -> Result<(), ApplicationError> {
@@ -270,6 +344,7 @@ pub enum ApplicationError {
         recovery: D4Error,
     },
     Epson(EpsonError),
+    WritePlan(String),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Usb(reink_usb::UsbOpenError),
     EntryReplyMissing,
@@ -286,6 +361,7 @@ impl fmt::Display for ApplicationError {
                 "D4 service setup failed: {setup}; orderly D4 exit also failed: {recovery}"
             ),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
+            Self::WritePlan(error) => write!(formatter, "invalid EEPROM write plan: {error}"),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => write!(formatter, "USB error: {error}"),
             Self::EntryReplyMissing => formatter.write_str("Epson D4 entry reply was not received"),
@@ -303,6 +379,7 @@ impl Error for ApplicationError {
             Self::D4(error) => Some(error),
             Self::SetupRecovery { setup, .. } => Some(setup),
             Self::Epson(error) => Some(error),
+            Self::WritePlan(_) => None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Usb(error) => Some(error),
             Self::EntryReplyMissing | Self::EntryReplyInvalid => None,
@@ -343,7 +420,7 @@ mod tests {
 
     use super::{
         ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session,
-        FirstWriteBackupGate,
+        FirstWriteBackupGate, validate_eeprom_updates,
     };
 
     #[test]
@@ -373,6 +450,19 @@ mod tests {
 
         super::wait_for_entry_reply(&mut target).unwrap();
         target.assert_finished();
+    }
+
+    #[test]
+    fn write_plan_requires_unique_model_bounded_addresses() {
+        let spec = spec();
+        assert!(validate_eeprom_updates(&spec, &[]).is_err());
+        assert!(
+            validate_eeprom_updates(&spec, &[(spec.memory_low, 1), (spec.memory_low, 2)]).is_err()
+        );
+        assert!(
+            validate_eeprom_updates(&spec, &[(spec.memory_high.saturating_add(1), 1)]).is_err()
+        );
+        assert!(validate_eeprom_updates(&spec, &[(spec.memory_low, 1)]).is_ok());
     }
 
     fn spec() -> reink_core::EpsonSpec {
