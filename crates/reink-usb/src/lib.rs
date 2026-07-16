@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! USB printer interface selection and read-only libusb transport.
 //!
-//! By default this crate refuses active Linux kernel drivers. Explicit
-//! maintenance APIs can temporarily detach and restore only the driver they
-//! detached. Its concrete libusb transport is available on Linux and macOS.
+//! On Linux, operations on an explicitly selected interface temporarily detach
+//! and restore only the active kernel driver that they detached. Its concrete
+//! libusb transport is available on Linux and macOS.
 
 mod descriptor;
 mod selection;
@@ -13,15 +13,20 @@ mod adapter;
 
 /// Controls whether an active Linux kernel driver may be temporarily detached.
 ///
-/// This policy is an explicit maintenance acknowledgement. It has no
-/// driver-management effect on macOS or Windows.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The default automatically detaches and restores the driver for an explicitly
+/// selected interface. This has no driver-management effect on macOS or Windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsbDriverHandoff {
-    /// Refuse to use an interface owned by an active Linux kernel driver.
-    #[default]
+    /// Retain a restrictive policy for internal callers that must not detach.
     Refuse,
     /// Temporarily detach an active Linux kernel driver and reattach it on close.
     TemporarilyDetach,
+}
+
+impl Default for UsbDriverHandoff {
+    fn default() -> Self {
+        Self::TemporarilyDetach
+    }
 }
 
 /// Observed lifecycle of an optional USB driver handoff.
@@ -86,7 +91,7 @@ mod tests {
     use super::{UsbDriverHandoff, UsbDriverHandoffOutcome};
 
     #[test]
-    fn handoff_outcome_does_not_claim_a_detach_without_one() {
+    fn handoff_outcome_records_the_selected_policy() {
         assert_eq!(
             UsbDriverHandoffOutcome::requested(UsbDriverHandoff::Refuse),
             UsbDriverHandoffOutcome {
@@ -102,6 +107,14 @@ mod tests {
                 detached: false,
                 reattached: None,
             }
+        );
+    }
+
+    #[test]
+    fn default_handoff_is_automatic() {
+        assert_eq!(
+            UsbDriverHandoff::default(),
+            UsbDriverHandoff::TemporarilyDetach
         );
     }
 

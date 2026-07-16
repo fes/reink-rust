@@ -18,7 +18,7 @@ needed to build `reink-rust`.
 -------------------------------------------------
 
 cd reink-results
-./run-linux-read-evidence.sh --allow-driver-handoff
+./run-linux-read-evidence.sh
 
 The runner lists descriptor-only printer candidates, chooses a candidate only
 when it is unambiguous, derives the bundled model range, and collects
@@ -26,24 +26,24 @@ preflight, D4 identity, selected EEPROM reads, a bounded dump, and one
 out-of-range boundary observation. For more than one candidate or model hint,
 select the intended printer explicitly:
 
-./run-linux-read-evidence.sh --allow-driver-handoff \
-  --candidate-alias usb-1 --model L1300
+./run-linux-read-evidence.sh --candidate-alias usb-1 --model L1300
 
 3. Linux driver handoff and recovery
 ------------------------------------
 
-`--allow-driver-handoff` authorizes the read-only hardware driver to perform
-the selected interface handoff itself. When a Linux kernel driver such as
-`usblp` owns that interface, ReInk temporarily detaches it, claims the
-interface for the operation, releases it, and reattaches only the driver it
-detached. No external shell session, `sudo`, manual unbind, module unload, or
-udev change is required.
+After a printer is explicitly selected, the read-only hardware driver
+automatically performs the selected interface handoff for each operation. When
+a Linux kernel driver such as `usblp` owns that interface, ReInk temporarily
+detaches it, claims the interface, releases it, and reattaches only the driver
+it detached. No external shell session, `sudo`, manual unbind, module unload,
+or udev change is required.
 
-If claim, release, or reattachment fails, the command reports that outcome in
-its console output and structured report. The printer may need a reconnect,
-manual recovery, or reboot afterward; this is a diagnostic/repair maintenance
-risk, not a reason to conceal or suppress the failure. The script continues
-the read-only evidence sequence so each attempted operation leaves a record.
+If detach, claim, release, or reattachment fails, the command reports clear
+recovery guidance in its console output and structured report: reconnect the
+printer, power-cycle it if needed, then reboot the host before retrying. This
+is a diagnostic/repair maintenance risk, not a reason to conceal or suppress
+the failure. The script continues the read-only evidence sequence so each
+attempted operation leaves a record.
 
 4. Retain and share evidence safely
 -----------------------------------
@@ -55,6 +55,6 @@ other device-specific data. Share only manually sanitized summaries. Before
 adding a protocol fixture, manually review and redact a trace, then use
 `trace-to-transcript`; that command does not sanitize input.
 
-The lower-level `reink-cli usb-id` and `usb-d4-probe` commands intentionally
-do not hand off a driver. Use the automated hardware-test runner for
-maintenance evidence when the selected interface is driver-owned.
+Lower-level selected-printer operations use the same automatic Linux handoff.
+Descriptor enumeration remains descriptor-only and never opens a device or
+hands off a driver.

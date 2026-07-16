@@ -137,13 +137,12 @@ than USB vendor/product attributes.
 printer-class interfaces with both bulk-IN and bulk-OUT endpoints and
 implements `ByteTransport` with bounded bulk I/O. Its optional bounded exchange
 probe is protocol-neutral: callers provide request bytes, expected reply bytes,
-and a read limit. By default, it refuses a Linux interface with an active
-kernel driver. The read-only hardware driver can opt in with
-`--allow-driver-handoff`, which temporarily detaches that selected Linux
-interface's driver, then releases and reattaches only the driver it detached.
-Reattachment failures are reported and may require recovery or a reboot. macOS
-access uses only libusb's normal read/claim operations; the handoff flag does
-not modify a macOS driver.
+and a read limit. After a Linux interface is explicitly selected, ReInk
+automatically detaches an active driver for that interface, then releases and
+reattaches only the driver it detached after each operation. Reattachment
+failures report recovery guidance: reconnect or power-cycle the printer, then
+reboot the host if needed before retrying. macOS access uses only libusb's
+normal read/claim operations and never modifies a macOS driver.
 
 The Windows build contains no libusb transport and no driver-management code.
 Windows support remains contingent on the native printer-stack prototype
@@ -276,10 +275,10 @@ cargo run -p reink-cli -- local-devices
 ```
 
 For a standard USB Printer Class identity read, select the exact device and
-interface. The command never enters Epson D4 mode and refuses to detach an
-active Linux kernel driver. If multiple devices share vendor/product IDs, add
-both `--bus-number` and `--device-address`; ReInk refuses to choose one
-arbitrarily:
+interface. The command never enters Epson D4 mode. On Linux, it automatically
+detaches and reattaches an active driver only for that selected interface. If
+multiple devices share vendor/product IDs, add both `--bus-number` and
+`--device-address`; ReInk refuses to choose one arbitrarily:
 
 ```powershell
 cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --interface <number>
@@ -287,9 +286,10 @@ cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --
 
 Use your platform's USB listing tool to obtain the product, interface, and any
 needed location values. Do not guess them and do not use this command on
-Windows; its USB path is not supported. An active Linux kernel driver or a
-failed macOS claim is a deliberate stop condition for these `reink-cli`
-commands: they will not detach, rebind, install, or work around a driver.
+Windows; its USB path is not supported. On Linux, failure to detach, claim, or
+reattach the selected interface reports reconnect, power-cycle, and reboot
+remediation. A failed macOS claim remains a deliberate stop condition: ReInk
+will not detach, rebind, install, or work around a macOS driver.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service
@@ -320,7 +320,7 @@ provides `run-linux-read-evidence.sh`. With the repositories checked out as
 siblings, run it from `reink-results`:
 
 ```bash
-./run-linux-read-evidence.sh --allow-driver-handoff
+./run-linux-read-evidence.sh
 ```
 
 The script selects a candidate only when exactly one descriptor candidate and
@@ -388,11 +388,12 @@ cargo run -p reink-hardware-test -- d4-identity --vendor-id 0x04b8 --product-id 
 cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0x000c --report-file <outside-repository-path>
 ```
 
-All successful reports use schema version 2 with `mode: "read_only"` and
+All successful reports use schema version 3 with `mode: "read_only"` and
 ordered step objects (`name`, `status`, and `result`). Preserve those reports as
 hardware evidence. The driver performs no physical write or reset operation;
 its `write-sequence` command is deliberately unavailable. Failure reports are
-also schema version 2 and record the failing stage without raw trace bytes or
+also schema version 3, include reconnect/power-cycle/reboot remediation, and
+record the failing stage without raw trace bytes or
 invented successful EEPROM values.
 
 Normal `d4-eeprom-read` rejects addresses outside the selected model's
@@ -406,16 +407,15 @@ safe.
 cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE --report-file <outside-repository-path>
 ```
 
-By default, `read-sequence`, `d4-identity`, `d4-eeprom-read`,
-`d4-eeprom-dump`, and `d4-eeprom-boundary-probe` refuse an interface with an
-active Linux kernel driver.
-`--allow-driver-handoff` is an explicit maintenance acknowledgement for those
-read-only commands only: on Linux it temporarily detaches, claims, releases,
-then reattaches only the driver ReInk detached. D4 reports retain
-`driver_handoff_enabled` and add `driver_handoff` with requested, detached, and
-reattached (or not-applicable) outcomes; they never contain raw traffic. If reattachment
-fails, recover the driver manually and a reboot may be required. On macOS the
-flag does not attempt a kernel-driver handoff and normal claiming continues.
+For an explicitly selected Linux interface, `read-sequence`, `d4-identity`,
+`d4-eeprom-read`, `d4-eeprom-dump`, and `d4-eeprom-boundary-probe`
+automatically detach, claim, release, and reattach only the active driver for
+each operation. Schema-version-3 reports include
+`linux_driver_handoff` with automatic, detached, and reattached outcomes; they
+never contain raw traffic. If detach, claim, release, or reattachment fails,
+reconnect or power-cycle the printer, then reboot the host if needed before
+retrying. macOS does not attempt a kernel-driver handoff and normal claim
+failure remains a safe stop.
 
 Concrete commands return nonzero for operational failures. When `--report-file`
 is supplied after a D4 operation begins, they preserve a structured failure
@@ -488,8 +488,10 @@ or EEPROM traffic, or enable writes. Candidates use a session-only alias and
 show only VID/PID, bus/address, interface/alternate setting, and exact bundled
 VID/PID model hints; hints are not identity confirmation. The GUI has no
 driver-handoff control. Identity and EEPROM reads require a future explicit
-read-only operation. On Windows, USB descriptor enumeration is unavailable and
-no printer is selected by default. Default mode never opens or claims a device,
+read-only operation, which must automatically detach and reattach the selected
+Linux interface driver without adding a separate handoff action. On Windows,
+USB descriptor enumeration is unavailable and no printer is selected by
+default. Default mode never opens or claims a device,
 hands off a driver, or sends traffic.
 
 Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
@@ -532,8 +534,8 @@ replay approach before any hardware-derived fixture is committed.
 ## Fresh-system setup
 
 These instructions assume a stock operating system and a new checkout. Linux
-hardware maintenance may explicitly opt into the documented read-only driver
-handoff; ordinary development does not modify USB drivers.
+diagnostics and repair automatically hand off only an explicitly selected Linux
+printer interface; ordinary development does not modify USB drivers.
 
 ### Windows: build, test, and read-only UIs
 
@@ -627,9 +629,9 @@ cargo run -p reink-gui
 For a physical USB printer, follow
 [the Linux read-only USB checklist](docs/LINUX_USB_READONLY_COMMANDS.txt).
 The automated hardware-test runner performs the supported read-only USB
-sequence, including an explicit in-session Linux driver handoff when
-`--allow-driver-handoff` is supplied. It reports claim, release, and reattach
-failures clearly; recovery or a reboot may be required.
+sequence, automatically handing off only an explicitly selected Linux driver
+for each operation. It reports detach, claim, release, and reattach failures
+clearly; reconnect or power-cycle the printer, then reboot the host if needed.
 
 ### Instructions for coding agents and automation
 
@@ -637,10 +639,11 @@ failures clearly; recovery or a reboot may be required.
 2. Treat all printer access as opt-in. Never run `usb-id`, D4, EEPROM, or reset
    commands against a device unless the user explicitly selects it.
 3. Never install, replace, or modify a Windows USB/printer driver. For an
-   explicitly selected Linux read-only hardware-test operation,
-   `--allow-driver-handoff` permits the utility to detach and reattach only its
-   selected interface driver in-session; report any claim, release, or reattach
-   failure rather than hiding it or requiring an external handoff session.
+   explicitly selected Linux read-only hardware-test operation, automatically
+   detach and reattach only its selected interface driver in-session; report
+   detach, claim, release, or reattach failure with reconnect, power-cycle, and
+   reboot remediation rather than hiding it or requiring an external handoff
+   session.
 4. Never commit raw captures, serial numbers, USB paths, IP addresses, SNMP
    credentials, or other device-specific data. Use sanitized transcripts only.
 5. Do not add write/reset commands until the protocol-provenance safety gate
@@ -699,8 +702,8 @@ sanitized fixtures.
 
 Do not commit captured traffic containing printer serial numbers, IP addresses,
 or other device-specific information. Do not add USB driver installation or
-Windows driver modification as part of ordinary development setup. Explicit
-Linux read-only maintenance handoff is permitted only through the supported
+Windows driver modification as part of ordinary development setup. Automatic
+Linux read-only maintenance handoff occurs only through the supported
 in-session lifecycle and must surface recovery failure. EEPROM writes and reset
 operations must require explicit user confirmation, use read-back verification
 by default, and report any rollback failure clearly.

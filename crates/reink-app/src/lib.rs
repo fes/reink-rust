@@ -69,7 +69,19 @@ pub fn probe_epson_d4_entry(
     device: reink_usb::UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<EpsonD4EntryProbeResult, ApplicationError> {
-    probe_epson_d4_entry_with_policy(device, interface, reink_usb::UsbDriverHandoff::Refuse)
+    let result = reink_usb::probe_bounded_exchange(
+        device,
+        interface,
+        EPSON_D4_ENTRY_COMMAND,
+        EPSON_D4_ENTRY_REPLY,
+        ENTRY_REPLY_READ_LIMIT,
+    )?;
+    Ok(match result {
+        reink_usb::BoundedExchangeProbeResult::Recognized => EpsonD4EntryProbeResult::Recognized,
+        reink_usb::BoundedExchangeProbeResult::Unrecognized { received_bytes } => {
+            EpsonD4EntryProbeResult::Unrecognized { received_bytes }
+        }
+    })
 }
 
 /// Probes Epson D4 entry with an explicit USB driver-handoff policy.

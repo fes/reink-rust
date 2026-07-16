@@ -56,8 +56,8 @@ included in the normal stdout report.
 
 Each D4 command also accepts `--report-file <outside-repository-path>`. It
 refuses overwrite and requires an existing parent just like traces. On success,
-it contains the exact schema-version-2 JSON printed on stdout. If an operation
-has begun and fails, it contains a schema-version-2 read-only failure report
+it contains the exact schema-version-3 JSON printed on stdout. If an operation
+has begun and fails, it contains a schema-version-3 read-only failure report
 with command, stage, error text, and driver-handoff outcome, but never raw
 trace bytes or fabricated successful values. Dump failures additionally record
 the completed-address count and failed address.
@@ -103,18 +103,20 @@ Class device ID. If vendor/product IDs match more than one attached device,
 also provide the matching `--bus-number` and `--device-address`; ReInk refuses
 to select one arbitrarily. It must remain separate from Epson D4 traffic. If
 an active Linux kernel driver owns the interface or macOS rejects the libusb
-claim, stop by default.
+claim, it remains a safe stop on macOS. On Linux, an active driver for the
+explicitly selected interface is automatically detached and reattached for each
+operation.
 
-For the read-only hardware-test commands (`read-sequence`, `d4-identity`,
-`d4-eeprom-read`, `d4-eeprom-dump`, and `d4-eeprom-boundary-probe`) only, an explicit
-`--allow-driver-handoff` maintenance acknowledgement temporarily detaches an
-active Linux driver, then releases and reattaches only that driver. D4 reports
-retain compatibility `driver_handoff_enabled` and record actual
-`driver_handoff.requested`, `.detached`, and `.reattached` outcomes without
-recording raw traffic. This is an in-session automated lifecycle; no external
-manual unbind is required. Reattachment failure may require manual driver
-recovery or a reboot and must remain visible in the report. The flag has no
-kernel-handoff effect on macOS and never enables writes or resets.
+For selected Linux read-only hardware-test commands (`read-sequence`,
+`d4-identity`, `d4-eeprom-read`, `d4-eeprom-dump`, and
+`d4-eeprom-boundary-probe`), handoff is automatic: ReInk temporarily detaches
+an active driver, then releases and reattaches only that driver for each
+operation. Schema-version-3 D4 reports record
+`linux_driver_handoff.automatic`, `.detached`, and `.reattached` outcomes
+without raw traffic. No external manual unbind is required. On failure, the
+report directs the operator to reconnect or power-cycle the printer and reboot
+the host if needed before retrying. macOS does not detach a driver, and this
+does not enable writes or resets.
 
 ### Automated Linux run
 
@@ -124,7 +126,7 @@ checked out as siblings:
 
 ```bash
 cd ../reink-results
-./run-linux-read-evidence.sh --allow-driver-handoff
+./run-linux-read-evidence.sh
 ```
 
 It captures the descriptor report, preflight, identity, selected reads,

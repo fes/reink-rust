@@ -91,15 +91,16 @@ pub struct ReadOnlyUsbTransport {
 }
 
 impl ReadOnlyUsbTransport {
-    /// Opens a selected printer interface without modifying its driver.
+    /// Opens a selected printer interface.
     ///
-    /// Linux refuses interfaces owned by an active kernel driver. On macOS,
-    /// libusb claim failure is returned without a driver workaround.
+    /// On Linux, this automatically detaches an active driver for the selected
+    /// interface and reattaches it on close. On macOS, libusb claim failure is
+    /// returned without a driver workaround.
     pub fn open(
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
     ) -> Result<Self, UsbOpenError> {
-        Self::open_with_policy(device, interface, UsbDriverHandoff::Refuse)
+        Self::open_with_policy(device, interface, UsbDriverHandoff::default())
     }
 
     /// Opens a selected printer interface with an explicit driver-handoff policy.
@@ -205,14 +206,13 @@ impl ReadOnlyUsbTransport {
 
 /// Reads the standard USB Printer Class device identifier without a protocol session.
 ///
-/// On Linux, the selected interface must not have an active kernel driver.
-/// Use [`read_printer_device_id_with_policy`] for the explicit maintenance
-/// handoff variant.
+/// On Linux, an active driver for the explicitly selected interface is
+/// temporarily detached and reattached before this operation returns.
 pub fn read_printer_device_id(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
 ) -> Result<Vec<u8>, UsbOpenError> {
-    read_printer_device_id_with_policy(device, interface, UsbDriverHandoff::Refuse)
+    read_printer_device_id_with_policy(device, interface, UsbDriverHandoff::default())
 }
 
 /// Reads a printer device identifier with an explicit driver-handoff policy.
@@ -237,9 +237,9 @@ pub enum BoundedExchangeProbeResult {
 
 /// Sends a request and looks for an expected reply across at most `max_reads`.
 ///
-/// On Linux, the selected interface must not have an active kernel driver.
-/// Use [`probe_bounded_exchange_with_policy`] for the explicit maintenance
-/// handoff variant. This function never returns collected reply bytes.
+/// On Linux, an active driver for the explicitly selected interface is
+/// temporarily detached and reattached before this operation returns. This
+/// function never returns collected reply bytes.
 pub fn probe_bounded_exchange(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -253,7 +253,7 @@ pub fn probe_bounded_exchange(
         request,
         expected_reply,
         max_reads,
-        UsbDriverHandoff::Refuse,
+        UsbDriverHandoff::default(),
     )
 }
 
@@ -601,15 +601,21 @@ impl fmt::Display for UsbOpenError {
             }
             Self::KernelDriverActive { interface } => write!(
                 formatter,
-                "USB interface {interface} is owned by an active kernel driver; ReInk will not detach it"
+                "USB interface {interface} is owned by an active kernel driver and the selected restrictive policy will not detach it"
             ),
             Self::DetachKernelDriver(error) => {
-                write!(formatter, "detaching USB kernel driver failed: {error}")
+                write!(
+                    formatter,
+                    "detaching USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
+                )
             }
-            Self::Claim(error) => write!(formatter, "claiming USB interface failed: {error}"),
+            Self::Claim(error) => write!(
+                formatter,
+                "claiming USB interface failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
+            ),
             Self::ClaimAndReattach { claim, reattach } => write!(
                 formatter,
-                "claiming USB interface failed: {claim}; reattaching the detached kernel driver also failed: {reattach}"
+                "claiming USB interface failed: {claim}; reattaching the detached kernel driver also failed: {reattach}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
             ),
             Self::ReadDeviceId(error) => {
                 write!(formatter, "reading USB printer device ID failed: {error}")
@@ -626,11 +632,14 @@ impl fmt::Display for UsbOpenError {
                     "reading bounded USB exchange reply failed: {error}"
                 )
             }
-            Self::Release(error) => write!(formatter, "releasing USB interface failed: {error}"),
+            Self::Release(error) => write!(
+                formatter,
+                "releasing USB interface failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
+            ),
             Self::ReattachKernelDriver(error) => {
                 write!(
                     formatter,
-                    "reattaching the detached USB kernel driver failed: {error}"
+                    "reattaching the detached USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
                 )
             }
             Self::ReleaseAndReattach { release, reattach } => {
@@ -732,10 +741,10 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn default_policy_refuses_an_active_kernel_driver() {
+    fn restrictive_policy_refuses_an_active_kernel_driver() {
         let mut driver = MockKernelDriver::active();
         let error =
-            claim_interface_with_policy(&mut driver, 3, UsbDriverHandoff::default(), |_| Ok(()))
+            claim_interface_with_policy(&mut driver, 3, UsbDriverHandoff::Refuse, |_| Ok(()))
                 .unwrap_err();
 
         assert!(matches!(
@@ -747,18 +756,14 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn opt_in_policy_detaches_before_claiming() {
+    fn default_policy_detaches_before_claiming() {
         let mut driver = MockKernelDriver::active();
-        let detached = claim_interface_with_policy(
-            &mut driver,
-            3,
-            UsbDriverHandoff::TemporarilyDetach,
-            |driver| {
+        let detached =
+            claim_interface_with_policy(&mut driver, 3, UsbDriverHandoff::default(), |driver| {
                 driver.events.push("claim");
                 Ok(())
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         assert!(detached);
         assert_eq!(driver.events, ["active", "detach", "claim"]);
