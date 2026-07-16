@@ -106,13 +106,14 @@ an active Linux kernel driver owns the interface or macOS rejects the libusb
 claim, stop by default.
 
 For the read-only hardware-test commands (`read-sequence`, `d4-identity`,
-`d4-eeprom-read`, and `d4-eeprom-dump`) only, an explicit
+`d4-eeprom-read`, `d4-eeprom-dump`, and `d4-eeprom-boundary-probe`) only, an explicit
 `--allow-driver-handoff` maintenance acknowledgement temporarily detaches an
 active Linux driver, then releases and reattaches only that driver. D4 reports
 retain compatibility `driver_handoff_enabled` and record actual
 `driver_handoff.requested`, `.detached`, and `.reattached` outcomes without
-recording raw traffic. Reattachment
-failure may require manual driver recovery or a reboot. The flag has no
+recording raw traffic. This is an in-session automated lifecycle; no external
+manual unbind is required. Reattachment failure may require manual driver
+recovery or a reboot and must remain visible in the report. The flag has no
 kernel-handoff effect on macOS and never enables writes or resets.
 
 ### Automated Linux run

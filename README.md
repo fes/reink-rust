@@ -406,8 +406,9 @@ safe.
 cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE --report-file <outside-repository-path>
 ```
 
-By default, `read-sequence`, `d4-identity`, `d4-eeprom-read`, and
-`d4-eeprom-dump` refuse an interface with an active Linux kernel driver.
+By default, `read-sequence`, `d4-identity`, `d4-eeprom-read`,
+`d4-eeprom-dump`, and `d4-eeprom-boundary-probe` refuse an interface with an
+active Linux kernel driver.
 `--allow-driver-handoff` is an explicit maintenance acknowledgement for those
 read-only commands only: on Linux it temporarily detaches, claims, releases,
 then reattaches only the driver ReInk detached. D4 reports retain
@@ -625,18 +626,21 @@ cargo run -p reink-gui
 
 For a physical USB printer, follow
 [the Linux read-only USB checklist](docs/LINUX_USB_READONLY_COMMANDS.txt).
-The only current USB request is the standard Printer Class device-ID read.
-It requires an exact vendor/product/interface selection and refuses to detach
-an active kernel driver.
+The automated hardware-test runner performs the supported read-only USB
+sequence, including an explicit in-session Linux driver handoff when
+`--allow-driver-handoff` is supplied. It reports claim, release, and reattach
+failures clearly; recovery or a reboot may be required.
 
 ### Instructions for coding agents and automation
 
 1. Run the build, format, Clippy, and test commands above after source changes.
 2. Treat all printer access as opt-in. Never run `usb-id`, D4, EEPROM, or reset
    commands against a device unless the user explicitly selects it.
-3. Never install, detach, unload, rebind, replace, or restore a USB/printer
-   driver. An active Linux kernel driver is a stop condition, not an error to
-   work around.
+3. Never install, replace, or modify a Windows USB/printer driver. For an
+   explicitly selected Linux read-only hardware-test operation,
+   `--allow-driver-handoff` permits the utility to detach and reattach only its
+   selected interface driver in-session; report any claim, release, or reattach
+   failure rather than hiding it or requiring an external handoff session.
 4. Never commit raw captures, serial numbers, USB paths, IP addresses, SNMP
    credentials, or other device-specific data. Use sanitized transcripts only.
 5. Do not add write/reset commands until the protocol-provenance safety gate
@@ -694,10 +698,12 @@ suite, so each ported behavior is documented through Rust tests and small,
 sanitized fixtures.
 
 Do not commit captured traffic containing printer serial numbers, IP addresses,
-or other device-specific information. Do not add a USB driver installation or
-rebind a physical printer as part of ordinary development setup. EEPROM writes
-and reset operations must require explicit user confirmation, use read-back
-verification by default, and report any rollback failure clearly.
+or other device-specific information. Do not add USB driver installation or
+Windows driver modification as part of ordinary development setup. Explicit
+Linux read-only maintenance handoff is permitted only through the supported
+in-session lifecycle and must surface recovery failure. EEPROM writes and reset
+operations must require explicit user confirmation, use read-back verification
+by default, and report any rollback failure clearly.
 
 ## License
 

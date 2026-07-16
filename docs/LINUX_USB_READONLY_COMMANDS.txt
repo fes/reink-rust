@@ -1,106 +1,60 @@
 ReInk Linux USB read-only command checklist
 ============================================
 
-Run these commands on native Linux. Send back sanitized output. Do not use
-sudo, unload usblp, unbind drivers, or modify udev rules.
+Run this workflow on native Linux for diagnostics and repair. It performs
+read-only USB evidence collection only: it never writes, restores, resets,
+prints, or cleans a printer.
 
-1. Clone and build
-------------------
-
-git clone https://github.com/fes/reink-rust.git
-cd reink-rust
-cargo build --workspace
-
-If the build reports missing libusb development files, report that error rather
-than installing anything yet.
-
-2. Record environment details
------------------------------
-
-rustc --version
-cargo --version
-uname -sr
-pkg-config --modversion libusb-1.0
-
-3. Identify Epson USB products and printer interfaces
------------------------------------------------------
-
-lsusb -d 04b8:
-lsusb -t
-
-for dev in /sys/bus/usb/devices/*; do
-  [ -f "$dev/idVendor" ] || continue
-  [ "$(cat "$dev/idVendor")" = "04b8" ] || continue
-  echo "Device: $(basename "$dev")  VID:PID=$(cat "$dev/idVendor"):$(cat "$dev/idProduct")"
-  for intf in "$dev":*; do
-    [ -f "$intf/bInterfaceNumber" ] || continue
-    if [ -L "$intf/driver" ]; then
-      driver="$(basename "$(readlink "$intf/driver")")"
-    else
-      driver=none
-    fi
-    echo "  interface=$(cat "$intf/bInterfaceNumber") class=$(cat "$intf/bInterfaceClass") driver=$driver"
-  done
-done
-
-4. Check local printer device-file candidates and permissions
--------------------------------------------------------------
-
-cargo run -p reink-cli -- local-devices
-ls -l /dev/lp* /dev/usb/lp* 2>/dev/null || true
-
-5. Request only the standard USB Printer Class device ID
---------------------------------------------------------
-
-For each discovered Epson device, replace the product ID and interface number:
-
-cargo run -p reink-cli -- usb-id \
-  --vendor-id 0x04b8 \
-  --product-id 0xNNNN \
-  --interface N
-
-The command never enters Epson D4 mode and never writes printer state. An
-error that an active kernel driver owns the interface is an expected safe stop
-condition. Record the exact error, but do not detach or rebind the driver.
-
-6. Optional capture-only D4 entry probe
----------------------------------------
-
-Run this only after a successful standard device-ID read on an interface with
-no active kernel driver:
-
-cargo run -p reink-cli -- usb-d4-probe \
-  --vendor-id 0x04b8 \
-  --product-id 0xNNNN \
-  --interface N
-
-The probe sends the source-compatible Epson entry sequence and reads at most
-five bounded replies. It stops before D4 Init, service opening, EEPROM reads,
-writes, or counter resets. It reports only whether the known reply was
-recognized, or an unexpected reply byte count; it never prints raw response
-bytes.
-
-7. Complete read-only evidence collection
+1. Check out the repositories as siblings
 -----------------------------------------
 
-For every printer whose selected interface has no active kernel driver, retain
-sanitized JSON from the following commands:
+git clone https://github.com/fes/reink-rust.git
+git clone https://github.com/fes/reink-results.git
 
-cargo run -p reink-hardware-test -- read-sequence \
-  --vendor-id 0x04b8 --product-id 0xNNNN --interface N
+The Linux host requires `cargo`, `python3`, and the libusb development package
+needed to build `reink-rust`.
 
-cargo run -p reink-hardware-test -- d4-identity \
-  --vendor-id 0x04b8 --product-id 0xNNNN --interface N --model MODEL
+2. Run the complete automated evidence collection
+-------------------------------------------------
 
-Run the complete sequence twice on the same printer. Retain both results to
-check stable replies and orderly shutdown.
+cd reink-results
+./run-linux-read-evidence.sh --allow-driver-handoff
 
-After a successful D4 identity result, use d4-eeprom-read only for explicitly
-selected addresses: one low address, one mid-range address, one configured
-waste-counter address, and one near the configured upper bound.
+The runner lists descriptor-only printer candidates, chooses a candidate only
+when it is unambiguous, derives the bundled model range, and collects
+preflight, D4 identity, selected EEPROM reads, a bounded dump, and one
+out-of-range boundary observation. For more than one candidate or model hint,
+select the intended printer explicitly:
 
-Also retain sanitized errors for an invalid model name and an invalid EEPROM
-address. Do not induce transport, USB, or printer errors deliberately.
+./run-linux-read-evidence.sh --allow-driver-handoff \
+  --candidate-alias usb-1 --model L1300
 
-For a printer blocked by an active kernel driver, retain only the driver-block
-error and device-file permission output. Do not detach or rebind the driver.
+3. Linux driver handoff and recovery
+------------------------------------
+
+`--allow-driver-handoff` authorizes the read-only hardware driver to perform
+the selected interface handoff itself. When a Linux kernel driver such as
+`usblp` owns that interface, ReInk temporarily detaches it, claims the
+interface for the operation, releases it, and reattaches only the driver it
+detached. No external shell session, `sudo`, manual unbind, module unload, or
+udev change is required.
+
+If claim, release, or reattachment fails, the command reports that outcome in
+its console output and structured report. The printer may need a reconnect,
+manual recovery, or reboot afterward; this is a diagnostic/repair maintenance
+risk, not a reason to conceal or suppress the failure. The script continues
+the read-only evidence sequence so each attempted operation leaves a record.
+
+4. Retain and share evidence safely
+-----------------------------------
+
+The runner writes raw console logs, reports, and traces to
+`private-evidence/<timestamp>/`, which is ignored by Git. Keep that directory
+private: it can contain printer identity, EEPROM values, USB topology, and
+other device-specific data. Share only manually sanitized summaries. Before
+adding a protocol fixture, manually review and redact a trace, then use
+`trace-to-transcript`; that command does not sanitize input.
+
+The lower-level `reink-cli usb-id` and `usb-d4-probe` commands intentionally
+do not hand off a driver. Use the automated hardware-test runner for
+maintenance evidence when the selected interface is driver-owned.
