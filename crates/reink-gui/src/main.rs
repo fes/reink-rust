@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use eframe::egui::{self, Color32, RichText};
-use regex::Regex;
+use regex::RegexBuilder;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use reink_app::{EepromImage, EpsonD4Session};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -533,7 +533,10 @@ impl ReinkGui {
                                 .model_names()
                                 .map(str::to_owned)
                                 .collect::<Vec<_>>();
-                            let filter = Regex::new(&self.model_filter).ok();
+                            let filter = RegexBuilder::new(&self.model_filter)
+                                .case_insensitive(true)
+                                .build()
+                                .ok();
                             let combo_id = ui.make_persistent_id("eeprom-model");
                             let focus_filter = selected_model.is_none()
                                 && !egui::ComboBox::is_open(ui.ctx(), combo_id);
@@ -547,7 +550,7 @@ impl ReinkGui {
                                 .height(model_popup_height)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show_ui(ui, |ui| {
-                                    ui.label("Filter (regex)");
+                                    ui.label("Filter (case-insensitive regex)");
                                     let filter_response = ui.add(
                                         egui::TextEdit::singleline(&mut self.model_filter)
                                             .id_salt("eeprom-model-filter"),
