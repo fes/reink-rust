@@ -119,6 +119,11 @@ the host if needed before retrying. The current macOS implementation does not
 detach a driver; a future selected-printer operation may use and restore an
 existing system driver association. This does not enable writes or resets.
 
+`read-sequence` includes an isolated D4 entry probe by default. That probe
+stops before D4 Init and may leave a printer awaiting D4 traffic, so the
+automated runner passes `--skip-d4-entry-probe` and lets each later D4 command
+start and close its own session.
+
 ### Automated Linux run
 
 For the standard complete evidence sequence, use the companion

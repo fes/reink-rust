@@ -75,6 +75,9 @@ enum Command {
         bus_number: Option<u8>,
         #[arg(long)]
         device_address: Option<u8>,
+        /// Omit the one-way D4 entry probe so a later D4 command starts a fresh session.
+        #[arg(long)]
+        skip_d4_entry_probe: bool,
     },
     /// Explain why write validation is not available.
     WriteSequence,
@@ -228,6 +231,7 @@ fn run(cli: Cli) -> Result<String, String> {
             alternate_setting,
             bus_number,
             device_address,
+            skip_d4_entry_probe,
         } => read_sequence(
             vendor_id,
             product_id,
@@ -235,6 +239,7 @@ fn run(cli: Cli) -> Result<String, String> {
             alternate_setting,
             bus_number,
             device_address,
+            skip_d4_entry_probe,
         ),
         Command::WriteSequence => Err(
             "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
@@ -1190,6 +1195,7 @@ fn read_sequence(
     alternate_setting: u8,
     bus_number: Option<u8>,
     device_address: Option<u8>,
+    skip_d4_entry_probe: bool,
 ) -> Result<String, String> {
     let selector = reink_platform::UsbInterfaceSelector {
         number: interface,
@@ -1205,12 +1211,16 @@ fn read_sequence(
     let resolved_model = database
         .resolve_identity(&identity)
         .map(|spec| spec.model.as_str());
-    let entry = probe_epson_d4_entry(device, selector).map_err(driver_recovery_error)?;
-    let d4_entry = match entry {
-        EpsonD4EntryProbeResult::Recognized => json!({"status": "recognized"}),
-        EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
-            json!({"status": "unrecognized", "received_bytes": received_bytes})
-        }
+    let d4_entry = if skip_d4_entry_probe {
+        None
+    } else {
+        let entry = probe_epson_d4_entry(device, selector).map_err(driver_recovery_error)?;
+        Some(match entry {
+            EpsonD4EntryProbeResult::Recognized => json!({"status": "recognized"}),
+            EpsonD4EntryProbeResult::Unrecognized { received_bytes } => {
+                json!({"status": "unrecognized", "received_bytes": received_bytes})
+            }
+        })
     };
     Ok(read_sequence_report(
         json!({"vendor_id": format!("{vendor_id:04x}"), "product_id": format!("{product_id:04x}"), "interface": interface, "alternate_setting": alternate_setting, "bytes_received": bytes.len()}),
@@ -1229,6 +1239,7 @@ fn read_sequence(
     _: u8,
     _: Option<u8>,
     _: Option<u8>,
+    _: bool,
 ) -> Result<String, String> {
     Err("hardware USB validation is currently supported only on Linux or macOS".to_owned())
 }
@@ -1572,18 +1583,21 @@ fn read_sequence_report(
     usb: Value,
     identity: Value,
     model_resolution: Value,
-    d4_entry: Value,
+    d4_entry: Option<Value>,
     driver_handoff: impl Into<DriverHandoffReport>,
 ) -> String {
+    let mut steps = vec![
+        completed_step("usb-device-id", usb),
+        completed_step("parse-device-id", identity),
+        completed_step("resolve-model", model_resolution),
+    ];
+    if let Some(d4_entry) = d4_entry {
+        steps.push(completed_step("d4-entry-probe", d4_entry));
+    }
     read_only_report(
         "read-sequence",
         driver_handoff,
-        vec![
-            completed_step("usb-device-id", usb),
-            completed_step("parse-device-id", identity),
-            completed_step("resolve-model", model_resolution),
-            completed_step("d4-entry-probe", d4_entry),
-        ],
+        steps,
         "Review this read-only preflight evidence before using d4-identity or d4-eeprom-read; write and reset validation remain unavailable.",
     )
 }
@@ -1731,7 +1745,7 @@ mod tests {
             json!({"vendor_id": "04b8", "bytes_received": 25}),
             json!({"MFG": "EPSON", "MDL": "C90"}),
             json!({"detected_model": "C90", "resolved_model": "C90"}),
-            json!({"status": "recognized"}),
+            Some(json!({"status": "recognized"})),
             true,
         ));
 
@@ -1754,6 +1768,22 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("d4-identity")
+        );
+    }
+
+    #[test]
+    fn read_sequence_can_omit_the_state_changing_d4_entry_probe() {
+        let output = report(read_sequence_report(
+            json!({"vendor_id": "04b8", "bytes_received": 25}),
+            json!({"MFG": "EPSON", "MDL": "C90"}),
+            json!({"detected_model": "C90", "resolved_model": "C90"}),
+            None,
+            false,
+        ));
+
+        assert_completed_steps(
+            &output,
+            &["usb-device-id", "parse-device-id", "resolve-model"],
         );
     }
 
