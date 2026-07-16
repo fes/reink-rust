@@ -72,9 +72,9 @@ traffic, or enable writes. No GUI driver-handoff control is present. Selecting
 a candidate clears the raw EEPROM source; selecting a fixture or raw file
 clears the candidate. A candidate has no identity or EEPROM data and makes
 connected operations and fixture validation unavailable until a future explicit
-read-only operation exists. That future selected-printer operation must
-automatically detach and reattach only the selected Linux interface driver; do
-not add an operation merely to perform handoff. On Windows, native USB
+read-only operation exists. That future selected-printer operation must restore
+the prior association after using an existing driver for the selected interface;
+do not add an operation merely to perform handoff. On Windows, native USB
 descriptor enumeration is unavailable; raw EEPROM inspection remains available, while fixtures require
 the explicit `--fixtures` launch mode.
 

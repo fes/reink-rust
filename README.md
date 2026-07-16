@@ -117,12 +117,12 @@ IEEE 1284.4 negotiation, and repeated bidirectional control-channel traffic
 without creating print jobs or disrupting ordinary printing. Until that
 prototype succeeds, Windows native USB access is not a supported transport.
 
-ReInk must **never** install, replace, detach, rebind, or restore a Windows
-device driver. A future libusb Windows adapter may support an interface that a
-user has already configured with a compatible driver, but it must neither
-perform nor prompt for that driver modification. If the selected adapter
-cannot access the device, it reports a precise error rather than silently
-switching transport methods.
+ReInk does not install drivers. A future Windows adapter may temporarily
+change the association or ownership of an explicitly selected printer interface
+only by using drivers already present on the system, then restore the prior
+association after the operation. If the selected adapter cannot access the
+device, it reports a precise error rather than silently switching transport
+methods.
 
 All concrete transports normalize their native implementation to
 `reink-platform::ByteTransport`. The D4 layer receives only ordered blocking
@@ -141,8 +141,10 @@ and a read limit. After a Linux interface is explicitly selected, ReInk
 automatically detaches an active driver for that interface, then releases and
 reattaches only the driver it detached after each operation. Reattachment
 failures report recovery guidance: reconnect or power-cycle the printer, then
-reboot the host if needed before retrying. macOS access uses only libusb's
-normal read/claim operations and never modifies a macOS driver.
+reboot the host if needed before retrying. macOS access currently uses only
+libusb's normal read/claim operations. A future selected-printer operation may
+use an existing system driver association when needed and must restore it after
+the operation.
 
 The Windows build contains no libusb transport and no driver-management code.
 Windows support remains contingent on the native printer-stack prototype
@@ -160,10 +162,11 @@ For native Linux or WSL development, install `build-essential`, `pkg-config`,
 toolchain.
 
 For macOS development, use the stable Xcode command-line tools and Rust
-toolchain. No driver installation, detachment, rebinding, or manual workaround
-is part of setup. Use `system_profiler SPUSBDataType` to obtain the selected
-printer's vendor/product IDs and, when duplicate IDs are attached, its
-libusb-visible bus and address. A libusb claim failure is a stop condition.
+toolchain. No driver installation is part of setup. Use
+`system_profiler SPUSBDataType` to obtain the selected printer's vendor/product
+IDs and, when duplicate IDs are attached, its libusb-visible bus and address.
+The current macOS adapter reports a claim failure; a future selected-printer
+operation may use and restore an existing system driver association.
 
 ### `reink-core`
 
@@ -288,8 +291,9 @@ Use your platform's USB listing tool to obtain the product, interface, and any
 needed location values. Do not guess them and do not use this command on
 Windows; its USB path is not supported. On Linux, failure to detach, claim, or
 reattach the selected interface reports reconnect, power-cycle, and reboot
-remediation. A failed macOS claim remains a deliberate stop condition: ReInk
-will not detach, rebind, install, or work around a macOS driver.
+remediation. The current macOS adapter reports a claim failure; a future
+selected-printer operation may use and restore an existing system driver
+association.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service
@@ -414,8 +418,9 @@ each operation. Schema-version-3 reports include
 `linux_driver_handoff` with automatic, detached, and reattached outcomes; they
 never contain raw traffic. If detach, claim, release, or reattachment fails,
 reconnect or power-cycle the printer, then reboot the host if needed before
-retrying. macOS does not attempt a kernel-driver handoff and normal claim
-failure remains a safe stop.
+retrying. The current macOS adapter does not attempt a kernel-driver handoff;
+future selected-printer operations may use and restore existing system driver
+associations.
 
 Concrete commands return nonzero for operational failures. When `--report-file`
 is supplied after a D4 operation begins, they preserve a structured failure
@@ -541,8 +546,9 @@ printer interface; ordinary development does not modify USB drivers.
 
 Windows supports the workspace's pure crates, CLI, terminal UI, descriptor/real
 GUI (with explicit fixture opt-in), mDNS, and SNMP paths. Native Windows USB
-access is **not supported**. Do not install, replace,
-detach, rebind, or restore a printer driver for ReInk.
+access is **not supported**. Future Windows support may use existing system
+drivers for a selected-printer lifecycle and restore the prior association; it
+must not install a new driver.
 
 1. Install [Git for Windows](https://git-scm.com/download/win).
 2. Install the current stable Rust MSVC toolchain from
@@ -638,12 +644,11 @@ clearly; reconnect or power-cycle the printer, then reboot the host if needed.
 1. Run the build, format, Clippy, and test commands above after source changes.
 2. Treat all printer access as opt-in. Never run `usb-id`, D4, EEPROM, or reset
    commands against a device unless the user explicitly selects it.
-3. Never install, replace, or modify a Windows USB/printer driver. For an
-   explicitly selected Linux read-only hardware-test operation, automatically
-   detach and reattach only its selected interface driver in-session; report
-   detach, claim, release, or reattach failure with reconnect, power-cycle, and
-   reboot remediation rather than hiding it or requiring an external handoff
-   session.
+3. Never install a USB/printer driver. An explicitly selected maintenance
+   operation may use an already-installed driver association and must restore
+   the prior association after the operation. Report detach, claim, release, or
+   reattach failure with reconnect, power-cycle, and reboot remediation rather
+   than hiding it or requiring an external handoff session.
 4. Never commit raw captures, serial numbers, USB paths, IP addresses, SNMP
    credentials, or other device-specific data. Use sanitized transcripts only.
 5. Do not add write/reset commands until the protocol-provenance safety gate
@@ -701,12 +706,12 @@ suite, so each ported behavior is documented through Rust tests and small,
 sanitized fixtures.
 
 Do not commit captured traffic containing printer serial numbers, IP addresses,
-or other device-specific information. Do not add USB driver installation or
-Windows driver modification as part of ordinary development setup. Automatic
-Linux read-only maintenance handoff occurs only through the supported
-in-session lifecycle and must surface recovery failure. EEPROM writes and reset
-operations must require explicit user confirmation, use read-back verification
-by default, and report any rollback failure clearly.
+or other device-specific information. Do not add USB driver installation as
+part of ordinary development setup. Selected maintenance operations may use
+existing driver associations only through a lifecycle that restores the prior
+association and surfaces recovery failure. EEPROM writes and reset operations
+must require explicit user confirmation, use read-back verification by default,
+and report any rollback failure clearly.
 
 ## License
 

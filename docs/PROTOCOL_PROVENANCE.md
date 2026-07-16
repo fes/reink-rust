@@ -103,8 +103,9 @@ operation, require all of the following:
 2. A test proving the request byte sequence and successful reply parsing.
 3. A test proving read-back verification and failure handling.
 4. Application-layer explicit confirmation and device identity display.
-5. No automatic Windows driver installation, replacement, detachment, or
-   rebinding.
+5. No installation of a new Windows driver. Any future selected-printer
+   association change must use an existing system driver and restore the prior
+   association after the operation.
 6. A separately retained sanitized read-only report, identified by a SHA-256
    reference rather than embedded raw hardware data.
 7. A separate human safety review covering backups, read-back, rollback, and

@@ -115,8 +115,9 @@ operation. Schema-version-3 D4 reports record
 `linux_driver_handoff.automatic`, `.detached`, and `.reattached` outcomes
 without raw traffic. No external manual unbind is required. On failure, the
 report directs the operator to reconnect or power-cycle the printer and reboot
-the host if needed before retrying. macOS does not detach a driver, and this
-does not enable writes or resets.
+the host if needed before retrying. The current macOS implementation does not
+detach a driver; a future selected-printer operation may use and restore an
+existing system driver association. This does not enable writes or resets.
 
 ### Automated Linux run
 
