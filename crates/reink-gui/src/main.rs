@@ -534,14 +534,24 @@ impl ReinkGui {
                                 .map(str::to_owned)
                                 .collect::<Vec<_>>();
                             let filter = Regex::new(&self.model_filter).ok();
+                            let combo_id = ui.make_persistent_id("eeprom-model");
+                            let focus_filter = selected_model.is_none()
+                                && !egui::ComboBox::is_open(ui.ctx(), combo_id);
                             egui::ComboBox::from_id_salt("eeprom-model")
                                 .selected_text(
                                     selected_model.as_deref().unwrap_or("Select model..."),
                                 )
                                 .width(180.0)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show_ui(ui, |ui| {
                                     ui.label("Filter (regex)");
-                                    ui.text_edit_singleline(&mut self.model_filter);
+                                    let filter_response = ui.add(
+                                        egui::TextEdit::singleline(&mut self.model_filter)
+                                            .id_salt("eeprom-model-filter"),
+                                    );
+                                    if focus_filter {
+                                        filter_response.request_focus();
+                                    }
                                     if !self.model_filter.is_empty() && filter.is_none() {
                                         ui.colored_label(Color32::RED, "Invalid regular expression");
                                     }
@@ -560,6 +570,7 @@ impl ReinkGui {
                                             .clicked()
                                         {
                                             selected_model = Some(model.clone());
+                                            ui.close();
                                         }
                                     }
                                 });
