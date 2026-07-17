@@ -10,12 +10,26 @@ mistaken for standards conformance.
 | --- | --- | --- |
 | A | Public authoritative standard or specification | Implement and cite the exact edition and section |
 | B | Official vendor documentation | Implement only within documented model/protocol scope |
-| C | ReInkPy source behavior or a sanitized device capture | Preserve as observed behavior; label it unverified |
+| C | ReInkPy source behavior or reviewed, sanitized provenance evidence | Preserve as observed behavior; label it unverified |
 | D | Third-party reverse-engineering reference | Use as a research lead; validate against a capture before enabling writes |
 
 Do not copy restricted standard text into this repository. For a licensed
 standard, record its edition and section number, summarize the requirement in
 original words, and keep the licensed document outside the repository.
+
+## Private hardware observations and provenance evidence
+
+Raw traces, reports, EEPROM images, and console transcripts from an observed
+hardware run are private operational evidence, not repository provenance
+evidence. Keep them untracked and outside committed documentation. They may
+inform a conclusion, but do not raise an evidence level by themselves.
+
+Only a deliberately reviewed and sanitized transcript, fixture, or summary can
+be committed as level-C provenance evidence. It must remove device and host
+identifiers, describe its scope and limitations, and be reviewed under the
+hardware capture and fixture guide. A private observed run may therefore be
+reported as an observation while the relevant protocol claim remains pending
+reviewed sanitized provenance evidence or an authoritative source.
 
 ## Source inventory
 
@@ -29,7 +43,7 @@ original words, and keep the licensed document outside the repository.
 | Epson D4 entry sequence, reply recognition, and `EPSON-CTRL` service | `reink-app/src/lib.rs` | C: `reinkpy/epson.py` (`EpsonD4._init_link`) | Epson documentation or sanitized capture | Scripted read-only session and app-owned entry probe implemented; hardware evidence required |
 | IEEE 1284 device ID | `reink-core/src/identity.rs` | C: `reinkpy/__init__.py` parser | IEEE 1284 device-ID definition | Pending review |
 | Epson printer status (`st`) | `reink-core/src/controller.rs`, `reink-app/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/epson.py` `do_status()` | Epson documentation or sanitized capture | Scripted core, D4-session, and SNMP-control composition tests; hardware evidence required |
-| USB printer interface selection, standard device ID, and generic bounded bulk exchange | `reink-usb/src/descriptor.rs`, `adapter.rs` | C: `reinkpy/usb.py`; sanitized Linux preflight | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-protocol-session device-ID read succeeded on one selected printer; selected Linux operations now automatically hand off and reattach an active driver; clause-level review pending |
+| USB printer interface selection, standard device ID, and generic bounded bulk exchange | `reink-usb/src/descriptor.rs`, `adapter.rs` | C: `reinkpy/usb.py`; private observed Linux preflight run (not committed provenance evidence) | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-protocol-session device-ID read succeeded on one selected printer; selected Linux operations now automatically hand off and reattach an active driver; reviewed sanitized provenance evidence and clause-level review remain pending |
 | SNMP printer identification and read-only Epson control composition | `reink-snmp/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/snmp.py`; RFC 3805 for standard MIB context | RFC 3805 where applicable; Epson enterprise MIB for private OIDs | Identity-validated status and model-bounded EEPROM CLI surfaces use GET only; deterministic composition tests implemented; private OID evidence still required |
 | Epson EEPROM factory commands and semantic counter plans | `reink-core/src/command.rs`, `controller.rs`, `epson.rs` | C: `reinkpy/epson.py`, model TOML | Epson documentation or sanitized capture | Scripted execution and declared-reset plan selection implemented; hardware evidence still required |
 | Offline factory-request binary analysis | `reink-cli/src/main.rs` | C: ReInkPy `epson.py` `search_bin()` | No device protocol authority required; input remains local | Deterministic bounded parser tests implemented |
@@ -40,7 +54,7 @@ original words, and keep the licensed document outside the repository.
   — authoritative publication record. A properly licensed copy is required
   for packet-field and state-machine conformance review.
 - [USB-IF Printer Device Class Document 1.1](https://www.usb.org/document-library/printer-device-class-document-11)
-  — required reference for the future USB adapter.
+  — required reference for the current `reink-usb` adapter.
 - [RFC 3805: Printer MIB v2](https://datatracker.ietf.org/doc/html/rfc3805)
   — standard SNMP printer-management reference. It does not make Epson private
   enterprise OIDs standard.
@@ -127,7 +141,9 @@ identity, one in-range address, and an explicit test byte. It creates its
 private structured report only after cleanup. If a test write fails after the
 original byte is known, it still attempts restoration and records the test
 write, restoration, verification, and cleanup outcomes separately. No default
-command, read-evidence runner, or GUI action is permitted to execute a physical
-write or semantic reset without an explicitly authorized target operation. The
-GUI contains no reset control and must remain unavailable until an independent
-GUI gate is implemented and validated.
+command or read-evidence runner is permitted to execute a physical write or
+semantic reset. A guarded GUI action is permitted only for an
+explicitly selected target when it satisfies the same identity, authorization,
+backup, confirmation, read-back, and rollback gates. On macOS and Windows, it
+also requires an already libusb-accessible selected interface; a claim failure
+is a safe stop.

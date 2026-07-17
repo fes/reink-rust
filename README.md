@@ -146,8 +146,8 @@ libusb's normal read/claim operations. Windows uses the same normal
 read/claim/release lifecycle and never performs driver installation, detach,
 rebind, or restoration.
 
-The concrete Linux transport must be built and exercised on Linux (or in
-Linux CI with libusb development headers). The macOS and Windows adapters use
+The concrete Linux transport must be built and exercised on Linux. The macOS
+and Windows adapters use
 `rusb`'s vendored libusb support. This is compilation and scripted-test
 coverage only, not hardware validation. Cross-compiling the Linux adapter from
 Windows also requires a Linux C compiler and sysroot for `libusb1-sys`; the
@@ -617,10 +617,12 @@ Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
 `Tools` tabs. Bundled fixtures are hidden unless explicitly enabled with
 `--fixtures`; only that opt-in mode resolves fixture identity and runs
 deterministic fixture validation. Local raw EEPROM images are inspected
-read-only after an explicit model selection. Confirmed CLI semantic resets are
-available for declared model bytes, but the GUI editing, reset, backup, and
-restore controls remain unavailable until a separately validated GUI gate is
-explicitly enabled; the GUI currently contains no write or reset path.
+read-only after an explicit model selection. The GUI's editing, reset, backup,
+and restore controls are guarded
+operations: they require a selected target, exact model identity, a
+create-new synchronized backup, and the action-specific confirmation. On macOS
+and Windows they are available only when the selected interface is already
+libusb-accessible; a claim failure is a safe stop.
 
 Its persistent shell and tab-specific sub-pane rules are documented in
 [UI design](docs/UI_DESIGN.md).
@@ -709,11 +711,14 @@ For the complete hardware-test evidence sequence, use the sibling
 selector and model parameters. It keeps raw paths, reports, traces, and EEPROM
 values in ignored private evidence.
 
-### macOS: descriptor-only GUI candidates
+### macOS: guarded GUI USB operations
 
 The optional GUI can list descriptor-only USB printer candidates on macOS
-without opening or configuring a printer. Install the current stable Xcode
-command-line tools and Rust toolchain, then run:
+without opening or configuring a printer. After explicit selection, it supports
+guarded status, dump, write, restore, and reset operations only if that
+interface is already libusb-accessible. It never installs, detaches, rebinds,
+or changes a driver; a claim failure is a safe stop. Install the current stable
+Xcode command-line tools and Rust toolchain, then run:
 
 ```bash
 cargo run -p reink-gui
@@ -760,7 +765,7 @@ cargo run -p reink-gui
 
 For a physical USB printer, follow
 [the Linux read-only USB checklist](docs/LINUX_USB_READONLY_COMMANDS.txt).
-The automated hardware-test runner performs the supported read-only USB
+The opt-in hardware-test runner performs the supported read-only USB
 sequence, automatically handing off only an explicitly selected Linux driver
 for each operation. It reports detach, claim, release, and reattach failures
 clearly; reconnect or power-cycle the printer, then reboot the host if needed.
@@ -795,14 +800,11 @@ D4 state transitions, strict malformed transaction rejection, deterministic
 packet-fragmentation matrices, transcript-replayed read-only sessions, the
 read-only D4 application session, SNMP OID mapping, mDNS result conversion,
 CLI argument parsing, and platform test doubles.
-Hardware smoke tests, when added, will be opt-in and require an explicitly
-selected device.
-
-GitHub Actions runs this same formatting, Clippy, and test sequence on current
-Linux, macOS, and Windows runners. Tagged `v*` revisions and manual dispatch create
-release-build artifacts for the CLI, hardware-test driver, and TUI;
-publishing a release remains a maintainer action after reviewing those
-artifacts.
+There is no automated CI workflow in this repository. The
+`reink-hardware-test` commands and sibling evidence runners are manual,
+opt-in hardware validation tools, not automated CI smoke tests; each requires
+an explicitly selected device. Any future hardware smoke test must preserve
+that opt-in requirement.
 
 ## Application-service workflow
 
