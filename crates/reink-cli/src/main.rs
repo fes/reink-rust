@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
-use reink_core::{EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity};
+use reink_core::{
+    CounterResetTarget, EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity,
+};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
@@ -25,6 +27,24 @@ use serde_json::json;
 const EEPROM_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 const EEPROM_RESTORE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESTORE_EEPROM";
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const EEPROM_COUNTER_RESET_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS";
+const MAX_OFFLINE_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CounterResetSelection {
+    Waste,
+    PlatenPad,
+}
+
+impl CounterResetSelection {
+    const fn target(self) -> CounterResetTarget {
+        match self {
+            Self::Waste => CounterResetTarget::Waste,
+            Self::PlatenPad => CounterResetTarget::PlatenPad,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,6 +68,14 @@ enum Command {
     Model { name: String },
     /// Parse and display an IEEE 1284 device ID.
     ParseId { identifier: String },
+    /// Analyze a local binary or capture for Epson EEPROM factory requests without opening a device.
+    AnalyzeBinary {
+        /// Existing local file to inspect. Files above 64 MiB are refused.
+        input_file: PathBuf,
+        /// Include printable eight-character runs for .pcapng input too.
+        #[arg(long)]
+        include_ascii: bool,
+    },
     /// Discover IPP, IPPS, and printer services over mDNS.
     Discover {
         #[arg(long, default_value_t = 3)]
@@ -214,6 +242,33 @@ enum Command {
         #[arg(long)]
         confirmation: Option<String>,
     },
+    /// Reset only explicitly declared waste or platen-pad counter bytes after saving a complete new backup.
+    UsbEepromReset {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: Option<u8>,
+        #[arg(long)]
+        device_address: Option<u8>,
+        /// Model that must exactly match the D4 identity read from the selected printer.
+        #[arg(long)]
+        model: String,
+        /// Declared counter family to reset; values without explicit reset bytes are excluded.
+        #[arg(long, value_enum)]
+        target: CounterResetSelection,
+        /// New complete EEPROM backup path. Existing files are never overwritten.
+        #[arg(long)]
+        backup_file: PathBuf,
+        /// Exact acknowledgement required before this command opens USB.
+        #[arg(long)]
+        confirmation: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -259,6 +314,10 @@ fn run(cli: Cli) -> Result<(), String> {
             let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
             render_identity(&identity, &database, cli.json)
         }
+        Command::AnalyzeBinary {
+            input_file,
+            include_ascii,
+        } => analyze_binary_output(&input_file, include_ascii, cli.json)?,
         Command::Discover { timeout_seconds } => {
             let discovery = MdnsDiscovery;
             let devices = discovery
@@ -402,6 +461,30 @@ fn run(cli: Cli) -> Result<(), String> {
             confirmation.as_deref(),
             cli.json,
         )?,
+        Command::UsbEepromReset {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            target,
+            backup_file,
+            confirmation,
+        } => usb_eeprom_reset_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            target,
+            &backup_file,
+            confirmation.as_deref(),
+            cli.json,
+        )?,
     };
     write_stdout(&output)
 }
@@ -476,6 +559,232 @@ fn parse_eeprom_update(value: &str) -> Result<(u16, u8), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected EEPROM update in ADDRESS=VALUE form, got {value:?}"))?;
     Ok((parse_u16(address)?, parse_u8(byte)?))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BinaryFinding {
+    EepromRead {
+        offset: usize,
+        read_key: u16,
+        address: u16,
+    },
+    EepromWrite {
+        offset: usize,
+        read_key: u16,
+        address: u16,
+        value: u8,
+        write_key: Vec<u8>,
+    },
+    InvalidFactoryRequest {
+        offset: usize,
+        reason: &'static str,
+    },
+    PrintableAscii {
+        offset: usize,
+        value: String,
+    },
+}
+
+fn analyze_binary_output(
+    input_file: &Path,
+    include_ascii: bool,
+    as_json: bool,
+) -> Result<String, String> {
+    let metadata = std::fs::metadata(input_file)
+        .map_err(|error| format!("could not inspect {}: {error}", input_file.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "offline binary analysis requires a regular file: {}",
+            input_file.display()
+        ));
+    }
+    if metadata.len() > MAX_OFFLINE_BINARY_BYTES {
+        return Err(format!(
+            "refusing to analyze {}: {} bytes exceeds the {}-byte offline limit",
+            input_file.display(),
+            metadata.len(),
+            MAX_OFFLINE_BINARY_BYTES
+        ));
+    }
+    let bytes = std::fs::read(input_file)
+        .map_err(|error| format!("could not read {}: {error}", input_file.display()))?;
+    let is_pcapng = input_file
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pcapng"));
+    let findings = analyze_binary_bytes(&bytes, include_ascii || !is_pcapng);
+    Ok(render_binary_findings(input_file, &findings, as_json))
+}
+
+/// Safely recognizes the `search_bin` Epson factory-request signatures in
+/// already captured local bytes. It never decodes or executes arbitrary input.
+fn analyze_binary_bytes(bytes: &[u8], include_ascii: bool) -> Vec<BinaryFinding> {
+    let mut findings = Vec::new();
+    let mut offset: usize = 0;
+    while offset.saturating_add(9) <= bytes.len() {
+        if bytes[offset..].starts_with(b"||") {
+            let command = &bytes[offset + 6..offset + 9];
+            let is_read = command == [b'A', !b'A', 0xa0];
+            let is_write = command == [b'B', !b'B', 0x21];
+            if is_read || is_write {
+                let declared_length =
+                    usize::from(u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]));
+                let Some(payload_length) = declared_length.checked_sub(5) else {
+                    findings.push(BinaryFinding::InvalidFactoryRequest {
+                        offset,
+                        reason: "declared factory payload is shorter than its five-byte header",
+                    });
+                    offset += 9;
+                    continue;
+                };
+                let payload_start = offset + 9;
+                let Some(payload_end) = payload_start.checked_add(payload_length) else {
+                    findings.push(BinaryFinding::InvalidFactoryRequest {
+                        offset,
+                        reason: "declared factory payload length overflows",
+                    });
+                    offset += 9;
+                    continue;
+                };
+                if payload_end > bytes.len() {
+                    findings.push(BinaryFinding::InvalidFactoryRequest {
+                        offset,
+                        reason: "factory request payload is truncated",
+                    });
+                } else if is_read && payload_length < 2 {
+                    findings.push(BinaryFinding::InvalidFactoryRequest {
+                        offset,
+                        reason: "EEPROM read request has fewer than two address bytes",
+                    });
+                } else if is_write && payload_length < 3 {
+                    findings.push(BinaryFinding::InvalidFactoryRequest {
+                        offset,
+                        reason: "EEPROM write request has fewer than address and value bytes",
+                    });
+                } else {
+                    let read_key = u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]);
+                    let address =
+                        u16::from_le_bytes([bytes[payload_start], bytes[payload_start + 1]]);
+                    if is_read {
+                        findings.push(BinaryFinding::EepromRead {
+                            offset,
+                            read_key,
+                            address,
+                        });
+                    } else {
+                        findings.push(BinaryFinding::EepromWrite {
+                            offset,
+                            read_key,
+                            address,
+                            value: bytes[payload_start + 2],
+                            write_key: bytes[payload_start + 3..payload_end].to_vec(),
+                        });
+                    }
+                }
+                offset += 9;
+                continue;
+            }
+        }
+        offset += 1;
+    }
+
+    if include_ascii {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if !(0x20..=0x7e).contains(&bytes[offset]) {
+                offset += 1;
+                continue;
+            }
+            let start = offset;
+            while offset < bytes.len() && (0x20..=0x7e).contains(&bytes[offset]) {
+                offset += 1;
+            }
+            if offset - start >= 8 {
+                findings.push(BinaryFinding::PrintableAscii {
+                    offset: start,
+                    value: String::from_utf8(bytes[start..offset].to_vec())
+                        .expect("ASCII byte range is valid UTF-8"),
+                });
+            }
+        }
+    }
+    findings
+}
+
+fn render_binary_findings(input_file: &Path, findings: &[BinaryFinding], as_json: bool) -> String {
+    if as_json {
+        let findings = findings
+            .iter()
+            .map(|finding| match finding {
+                BinaryFinding::EepromRead {
+                    offset,
+                    read_key,
+                    address,
+                } => json!({
+                    "kind": "eeprom_read",
+                    "offset": offset,
+                    "read_key": format!("{read_key:04X}"),
+                    "address": format!("{address:04X}"),
+                }),
+                BinaryFinding::EepromWrite {
+                    offset,
+                    read_key,
+                    address,
+                    value,
+                    write_key,
+                } => json!({
+                    "kind": "eeprom_write",
+                    "offset": offset,
+                    "read_key": format!("{read_key:04X}"),
+                    "address": format!("{address:04X}"),
+                    "value": format!("{value:02X}"),
+                    "write_key_hex": hex_encode(write_key),
+                }),
+                BinaryFinding::InvalidFactoryRequest { offset, reason } => json!({
+                    "kind": "invalid_factory_request",
+                    "offset": offset,
+                    "reason": reason,
+                }),
+                BinaryFinding::PrintableAscii { offset, value } => json!({
+                    "kind": "printable_ascii",
+                    "offset": offset,
+                    "value": value,
+                }),
+            })
+            .collect::<Vec<_>>();
+        return json!({
+            "mode": "offline",
+            "input_file": input_file,
+            "findings": findings,
+        })
+        .to_string();
+    }
+    findings
+        .iter()
+        .map(|finding| match finding {
+            BinaryFinding::EepromRead {
+                offset,
+                read_key,
+                address,
+            } => format!("offset:{offset:08X} rkey:{read_key:04x} READ addr:{address:04x}"),
+            BinaryFinding::EepromWrite {
+                offset,
+                read_key,
+                address,
+                value,
+                write_key,
+            } => format!(
+                "offset:{offset:08X} rkey:{read_key:04x} WRITE addr:{address:04x} val:{value:02x} wkey:{}",
+                hex_encode(write_key)
+            ),
+            BinaryFinding::InvalidFactoryRequest { offset, reason } => {
+                format!("offset:{offset:08X} INVALID {reason}")
+            }
+            BinaryFinding::PrintableAscii { offset, value } => {
+                format!("offset:{offset:08X} ASCII {value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn snmp_status_output(as_json: bool) -> Result<String, String> {
@@ -929,6 +1238,116 @@ fn usb_eeprom_write_output(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
+fn usb_eeprom_reset_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    target: CounterResetSelection,
+    backup_file: &Path,
+    confirmation: Option<&str>,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_confirmation(
+        confirmation,
+        EEPROM_COUNTER_RESET_CONFIRMATION,
+        "usb-eeprom-reset",
+    )?;
+    validate_new_file_path(backup_file, "EEPROM reset backup")?;
+    let spec = selected_model(model)?;
+    let updates = declared_counter_reset_updates(&spec, target)?;
+
+    with_usb_epson_session(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        spec,
+        |session| {
+            verify_requested_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            let plan = session
+                .prepare_eeprom_write(&updates)
+                .map_err(|error| format!("could not prepare declared counter reset: {error}"))?;
+            write_new_binary_file(backup_file, &plan.backup.bytes, "EEPROM reset backup")?;
+            session
+                .apply_eeprom_write(&plan)
+                .map_err(|error| format!("declared counter reset failed: {error}"))
+        },
+    )?;
+
+    Ok(counter_reset_output(
+        model,
+        target,
+        updates.len(),
+        backup_file,
+        as_json,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn declared_counter_reset_updates(
+    spec: &EpsonSpec,
+    target: CounterResetSelection,
+) -> Result<Vec<(u16, u8)>, String> {
+    let operation = spec.counter_reset(target.target()).ok_or_else(|| {
+        format!(
+            "model {} has no explicitly declared {} reset bytes",
+            spec.model,
+            target.target().display_name()
+        )
+    })?;
+    if !operation.has_declared_reset_values() {
+        return Err(format!(
+            "model {} has no explicitly declared {} reset bytes",
+            spec.model,
+            target.target().display_name()
+        ));
+    }
+    let updates = operation
+        .addresses
+        .into_iter()
+        .zip(operation.reset_values)
+        .collect::<Vec<_>>();
+    validate_eeprom_updates(spec, &updates)?;
+    Ok(updates)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn counter_reset_output(
+    model: &str,
+    target: CounterResetSelection,
+    byte_count: usize,
+    backup_file: &Path,
+    as_json: bool,
+) -> String {
+    let target = target.target().display_name();
+    if as_json {
+        json!({
+            "operation": "declared_counter_reset",
+            "model": model,
+            "target": target,
+            "byte_count": byte_count,
+            "backup_file": backup_file,
+        })
+        .to_string()
+    } else {
+        format!(
+            "Declared {target} reset completed for {model}: {byte_count} byte(s); backup_file: {}",
+            backup_file.display()
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn usb_eeprom_restore_output(
     vendor_id: u16,
     product_id: u16,
@@ -1153,6 +1572,24 @@ fn usb_eeprom_restore_output(
     Err("USB EEPROM restores are currently supported only on Linux or macOS".to_owned())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn usb_eeprom_reset_output(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: Option<u8>,
+    _: Option<u8>,
+    _: &str,
+    _: CounterResetSelection,
+    _: &Path,
+    _: Option<&str>,
+    _: bool,
+) -> Result<String, String> {
+    Err("USB EEPROM resets are currently supported only on Linux or macOS".to_owned())
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn usb_identity_output(
     _vendor_id: u16,
@@ -1304,10 +1741,12 @@ mod tests {
     use reink_core::{EepromReadReply, ModelDatabase};
 
     use super::{
-        Cli, Command, EEPROM_RESTORE_CONFIRMATION, EEPROM_WRITE_CONFIRMATION, parse_eeprom_update,
-        render_eeprom_readings, render_identity, render_models, render_printer_status,
-        validate_confirmation, validate_eeprom_read_addresses, validate_eeprom_updates,
-        validate_new_file_path, verify_requested_model,
+        BinaryFinding, Cli, Command, CounterResetSelection, EEPROM_COUNTER_RESET_CONFIRMATION,
+        EEPROM_RESTORE_CONFIRMATION, EEPROM_WRITE_CONFIRMATION, analyze_binary_bytes,
+        declared_counter_reset_updates, parse_eeprom_update, render_eeprom_readings,
+        render_identity, render_models, render_printer_status, validate_confirmation,
+        validate_eeprom_read_addresses, validate_eeprom_updates, validate_new_file_path,
+        verify_requested_model,
     };
 
     #[test]
@@ -1322,6 +1761,14 @@ mod tests {
         let cli = Cli::try_parse_from(["reink", "--json", "snmp-id"]).unwrap();
         assert!(cli.json);
         assert!(matches!(cli.command, Command::SnmpId));
+        let cli = Cli::try_parse_from(["reink", "analyze-binary", "capture.bin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::AnalyzeBinary {
+                input_file,
+                include_ascii: false,
+            } if input_file == std::path::Path::new("capture.bin")
+        ));
         let cli = Cli::try_parse_from(["reink", "snmp-status"]).unwrap();
         assert!(matches!(cli.command, Command::SnmpStatus));
         let cli = Cli::try_parse_from([
@@ -1454,6 +1901,33 @@ mod tests {
                 ..
             }
         ));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "usb-eeprom-reset",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--target",
+            "waste",
+            "--backup-file",
+            "new-reset-backup.bin",
+            "--confirmation",
+            EEPROM_COUNTER_RESET_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::UsbEepromReset {
+                target: CounterResetSelection::Waste,
+                confirmation: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1491,6 +1965,48 @@ mod tests {
         assert_eq!(parse_eeprom_update("12=34").unwrap(), (12, 34));
         assert!(parse_eeprom_update("0x000c").is_err());
         assert!(parse_eeprom_update("0x000c=0x100").is_err());
+    }
+
+    #[test]
+    fn offline_binary_analysis_finds_factory_requests_and_never_reads_past_input() {
+        let bytes = [
+            b'x', b'|', b'|', 0x07, 0x00, 0x34, 0x12, b'A', 0xbe, 0xa0, 0x78, 0x56, b'|', b'|',
+            0x10, 0x00, 0x34, 0x12, b'B', 0xbd, 0x21, 0x34, 0x12, 0xfe, b'k', b'e', b'y', 0, 0, 0,
+            0, 0, b'p', b'r', b'i', b'n', b't', b'a', b'b', b'l', b'e', b'!', 0, b'|', b'|', 0x04,
+            0x00, 0x34, 0x12, b'A', 0xbe, 0xa0,
+        ];
+        let findings = analyze_binary_bytes(&bytes, true);
+
+        assert_eq!(
+            findings,
+            vec![
+                BinaryFinding::EepromRead {
+                    offset: 1,
+                    read_key: 0x1234,
+                    address: 0x5678,
+                },
+                BinaryFinding::EepromWrite {
+                    offset: 12,
+                    read_key: 0x1234,
+                    address: 0x1234,
+                    value: 0xfe,
+                    write_key: b"key\0\0\0\0\0".to_vec(),
+                },
+                BinaryFinding::InvalidFactoryRequest {
+                    offset: 43,
+                    reason: "declared factory payload is shorter than its five-byte header",
+                },
+                BinaryFinding::PrintableAscii {
+                    offset: 32,
+                    value: "printable!".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_binary_analysis_can_exclude_printable_ascii() {
+        assert!(analyze_binary_bytes(b"ABCDEFGH", false).is_empty());
     }
 
     #[test]
@@ -1559,12 +2075,58 @@ mod tests {
             validate_eeprom_updates(spec, &[(spec.memory_low, 1), (spec.memory_low, 2)]).is_err()
         );
         assert!(validate_eeprom_updates(spec, &[(spec.memory_high.saturating_add(1), 1)]).is_err());
+        assert!(
+            validate_confirmation(
+                Some(EEPROM_COUNTER_RESET_CONFIRMATION),
+                EEPROM_COUNTER_RESET_CONFIRMATION,
+                "usb-eeprom-reset"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_confirmation(
+                Some("I_CONFIRM_THIS_WILL_RESET_COUNTERS"),
+                EEPROM_COUNTER_RESET_CONFIRMATION,
+                "usb-eeprom-reset"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn declared_counter_resets_select_only_the_requested_explicit_operations() {
+        let database = ModelDatabase::builtin().unwrap();
+        let c90 = database.get("C90").unwrap();
+        assert_eq!(
+            declared_counter_reset_updates(c90, CounterResetSelection::Waste).unwrap(),
+            vec![
+                (0x06, 0),
+                (0x07, 0),
+                (0x0a, 0),
+                (0x0b, 0),
+                (0x16, 0),
+                (0x17, 0),
+                (0x34, 4),
+                (0x35, 0x57),
+                (0x0c, 1),
+                (0x0d, 0xf4),
+            ]
+        );
+        assert!(declared_counter_reset_updates(c90, CounterResetSelection::PlatenPad).is_err());
+
+        let xp = database.get("XP-15000").unwrap();
+        assert_eq!(
+            declared_counter_reset_updates(xp, CounterResetSelection::PlatenPad).unwrap(),
+            vec![(0x40, 0), (0x43, 0), (0x44, 0), (0x48, 0x5e), (0x1ed, 0)]
+        );
+        assert!(declared_counter_reset_updates(xp, CounterResetSelection::Waste).is_err());
     }
 
     #[test]
     fn refuses_existing_and_parentless_backup_paths() {
         let existing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert!(validate_new_file_path(&existing, "EEPROM backup").is_err());
+        assert!(validate_new_file_path(&existing, "EEPROM reset backup").is_err());
         assert!(
             validate_new_file_path(
                 std::path::Path::new("missing-parent-for-reink-cli-test\\backup.bin"),

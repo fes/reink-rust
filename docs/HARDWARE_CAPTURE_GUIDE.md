@@ -18,8 +18,8 @@ It applies when a device is available and supplements
    family when known, timestamp, and whether the interaction was read-only.
    Keep this metadata private if it identifies a device or person.
 5. A capture is evidence of observed behavior, not permission for a generic
-   write/reset action. A physical write remains available only through the
-   explicit write-evidence or confirmed CLI gates.
+   write/reset action. A physical write or semantic counter reset remains
+   available only through the explicit write-evidence or confirmed CLI gates.
 6. The `--trace-file` output is an original/raw byte trace. Store it outside
    this repository, never commit it, and share only a separately redacted
    derivative when authorized.
@@ -111,6 +111,29 @@ restoration, read-back, shutdown, or USB cleanup stage fails, do not retry and
 do not issue another write. Retain the private backup/report, reconnect or
 power-cycle if needed, and verify the original byte with a separately confirmed
 read before further action.
+
+## Confirmed semantic counter reset
+
+`reink-cli usb-eeprom-reset` is a separate, explicit maintenance operation; it
+is not a hardware-evidence command and no evidence runner invokes it. It
+requires an exact selected model identity, a new complete private backup, and
+the exact acknowledgement
+`I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS` before USB is opened. Its
+`--target waste` and `--target platen-pad` options are semantically separate.
+The command merges only matching model-TOML operations with an explicitly
+declared `reset` byte array. It never converts a missing `reset` field or a
+`min` metadata field into zeros.
+
+The command uses the same complete backup, per-byte read-back verification,
+rollback-on-failure, orderly D4 shutdown, and USB cleanup path as confirmed
+write/restore. Unlike `d4-eeprom-write-evidence`, a successful reset is not
+automatically restored and does not create a hardware-test report: retain the
+private backup and command result. Do not add this command to read-evidence
+runners or use it solely to produce a capture.
+
+```powershell
+cargo run -p reink-cli -- usb-eeprom-reset --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --target waste --backup-file <new-private-complete-backup.bin> --confirmation I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS
+```
 
 ## USB identity preflight
 

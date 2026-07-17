@@ -266,9 +266,24 @@ impl<T: ByteTransport> EpsonD4Session<T> {
             ));
         }
         validate_eeprom_updates(&self.spec, &plan.updates)?;
+        let originals = plan
+            .updates
+            .iter()
+            .map(|&(address, _)| {
+                plan.backup
+                    .value_at(address)
+                    .map(|value| (address, value))
+                    .ok_or_else(|| {
+                        ApplicationError::WritePlan(format!(
+                            "backup does not contain EEPROM address {address:#06x}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut channel = self.link.control_channel(self.control_channel)?;
-        EpsonController::new(&mut channel, &self.spec).write_eeprom(
+        EpsonController::new(&mut channel, &self.spec).write_eeprom_with_originals(
             &plan.updates,
+            Some(&originals),
             EepromWriteOptions {
                 verify_read_back: true,
                 atomic: true,

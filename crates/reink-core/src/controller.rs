@@ -66,7 +66,7 @@ impl<'a, C: ControlChannel> EpsonController<'a, C> {
     }
 
     /// Writes EEPROM values, optionally verifying each value and rolling back
-    /// completed writes after a failure.
+    /// every attempted write after a failure.
     pub fn write_eeprom(
         &mut self,
         updates: &[(u16, u8)],
@@ -87,32 +87,67 @@ impl<'a, C: ControlChannel> EpsonController<'a, C> {
         } else {
             None
         };
+        self.write_eeprom_with_originals(updates, originals.as_deref(), options)
+    }
 
-        let mut completed = Vec::new();
+    /// Writes values using caller-captured originals for atomic restoration.
+    ///
+    /// `originals` must contain every update address exactly once. This lets an
+    /// application use the durable complete image it captured before any write,
+    /// rather than taking a second, narrower pre-write snapshot.
+    pub fn write_eeprom_with_originals(
+        &mut self,
+        updates: &[(u16, u8)],
+        originals: Option<&[(u16, u8)]>,
+        options: EepromWriteOptions,
+    ) -> Result<(), EpsonError> {
+        if let Some(originals) = originals {
+            for &(address, _) in updates {
+                if !originals
+                    .iter()
+                    .any(|(original_address, _)| *original_address == address)
+                {
+                    return Err(EpsonError::MissingAtomicOriginal { address });
+                }
+            }
+        } else if options.atomic {
+            return Err(EpsonError::MissingAtomicOriginal {
+                address: updates.first().map_or(0, |(address, _)| *address),
+            });
+        }
+
+        let mut attempted = Vec::new();
         for &(address, value) in updates {
+            attempted.push(address);
             if let Err(error) = self.write_eeprom_address(address, value, options.verify_read_back)
             {
-                let rollback_error = originals.as_ref().and_then(|originals| {
-                    completed.iter().rev().find_map(|completed_address| {
-                        let (_, original_value) = originals
+                let rollback_errors = originals
+                    .map(|originals| {
+                        attempted
                             .iter()
-                            .find(|(original_address, _)| original_address == completed_address)?;
-                        self.write_eeprom_address(
-                            *completed_address,
-                            *original_value,
-                            options.verify_read_back,
-                        )
-                        .err()
-                        .map(|rollback| (*completed_address, rollback.to_string()))
+                            .rev()
+                            .filter_map(|attempted_address| {
+                                let (_, original_value) =
+                                    originals.iter().find(|(original_address, _)| {
+                                        original_address == attempted_address
+                                    })?;
+                                self.write_eeprom_address(
+                                    *attempted_address,
+                                    *original_value,
+                                    options.verify_read_back,
+                                )
+                                .err()
+                                .map(|rollback| (*attempted_address, rollback.to_string()))
+                            })
+                            .collect()
                     })
-                });
+                    .unwrap_or_default();
                 return Err(EpsonError::AtomicWriteFailed {
                     address,
                     reason: error.to_string(),
-                    rollback_error,
+                    rollback_errors,
                 });
             }
-            completed.push(address);
         }
         Ok(())
     }
@@ -131,6 +166,18 @@ impl<'a, C: ControlChannel> EpsonController<'a, C> {
         operation: &MemoryOperation,
         options: EepromWriteOptions,
     ) -> Result<(), EpsonError> {
+        if !operation.has_declared_reset_values() {
+            return Err(EpsonError::OperationHasNoDeclaredReset {
+                description: operation.description.clone(),
+            });
+        }
+        if operation.addresses.len() != operation.reset_values.len() {
+            return Err(EpsonError::OperationResetLengthMismatch {
+                description: operation.description.clone(),
+                addresses: operation.addresses.len(),
+                reset_values: operation.reset_values.len(),
+            });
+        }
         let updates = operation
             .addresses
             .iter()
@@ -200,7 +247,18 @@ pub enum EpsonError {
     AtomicWriteFailed {
         address: u16,
         reason: String,
-        rollback_error: Option<(u16, String)>,
+        rollback_errors: Vec<(u16, String)>,
+    },
+    MissingAtomicOriginal {
+        address: u16,
+    },
+    OperationHasNoDeclaredReset {
+        description: String,
+    },
+    OperationResetLengthMismatch {
+        description: String,
+        addresses: usize,
+        reset_values: usize,
     },
     OperationUnavailable,
 }
@@ -233,13 +291,13 @@ impl fmt::Display for EpsonError {
             Self::AtomicWriteFailed {
                 address,
                 reason,
-                rollback_error,
+                rollback_errors,
             } => {
                 write!(
                     formatter,
                     "atomic EEPROM write failed at {address:#06x}: {reason}"
                 )?;
-                if let Some((rollback_address, rollback_reason)) = rollback_error {
+                for (rollback_address, rollback_reason) in rollback_errors {
                     write!(
                         formatter,
                         "; rollback failed at {rollback_address:#06x}: {rollback_reason}"
@@ -247,6 +305,22 @@ impl fmt::Display for EpsonError {
                 }
                 Ok(())
             }
+            Self::MissingAtomicOriginal { address } => write!(
+                formatter,
+                "atomic EEPROM write has no original value for {address:#06x}"
+            ),
+            Self::OperationHasNoDeclaredReset { description } => write!(
+                formatter,
+                "EEPROM operation {description:?} has no explicitly declared reset values"
+            ),
+            Self::OperationResetLengthMismatch {
+                description,
+                addresses,
+                reset_values,
+            } => write!(
+                formatter,
+                "EEPROM operation {description:?} has {addresses} addresses but {reset_values} reset values"
+            ),
             Self::OperationUnavailable => formatter.write_str("waste-counter reset is unavailable"),
         }
     }
@@ -373,6 +447,76 @@ mod tests {
                 },
             ),
             Err(EpsonError::AtomicWriteFailed { .. })
+        ));
+        channel.assert_finished();
+    }
+
+    #[test]
+    fn atomic_write_restores_the_failed_address_and_every_prior_address() {
+        let spec = spec();
+        let mut channel = ScriptedControlChannel::new();
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0c, 0x42).unwrap(), b":OK;");
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0d, 0x43).unwrap(), b":NA;");
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0d, 0x20).unwrap(), b":OK;");
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0c, 0x10).unwrap(), b":OK;");
+
+        let mut controller = EpsonController::new(&mut channel, &spec);
+        assert!(matches!(
+            controller.write_eeprom_with_originals(
+                &[(0x0c, 0x42), (0x0d, 0x43)],
+                Some(&[(0x0c, 0x10), (0x0d, 0x20)]),
+                EepromWriteOptions {
+                    verify_read_back: false,
+                    atomic: true,
+                },
+            ),
+            Err(EpsonError::AtomicWriteFailed {
+                rollback_errors,
+                ..
+            }) if rollback_errors.is_empty()
+        ));
+        channel.assert_finished();
+    }
+
+    #[test]
+    fn atomic_rollback_readback_verifies_every_restored_value() {
+        let spec = spec();
+        let mut channel = ScriptedControlChannel::new();
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0c, 0x42).unwrap(), b":OK;");
+        channel.expect_reply(
+            encode_eeprom_read(&spec, 0x0c).unwrap(),
+            b"@BDC PS EE:0C4200;",
+        );
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0d, 0x43).unwrap(), b":OK;");
+        channel.expect_reply(
+            encode_eeprom_read(&spec, 0x0d).unwrap(),
+            b"@BDC PS EE:0D0000;",
+        );
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0d, 0x20).unwrap(), b":OK;");
+        channel.expect_reply(
+            encode_eeprom_read(&spec, 0x0d).unwrap(),
+            b"@BDC PS EE:0D2000;",
+        );
+        channel.expect_reply(encode_eeprom_write(&spec, 0x0c, 0x10).unwrap(), b":OK;");
+        channel.expect_reply(
+            encode_eeprom_read(&spec, 0x0c).unwrap(),
+            b"@BDC PS EE:0C1000;",
+        );
+
+        let mut controller = EpsonController::new(&mut channel, &spec);
+        assert!(matches!(
+            controller.write_eeprom_with_originals(
+                &[(0x0c, 0x42), (0x0d, 0x43)],
+                Some(&[(0x0c, 0x10), (0x0d, 0x20)]),
+                EepromWriteOptions {
+                    verify_read_back: true,
+                    atomic: true,
+                },
+            ),
+            Err(EpsonError::AtomicWriteFailed {
+                rollback_errors,
+                ..
+            }) if rollback_errors.is_empty()
         ));
         channel.assert_finished();
     }

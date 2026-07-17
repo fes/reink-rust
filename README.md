@@ -37,12 +37,12 @@ specific gate.
 | IEEE 1284 identity parsing | Implemented |
 | Epson model database, command encoding, printer status, and EEPROM reply parsing | Implemented |
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
-| Epson command execution, read-only status, and EEPROM read/write orchestration | Implemented with scripted tests and core verification |
-| Epson D4 application service with status and write plans | Implemented; used by explicit read workflows and the gated hardware write-evidence workflow |
+| Epson command execution, read-only status, and EEPROM read/write orchestration | Implemented with scripted tests, read-back verification, and atomic rollback |
+| Epson D4 application service with status and write plans | Implemented; used by explicit read workflows, confirmed CLI mutations, and gated hardware write evidence |
 | Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; used by explicit read workflows and gated write evidence |
 | SNMP control adapter, safe Epson status/EEPROM inspection, and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB sessions | Implemented through libusb; no automatic write path |
-| CLI inspection, selected USB status, SNMP EEPROM inspection, and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
+| CLI inspection, offline binary analysis, selected USB status, SNMP EEPROM inspection, and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
 | Read-only terminal UI model browser | Implemented |
 
 ## Porting approach
@@ -171,12 +171,13 @@ typed, transport-independent operations:
 
 - parse IEEE 1284 identity fields and standard aliases (`MFG`, `MDL`, `CMD`);
 - load, validate, and look up Epson model specifications;
-- derive merged waste-counter reset operations from model metadata;
+- derive model-aware waste and platen-pad reset plans using only explicitly
+  declared reset bytes;
 - encode regular Epson commands and factory EEPROM read/write commands;
 - parse EEPROM read replies without treating malformed responses as successful
   values;
-- execute identity, raw printer status, EEPROM read, EEPROM write, and waste-counter reset
-  operations through an abstract `ControlChannel`.
+- execute identity, raw printer status, EEPROM read, EEPROM write, and declared
+  counter-reset operations through an abstract `ControlChannel`.
 
 EEPROM writes use read-back verification by default. Atomic writes read all
 original values before changing printer state and restore prior values after a
@@ -185,10 +186,10 @@ they are not authorization to write a physical printer without the evidence
 and user-confirmation requirements below.
 
 The database keeps upstream ordering semantics: if a model occurs in more than
-one group, the later group overrides an earlier one. Some source entries have
-minimum-counter metadata without explicit reset values. The initial port
-retains that minimum metadata and uses zero reset bytes where the upstream
-aggregate reset behavior does so; execution policy is not implemented yet.
+one group, the later group overrides an earlier one. Minimum-counter metadata
+is retained, but a missing `reset` array is not silently substituted with zero
+bytes. Guarded semantic-reset plans exclude those entries and write only
+explicitly declared bytes.
 
 The Python parser has an ambiguity for one-byte EEPROM addresses: it consumes
 the first two bytes of a six-hex-digit reply. The Rust parser intentionally
@@ -200,7 +201,8 @@ one-byte-address printer.
 `reink-d4` consumes only `reink-platform::ByteTransport` and exposes an
 `EPSON-CTRL` service channel as `ControlChannel`. It supports packet framing
 across fragmented reads, transaction protocol revisions `0x10` and `0x20`,
-revision fallback, service lookup/opening, and channel credit accounting.
+revision fallback, service-to-socket and socket-to-service lookup, channel
+opening, and credit accounting.
 The crate has no USB, OS, or UI dependency.
 
 Build and test this layer independently with:
@@ -253,10 +255,11 @@ device, sends traffic, or changes a driver binding.
 
 ### `reink-cli`
 
-`reink-cli` provides inspection commands plus explicitly confirmed EEPROM
-write and restore commands. It never performs a default or automatic write;
-those commands require a selected target, an exact model match, an exact
-confirmation, and a create-new complete backup.
+`reink-cli` provides inspection commands, offline binary analysis, and
+explicitly confirmed EEPROM write, restore, and declared counter-reset
+commands. It never performs a default or automatic write; mutations require a
+selected target, exact model match, exact confirmation, and a create-new
+complete backup.
 
 `parse-id`, `snmp-id`, and `usb-id` report the parsed IEEE 1284 fields together
 with a detected model candidate and any match in the built-in model database.
@@ -269,6 +272,7 @@ cargo run -p reink-cli -- model C90
 cargo run -p reink-cli -- parse-id "MFG:EPSON;MDL:C90;"
 cargo run -p reink-cli -- discover --timeout-seconds 3
 cargo run -p reink-cli -- --json models
+cargo run -p reink-cli -- analyze-binary <local-capture-or-binary>
 ```
 
 On Linux, list local device-file candidates without opening them:
@@ -325,11 +329,16 @@ of those normal inspection commands.
 D4 identity in the same session and rejects a model mismatch before reading
 EEPROM. The output path must be new and have an existing parent directory.
 
-On Linux and macOS, `usb-eeprom-write` and `usb-eeprom-restore` are confirmed
-CLI mutation commands. They require an exact D4 model match, an exact
-confirmation, and a new backup path before USB is opened. They always attempt
-orderly D4 shutdown and USB close; cleanup failures are included in the command
-error. On all supported USB platforms, use the separate
+On Linux and macOS, `usb-eeprom-write`, `usb-eeprom-restore`, and
+`usb-eeprom-reset` are confirmed CLI mutation commands. They require an exact
+D4 model match, an exact confirmation, and a new backup path before USB is
+opened. `usb-eeprom-reset` accepts either `waste` or `platen-pad`, then derives
+updates only from explicitly declared `reset` arrays for that model; entries
+with only `min` metadata are never zero-filled. Each command saves and syncs a
+complete image before applying its plan, verifies every write by read-back,
+rolls back every attempted byte after a failure, and always attempts orderly D4
+shutdown and USB close. Cleanup failures are included in the command error. On
+all supported USB platforms, use the separate
 `d4-eeprom-write-evidence` command below when the goal is to write and restore
 one byte as auditable physical evidence.
 
@@ -337,6 +346,7 @@ one byte as auditable physical evidence.
 cargo run -p reink-cli -- usb-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --output-file <new-image.bin>
 cargo run -p reink-cli -- usb-eeprom-write --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --update 0x000c=0x00 --backup-file <new-backup.bin> --confirmation I_CONFIRM_THIS_WILL_WRITE_EEPROM
 cargo run -p reink-cli -- usb-eeprom-restore --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --input-file <complete-image.bin> --rollback-backup-file <new-rollback.bin> --confirmation I_CONFIRM_THIS_WILL_RESTORE_EEPROM
+cargo run -p reink-cli -- usb-eeprom-reset --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --target waste --backup-file <new-reset-backup.bin> --confirmation I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS
 ```
 
 Write updates must be unique and within the selected model range. Before any
@@ -347,6 +357,13 @@ before USB access and maps every image byte in order onto the selected declared
 range; it saves a complete create-new rollback backup before applying that
 plan. EEPROM images and backups are private device-specific data: retain them
 securely and never commit them.
+
+`analyze-binary` is an offline, local-only port of ReInkPy's `search_bin`
+helper. It recognizes bounded Epson factory-read/write signatures and, except
+for `.pcapng` by default, printable eight-character runs. It opens no device,
+does not send traffic, refuses non-regular files and files larger than 64 MiB,
+and may display potential write-key bytes from the input; keep its input and
+output private.
 
 Before selecting a device for a hardware-test command, Linux, macOS, and
 Windows can
@@ -448,10 +465,9 @@ cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-
 
 All successful reports use schema version 3 with `mode: "read_only"` and
 ordered step objects (`name`, `status`, and `result`). Preserve those reports as
-hardware evidence. Read-only commands never write. Physical writes are
-supported only by the explicit, gated write-evidence command or confirmed CLI
-commands; no default workflow, read-evidence runner, or GUI action writes
-printer state. Read-only failure reports are also schema version 3, include
+hardware evidence. Read-only commands never write. Physical writes and semantic resets are supported only by the explicit, gated
+write-evidence command or confirmed CLI commands; no default workflow,
+read-evidence runner, or GUI action writes printer state. Read-only failure reports are also schema version 3, include
 reconnect/power-cycle/reboot remediation, and record the failing stage without
 raw trace bytes or invented successful EEPROM values.
 
@@ -580,8 +596,10 @@ Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
 `Tools` tabs. Bundled fixtures are hidden unless explicitly enabled with
 `--fixtures`; only that opt-in mode resolves fixture identity and runs
 deterministic fixture validation. Local raw EEPROM images are inspected
-read-only after an explicit model selection. The editing, reset, backup, and
-restore controls remain unavailable; the GUI contains no write or reset path.
+read-only after an explicit model selection. Confirmed CLI semantic resets are
+available for declared model bytes, but the GUI editing, reset, backup, and
+restore controls remain unavailable until a separately validated GUI gate is
+explicitly enabled; the GUI currently contains no write or reset path.
 
 Its persistent shell and tab-specific sub-pane rules are documented in
 [UI design](docs/UI_DESIGN.md).
@@ -660,7 +678,8 @@ cargo run -p reink-gui
 `local-devices` remains Linux-only because it enumerates Linux device files.
 `usb-id`, `usb-d4-probe`, and the read-only `usb-eeprom-dump` workflow are
 available on Windows for an explicitly selected libusb-accessible interface.
-`usb-eeprom-write` and `usb-eeprom-restore` remain unavailable on Windows.
+`usb-eeprom-write`, `usb-eeprom-restore`, and `usb-eeprom-reset` remain
+unavailable on Windows.
 The cross-platform `d4-eeprom-write-evidence` command is available only as its
 separate gated, reversible workflow; it is never invoked by the Windows
 read-evidence runner.

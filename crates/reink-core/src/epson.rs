@@ -38,7 +38,43 @@ pub struct MemoryOperation {
     pub description: String,
     pub addresses: Vec<u16>,
     pub reset_values: Vec<u8>,
+    /// Whether `reset_values` was explicitly declared in the model metadata.
+    ///
+    /// A missing `reset` field is deliberately not converted to zero bytes.
+    /// ReInkPy's dynamic helper can fall back to zero (and its scalar `min`
+    /// metadata cannot be safely zipped as byte values), but a guarded physical
+    /// reset must write only values the specification explicitly declares.
+    pub reset_values_declared: bool,
     pub minimum: Option<u32>,
+}
+
+impl MemoryOperation {
+    pub fn has_declared_reset_values(&self) -> bool {
+        self.reset_values_declared
+    }
+}
+
+/// A counter family with separately declared Epson reset semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterResetTarget {
+    Waste,
+    PlatenPad,
+}
+
+impl CounterResetTarget {
+    pub const fn description_fragment(self) -> &'static str {
+        match self {
+            Self::Waste => "waste counter",
+            Self::PlatenPad => "platen pad counter",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Waste => "waste counter",
+            Self::PlatenPad => "platen pad counter",
+        }
+    }
 }
 
 /// Model-specific Epson EEPROM settings.
@@ -59,7 +95,8 @@ pub struct EpsonSpec {
 }
 
 impl EpsonSpec {
-    /// Merges all matching operations while retaining the first address order.
+    /// Merges matching operations with explicit reset bytes while retaining the
+    /// first address order.
     ///
     /// Address values later in the specification replace earlier values, which
     /// matches the Python implementation's dictionary update behavior.
@@ -75,6 +112,9 @@ impl EpsonSpec {
                 .to_ascii_lowercase()
                 .contains(&fragment)
             {
+                continue;
+            }
+            if !operation.has_declared_reset_values() {
                 continue;
             }
 
@@ -93,12 +133,23 @@ impl EpsonSpec {
             description: format!("All {description_fragment}s"),
             addresses,
             reset_values,
+            reset_values_declared: true,
             minimum: None,
         })
     }
 
     pub fn waste_counter_reset(&self) -> Option<MemoryOperation> {
-        self.merged_operation("waste counter")
+        self.counter_reset(CounterResetTarget::Waste)
+    }
+
+    pub fn platen_pad_counter_reset(&self) -> Option<MemoryOperation> {
+        self.counter_reset(CounterResetTarget::PlatenPad)
+    }
+
+    /// Returns a physical-reset operation composed only of explicitly declared
+    /// byte values for the requested counter family.
+    pub fn counter_reset(&self, target: CounterResetTarget) -> Option<MemoryOperation> {
+        self.merged_operation(target.description_fragment())
     }
 }
 
@@ -251,15 +302,12 @@ impl TryFrom<RawMemoryOperation> for MemoryOperation {
             });
         }
 
-        let reset_values = if raw.reset.is_empty() {
-            vec![0; raw.addr.len()]
-        } else {
-            raw.reset
-        };
+        let reset_values_declared = !raw.reset.is_empty();
         Ok(Self {
             description: raw.desc,
             addresses: raw.addr,
-            reset_values,
+            reset_values: raw.reset,
+            reset_values_declared,
             minimum: raw.min,
         })
     }
@@ -341,7 +389,7 @@ impl Error for SpecError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddressWidth, ModelDatabase, SpecError};
+    use super::{AddressWidth, CounterResetTarget, ModelDatabase, SpecError};
 
     #[test]
     fn builtin_database_loads_known_model() {
@@ -353,20 +401,52 @@ mod tests {
     }
 
     #[test]
-    fn waste_counter_reset_merges_matching_operations() {
+    fn waste_counter_reset_merges_only_declared_operations() {
         let database = ModelDatabase::builtin().unwrap();
         let spec = database.get("C90").unwrap();
         let operation = spec.waste_counter_reset().unwrap();
 
         assert_eq!(
             operation.addresses,
-            vec![
-                0x06, 0x07, 0x0a, 0x0b, 0x16, 0x17, 0x34, 0x35, 0x0c, 0x0d, 0x36, 0x37
-            ]
+            vec![0x06, 0x07, 0x0a, 0x0b, 0x16, 0x17, 0x34, 0x35, 0x0c, 0x0d]
         );
         assert_eq!(
             operation.reset_values,
-            vec![0, 0, 0, 0, 0, 0, 4, 0x57, 1, 0xf4, 0, 0]
+            vec![0, 0, 0, 0, 0, 0, 4, 0x57, 1, 0xf4]
+        );
+        assert!(operation.has_declared_reset_values());
+    }
+
+    #[test]
+    fn platen_resets_do_not_include_waste_operations() {
+        let database = ModelDatabase::builtin().unwrap();
+        let spec = database.get("XP-15000").unwrap();
+        let operation = spec.counter_reset(CounterResetTarget::PlatenPad).unwrap();
+
+        assert_eq!(operation.addresses, vec![0x40, 0x43, 0x44, 0x48, 0x1ed]);
+        assert_eq!(operation.reset_values, vec![0, 0, 0, 0x5e, 0]);
+        assert!(spec.counter_reset(CounterResetTarget::Waste).is_none());
+    }
+
+    #[test]
+    fn missing_reset_values_remain_undeclared_and_are_not_zeroed() {
+        let source = r#"
+            [[EPSON]]
+            models = ["Undeclared"]
+            mem = [{ addr = [1, 2], desc = "Waste counter", min = 500 }]
+        "#;
+        let database = ModelDatabase::from_toml(source).unwrap();
+        let operation = &database.get("Undeclared").unwrap().memory_operations[0];
+
+        assert_eq!(operation.reset_values, Vec::<u8>::new());
+        assert!(!operation.has_declared_reset_values());
+        assert_eq!(operation.minimum, Some(500));
+        assert!(
+            database
+                .get("Undeclared")
+                .unwrap()
+                .waste_counter_reset()
+                .is_none()
         );
     }
 

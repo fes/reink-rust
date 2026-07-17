@@ -205,6 +205,23 @@ impl<T: ByteTransport> D4Link<T> {
         Ok(channel)
     }
 
+    /// Resolves the service name advertised for a peer socket without opening it.
+    pub fn service_name(&mut self, socket_id: u8) -> Result<String, D4Error> {
+        let reply = self.transaction(TransactionMessage::GetServiceName { socket_id }, true)?;
+        let TransactionMessage::GetServiceNameReply {
+            result,
+            socket_id: returned_socket_id,
+            service_name,
+        } = reply
+        else {
+            return Err(D4Error::UnexpectedTransactionReply);
+        };
+        if result != 0 || returned_socket_id != socket_id {
+            return Err(D4Error::DeviceRejected { result });
+        }
+        Ok(service_name)
+    }
+
     pub fn control_channel(
         &mut self,
         channel: ChannelId,
@@ -957,6 +974,45 @@ mod tests {
         let mut link = D4Link::new(target);
         link.initialize().unwrap();
         assert_eq!(link.revision(), ProtocolRevision::V10);
+        link.target().assert_finished();
+    }
+
+    #[test]
+    fn resolves_a_service_name_by_socket_id() {
+        let mut target = ScriptedTransport::new("scripted");
+        target.expect_write(Packet::new(0, 0, [0x0a, 0x02], 1, 0).unwrap().encode());
+        target.push_read_data(transaction_packet(
+            TransactionMessage::GetServiceNameReply {
+                result: 0,
+                socket_id: 2,
+                service_name: "EPSON-CTRL".to_owned(),
+            },
+            1,
+        ));
+
+        let mut link = active_link(target);
+        assert_eq!(link.service_name(2).unwrap(), "EPSON-CTRL");
+        link.target().assert_finished();
+    }
+
+    #[test]
+    fn rejects_a_service_name_reply_for_a_different_socket() {
+        let mut target = ScriptedTransport::new("scripted");
+        target.expect_write(Packet::new(0, 0, [0x0a, 0x02], 1, 0).unwrap().encode());
+        target.push_read_data(transaction_packet(
+            TransactionMessage::GetServiceNameReply {
+                result: 0,
+                socket_id: 3,
+                service_name: "EPSON-CTRL".to_owned(),
+            },
+            1,
+        ));
+
+        let mut link = active_link(target);
+        assert!(matches!(
+            link.service_name(2),
+            Err(super::D4Error::DeviceRejected { result: 0 })
+        ));
         link.target().assert_finished();
     }
 

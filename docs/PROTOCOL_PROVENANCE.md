@@ -25,13 +25,14 @@ original words, and keep the licensed document outside the repository.
 | Packet length and fragmented-read reassembly | `reink-d4/src/packet.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `retreive()` | IEEE 1284.4 framing rules | Reviewed; covered by unit tests |
 | Transaction messages, revision `0x20` | `reink-d4/src/transaction.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `protocol_0x20.cmd_by_name` | IEEE 1284.4 transaction-channel definition | Reviewed; covered by unit tests |
 | Transaction messages, revision `0x10` | `reink-d4/src/transaction.rs` | C: ReInkPy says this layout is “undocumented ? taken from d4lib.c” | IEEE 1284.4 revision-1 material and/or validated capture | Source-compatible layouts covered by unit tests; authoritative review pending |
-| D4 init, service lookup, channel open, credits | `reink-d4/src/link.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `D4Link`, `TXChannel`, and `Channel` | IEEE 1284.4 state-machine rules | Reviewed; peer transactions, open/close/Exit covered by unit tests |
+| D4 init, service lookup, channel open, credits | `reink-d4/src/link.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `D4Link`, `TXChannel`, and `Channel` | IEEE 1284.4 state-machine rules | Reviewed; service-to-socket and socket-to-service lookups, peer transactions, open/close/Exit covered by unit tests |
 | Epson D4 entry sequence, reply recognition, and `EPSON-CTRL` service | `reink-app/src/lib.rs` | C: `reinkpy/epson.py` (`EpsonD4._init_link`) | Epson documentation or sanitized capture | Scripted read-only session and app-owned entry probe implemented; hardware evidence required |
 | IEEE 1284 device ID | `reink-core/src/identity.rs` | C: `reinkpy/__init__.py` parser | IEEE 1284 device-ID definition | Pending review |
 | Epson printer status (`st`) | `reink-core/src/controller.rs`, `reink-app/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/epson.py` `do_status()` | Epson documentation or sanitized capture | Scripted core, D4-session, and SNMP-control composition tests; hardware evidence required |
 | USB printer interface selection, standard device ID, and generic bounded bulk exchange | `reink-usb/src/descriptor.rs`, `adapter.rs` | C: `reinkpy/usb.py`; sanitized Linux preflight | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-protocol-session device-ID read succeeded on one selected printer; selected Linux operations now automatically hand off and reattach an active driver; clause-level review pending |
 | SNMP printer identification and read-only Epson control composition | `reink-snmp/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/snmp.py`; RFC 3805 for standard MIB context | RFC 3805 where applicable; Epson enterprise MIB for private OIDs | Identity-validated status and model-bounded EEPROM CLI surfaces use GET only; deterministic composition tests implemented; private OID evidence still required |
-| Epson EEPROM factory commands | `reink-core/src/command.rs`, `controller.rs` | C: `reinkpy/epson.py`, model TOML | Epson documentation or sanitized capture | Scripted execution implemented; read-only CLI surfaces enforce model bounds; hardware evidence still required |
+| Epson EEPROM factory commands and semantic counter plans | `reink-core/src/command.rs`, `controller.rs`, `epson.rs` | C: `reinkpy/epson.py`, model TOML | Epson documentation or sanitized capture | Scripted execution and declared-reset plan selection implemented; hardware evidence still required |
+| Offline factory-request binary analysis | `reink-cli/src/main.rs` | C: ReInkPy `epson.py` `search_bin()` | No device protocol authority required; input remains local | Deterministic bounded parser tests implemented |
 
 ## Authoritative references
 
@@ -61,6 +62,7 @@ ReInkPy structures:
 | Transaction channel uses socket pair `(0, 0)` | `TXChannel.cid` | C |
 | Init starts at revision `0x20` and can retry `0x10` | `D4Link._send_init` | C |
 | Service channel mirrors a returned socket ID as `(id, id)` | `D4Link.get_channel` | C |
+| Service name can be resolved from a socket ID | `D4Link.get_channel(cid=...)` / `GetServiceName` | C |
 | Credit is received in packet headers and consumed before data sends | `D4Link._on_received` and `send` | C |
 
 The licensed IEEE 1284.4-2000 copy was privately reviewed against the packet
@@ -96,7 +98,11 @@ in the test comment only when it is available under the project's license.
 The EEPROM factory **write** encoder is exposed only through confirmed CLI
 commands and the dedicated `d4-eeprom-write-evidence` physical-test command.
 The latter is not a generic reset command and never runs as part of a read-only
-workflow. Before executing a physical write or reset operation, require all of
+workflow. `usb-eeprom-reset` is a confirmed CLI maintenance command, not a
+generic address writer: it selects waste or platen-pad semantics and emits only
+explicitly declared model-TOML reset bytes. Missing `reset` values and `min`
+metadata are never zero-substituted. Before executing a physical write or reset
+operation, require all of
 the following:
 
 1. Vendor documentation or repeatable capture evidence for the exact model
@@ -109,10 +115,11 @@ the following:
    libusb-accessible interface and must stop safely if that claim fails.
 6. Explicit authorization for the selected target operation; a prior
    read-only report is useful evidence but is not itself permission.
-7. The dedicated command's two exact acknowledgements: one for the write and
-   one for restoration/private evidence.
-8. A complete create-new backup that is persisted before the test write, plus
-   post-write and post-restoration read-back verification.
+7. The exact command acknowledgement: the dedicated evidence command needs its
+   two evidence acknowledgements; `usb-eeprom-reset` needs
+   `I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS`.
+8. A complete create-new backup persisted before mutation, per-byte read-back
+   verification, and rollback of every attempted byte after a failure.
 
 `reink-hardware-test d4-eeprom-write-evidence` requires an exact
 vendor/product/interface/alternate-setting/bus/device selector, exact D4 model
@@ -121,4 +128,6 @@ private structured report only after cleanup. If a test write fails after the
 original byte is known, it still attempts restoration and records the test
 write, restoration, verification, and cleanup outcomes separately. No default
 command, read-evidence runner, or GUI action is permitted to execute a physical
-write without an explicitly authorized target operation.
+write or semantic reset without an explicitly authorized target operation. The
+GUI contains no reset control and must remain unavailable until an independent
+GUI gate is implemented and validated.

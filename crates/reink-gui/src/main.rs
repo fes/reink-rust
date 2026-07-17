@@ -855,7 +855,7 @@ impl ReinkGui {
                             ),
                         );
                     });
-                    ui.label("Unavailable in the GUI; use only the separate gated write-evidence or confirmed CLI workflow after evidence passes.");
+                    ui.label("Unavailable in the GUI; confirmed CLI semantic resets remain separately gated after evidence passes.");
                     ui.add_enabled_ui(false, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(format!(
@@ -985,7 +985,7 @@ impl ReinkGui {
             ui.heading("Waste-ink counter");
             ui.label("Fixture value: 1,048");
             ui.add_enabled(false, egui::Button::new("Reset to zero"));
-            ui.label("Reset is unavailable in the GUI: no GUI write or reset path is linked.");
+            ui.label("Semantic resets are available only through explicitly gated CLI commands; no GUI reset path is linked.");
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1003,7 +1003,7 @@ impl ReinkGui {
                 "Persistent writes require a complete backup and command-specific confirmations.",
             );
             ui.label(
-                "The GUI remains disabled; use only the separate gated write-evidence or confirmed CLI workflow after evidence passes.",
+                "The GUI remains disabled until separately enabled and validated; use only gated write-evidence or confirmed CLI workflows after evidence passes.",
             );
             ui.add_enabled(false, egui::Button::new("Choose EEPROM backup..."));
             ui.label("GUI backup selection is intentionally unavailable.");
