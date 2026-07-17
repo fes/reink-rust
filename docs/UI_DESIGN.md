@@ -84,5 +84,7 @@ traffic is a live, opt-in, bounded in-memory session-only pane for
 recorded-session TX/RX events. Selecting a descriptor candidate alone produces
 no traffic; an explicit **Read EEPROM** operation can append its records. No
 GUI operation exports them.
-Persistent printer writes and counter resets remain unavailable until the
-separate hardware-evidence and safety-review gates are complete.
+The GUI has no physical-write or reset path and remains disabled for those
+actions until the separate hardware-evidence gate passes. Even then, writes are
+performed only through the explicit gated write-evidence or confirmed CLI
+commands; the GUI must never trigger a default or automatic write.

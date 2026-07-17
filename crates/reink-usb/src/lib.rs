@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! USB printer interface selection and read-only libusb transport.
+//! USB printer interface selection and libusb transport.
 //!
 //! On Linux, operations on an explicitly selected interface temporarily detach
 //! and restore only the active kernel driver that they detached. Its concrete

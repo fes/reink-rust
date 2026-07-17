@@ -1,7 +1,8 @@
 # Hardware capture and fixture guide
 
-This guide prepares evidence collection without enabling printer writes. It
-applies when a device is available and supplements
+This guide prepares read-only evidence collection and the separately explicit
+reversible write-evidence workflow. It never makes a printer write automatic.
+It applies when a device is available and supplements
 [protocol provenance](PROTOCOL_PROVENANCE.md).
 
 ## Capture rules
@@ -16,15 +17,16 @@ applies when a device is available and supplements
 4. Record the transport, operating system, selected model family, firmware
    family when known, timestamp, and whether the interaction was read-only.
    Keep this metadata private if it identifies a device or person.
-5. A capture is evidence of observed behavior, not permission to enable a
-   write/reset command.
+5. A capture is evidence of observed behavior, not permission for a generic
+   write/reset action. A physical write remains available only through the
+   explicit write-evidence or confirmed CLI gates.
 6. The `--trace-file` output is an original/raw byte trace. Store it outside
    this repository, never commit it, and share only a separately redacted
    derivative when authorized.
 7. `--report-file` is also private evidence. Store it outside this repository:
    EEPROM values and handoff outcomes can be device-specific. Never treat a
-   report or trace as authorization for an EEPROM write, restore, reset, or any
-   other state change.
+   read-only report or trace as authorization for an EEPROM write, restore,
+   reset, or any other state change.
 
 ## Read-only D4 capture sequence
 
@@ -80,6 +82,35 @@ reads are safe.
 cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE --report-file <outside-repository-path>
 ```
 
+## Reversible physical write evidence
+
+`d4-eeprom-write-evidence` is the only hardware-test command that writes a
+physical EEPROM byte. It is intentionally separate from all read-only commands
+and automated read-evidence runners. It never chooses a candidate, model,
+interface, address, or value: the full USB location, model, one in-range
+address, and a test byte must be supplied explicitly.
+
+Before USB is opened, it requires two exact confirmations, validates the model
+range, and rejects existing or aliased backup/report paths. In its D4 session it
+requires an exact identity-model match, pre-reads the original byte, creates
+and syncs a full create-new backup, writes the selected byte with
+`EepromWritePlan`/core read-back verification, and independently reads the
+test byte. It then attempts restoration whenever the original byte is known,
+including after a test-write failure, and independently verifies the restored
+byte. The private report is created only after D4 shutdown and USB cleanup have
+both been attempted; it records every stage and distinguishes test-write,
+restoration, read-back, and cleanup failures.
+
+```powershell
+cargo run -p reink-hardware-test -- d4-eeprom-write-evidence --vendor-id 0x04b8 --product-id <product-id> --interface <number> --alternate-setting <number> --bus-number <bus> --device-address <device> --model <model> --address <in-range-address> --value <different-test-byte> --backup-file <new-private-complete-backup.bin> --report-file <new-private-write-evidence-report.json> --confirm-write I_CONFIRM_THIS_WILL_WRITE_EEPROM --confirm-restoration-evidence I_CONFIRM_THIS_WILL_RESTORE_EEPROM_AND_RETAIN_PRIVATE_EVIDENCE
+```
+
+Do not run it without an explicitly authorized target operation. If any write,
+restoration, read-back, shutdown, or USB cleanup stage fails, do not retry and
+do not issue another write. Retain the private backup/report, reconnect or
+power-cycle if needed, and verify the original byte with a separately confirmed
+read before further action.
+
 ## USB identity preflight
 
 On Linux, macOS, or Windows, first list candidates without opening a device:
@@ -116,7 +147,8 @@ without raw traffic. No external manual unbind is required. On failure, the
 report directs the operator to reconnect or power-cycle the printer and reboot
 the host if needed before retrying. The current macOS implementation does not
 detach a driver. Windows also never installs, detaches, rebinds, changes, or
-restores a driver. This does not enable writes or resets.
+restores a driver. Driver handoff alone is never authorization for a write or
+reset.
 
 `read-sequence` includes an isolated D4 entry probe by default. That probe
 stops before D4 Init and may leave a printer awaiting D4 traffic, so the
@@ -127,7 +159,9 @@ After every evidence command succeeds, the automated Linux and Windows runners
 invoke the
 durable `reink-cli usb-eeprom-dump` workflow and saves a new private
 `eeprom-image.bin` beside the reports. It is a model-bounded read-only image,
-not a hardware-test report or write authorization.
+not a hardware-test report or write authorization. These runners never invoke
+write evidence; use only the separate explicit write-evidence runner when a
+target operation has been authorized.
 
 ### Automated Linux run
 
@@ -219,5 +253,6 @@ For every new fixture:
 
 1. Confirm no sensitive or device-specific data remains.
 2. Add an assertion for the observable behavior the fixture protects.
-3. Keep write/reset fixtures out of the suite until the vendor-command safety
-   gate in `PROTOCOL_PROVENANCE.md` is met.
+3. Keep physical write/reset fixtures out of the suite. Exercise
+   write-evidence branching only with mocks unless an explicitly authorized
+   target operation is being run through its dedicated command.

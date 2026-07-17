@@ -8,6 +8,8 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use reink_app::EepromWritePlan;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -22,8 +24,11 @@ use reink_platform::TransportEvent;
 use reink_usb::read_printer_device_id;
 use serde_json::{Value, json};
 
-const NON_EXECUTABLE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES";
 const TRACE_SANITIZATION_CONFIRMATION: &str = "I_CONFIRM_TRACE_IS_SANITIZED";
+const WRITE_EVIDENCE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
+const WRITE_EVIDENCE_RESTORATION_CONFIRMATION: &str =
+    "I_CONFIRM_THIS_WILL_RESTORE_EEPROM_AND_RETAIN_PRIVATE_EVIDENCE";
+const WRITE_EVIDENCE_REMEDIATION: &str = "Do not repeat this test or issue another write. Treat restoration as unverified, retain the private report and durable backup, reconnect or power-cycle the printer if needed, then verify the original byte with a separately confirmed read before further action.";
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
     allow(dead_code)
@@ -79,16 +84,47 @@ enum Command {
         #[arg(long)]
         skip_d4_entry_probe: bool,
     },
-    /// Explain why write validation is not available.
-    WriteSequence,
-    /// Create a non-executable write-validation safety-gate report.
-    WriteValidationPlan {
-        /// SHA-256 reference for a separately retained sanitized hardware-evidence report.
+    /// Write and restore one explicitly selected EEPROM byte as private physical evidence.
+    D4EepromWriteEvidence {
+        /// USB vendor ID in decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        /// USB product ID in decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        /// Explicit USB printer interface number.
         #[arg(long)]
-        evidence_sha256: Option<String>,
-        /// Exact acknowledgement that this command cannot execute physical writes.
+        interface: u8,
+        /// Explicit alternate setting for the selected printer interface.
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        /// Explicit libusb bus number; this command never selects by VID/PID alone.
         #[arg(long)]
-        confirmation: Option<String>,
+        bus_number: u8,
+        /// Explicit libusb device address; this command never selects by VID/PID alone.
+        #[arg(long)]
+        device_address: u8,
+        /// Model that must exactly match the D4 identity read from the selected printer.
+        #[arg(long)]
+        model: String,
+        /// In-range EEPROM address in decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u16)]
+        address: u16,
+        /// Test byte in decimal or 0x-prefixed hexadecimal. It must differ from the pre-read byte.
+        #[arg(long, value_parser = parse_u8)]
+        value: u8,
+        /// New complete private EEPROM backup path. Existing files are never overwritten.
+        #[arg(long)]
+        backup_file: PathBuf,
+        /// New private structured report path. It is written only after cleanup.
+        #[arg(long)]
+        report_file: PathBuf,
+        /// Exact acknowledgement required before this command opens USB.
+        #[arg(long)]
+        confirm_write: Option<String>,
+        /// Exact acknowledgement that restoration and private evidence are required.
+        #[arg(long)]
+        confirm_restoration_evidence: Option<String>,
     },
     /// Run D4 Init, EPSON-CTRL identity read, orderly close, and Exit.
     D4Identity {
@@ -241,16 +277,35 @@ fn run(cli: Cli) -> Result<String, String> {
             device_address,
             skip_d4_entry_probe,
         ),
-        Command::WriteSequence => Err(
-            "write validation is unavailable: it requires validated read fixtures, explicit device confirmation, backup/read-back/rollback evidence, and a separate safety review".to_owned()
+        Command::D4EepromWriteEvidence {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+            address,
+            value,
+            backup_file,
+            report_file,
+            confirm_write,
+            confirm_restoration_evidence,
+        } => d4_eeprom_write_evidence(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
+            address,
+            value,
+            &backup_file,
+            &report_file,
+            confirm_write.as_deref(),
+            confirm_restoration_evidence.as_deref(),
         ),
-        Command::WriteValidationPlan {
-            evidence_sha256,
-            confirmation,
-        } => Ok(write_validation_plan_report(
-            evidence_sha256.as_deref(),
-            confirmation.as_deref(),
-        )),
         Command::D4Identity {
             vendor_id,
             product_id,
@@ -346,6 +401,279 @@ fn run(cli: Cli) -> Result<String, String> {
             report_file.as_deref(),
         ),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WriteEvidenceStage {
+    status: &'static str,
+    detail: String,
+    value: Option<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl WriteEvidenceStage {
+    fn completed(detail: impl Into<String>, value: Option<u8>) -> Self {
+        Self {
+            status: "completed",
+            detail: detail.into(),
+            value,
+        }
+    }
+
+    fn failed(detail: impl Into<String>) -> Self {
+        Self {
+            status: "failed",
+            detail: detail.into(),
+            value: None,
+        }
+    }
+
+    fn skipped(detail: impl Into<String>) -> Self {
+        Self {
+            status: "skipped",
+            detail: detail.into(),
+            value: None,
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.status == "completed"
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WriteEvidenceOutcome {
+    identity: WriteEvidenceStage,
+    pre_read: WriteEvidenceStage,
+    backup: WriteEvidenceStage,
+    test_write: WriteEvidenceStage,
+    test_readback: WriteEvidenceStage,
+    restoration: WriteEvidenceStage,
+    restoration_readback: WriteEvidenceStage,
+    original_value: Option<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl WriteEvidenceOutcome {
+    fn new() -> Self {
+        Self {
+            identity: WriteEvidenceStage::skipped("D4 identity has not been read"),
+            pre_read: WriteEvidenceStage::skipped("original byte was not read"),
+            backup: WriteEvidenceStage::skipped("complete backup was not created"),
+            test_write: WriteEvidenceStage::skipped("test write was not attempted"),
+            test_readback: WriteEvidenceStage::skipped("test write read-back was not attempted"),
+            restoration: WriteEvidenceStage::skipped("restoration was not attempted"),
+            restoration_readback: WriteEvidenceStage::skipped(
+                "restoration read-back was not attempted",
+            ),
+            original_value: None,
+        }
+    }
+
+    fn completed_safely(&self) -> bool {
+        self.identity.succeeded()
+            && self.pre_read.succeeded()
+            && self.backup.succeeded()
+            && self.test_write.succeeded()
+            && self.test_readback.succeeded()
+            && self.restoration.succeeded()
+            && self.restoration_readback.succeeded()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+trait WriteEvidenceSession {
+    fn identity_model(&mut self) -> Result<Option<String>, String>;
+    fn read_byte(&mut self, address: u16) -> Result<u8, String>;
+    fn prepare_write_plan(&mut self, updates: &[(u16, u8)]) -> Result<EepromWritePlan, String>;
+    fn apply_write_plan(&mut self, plan: &EepromWritePlan) -> Result<(), String>;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+impl<T: reink_platform::ByteTransport> WriteEvidenceSession for reink_app::EpsonD4Session<T> {
+    fn identity_model(&mut self) -> Result<Option<String>, String> {
+        Ok(self
+            .read_identity()
+            .map_err(|error| error.to_string())?
+            .detected_model()
+            .map(str::to_owned))
+    }
+
+    fn read_byte(&mut self, address: u16) -> Result<u8, String> {
+        self.read_eeprom(&[address])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .map(|reply| reply.value)
+            .ok_or_else(|| "single-byte EEPROM read returned no reply".to_owned())
+    }
+
+    fn prepare_write_plan(&mut self, updates: &[(u16, u8)]) -> Result<EepromWritePlan, String> {
+        self.prepare_eeprom_write(updates)
+            .map_err(|error| error.to_string())
+    }
+
+    fn apply_write_plan(&mut self, plan: &EepromWritePlan) -> Result<(), String> {
+        self.apply_eeprom_write(plan)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn execute_write_evidence<S, F>(
+    session: &mut S,
+    model: &str,
+    address: u16,
+    requested_value: u8,
+    persist_backup: F,
+) -> WriteEvidenceOutcome
+where
+    S: WriteEvidenceSession,
+    F: FnOnce(&[u8]) -> Result<(), String>,
+{
+    let mut outcome = WriteEvidenceOutcome::new();
+    match session.identity_model() {
+        Ok(Some(detected)) if detected == model => {
+            outcome.identity = WriteEvidenceStage::completed(
+                "D4 identity exactly matched the requested model",
+                None,
+            );
+        }
+        Ok(Some(detected)) => {
+            outcome.identity = WriteEvidenceStage::failed(format!(
+                "D4 identity model {detected:?} does not match requested model {model:?}"
+            ));
+            return outcome;
+        }
+        Ok(None) => {
+            outcome.identity = WriteEvidenceStage::failed(format!(
+                "D4 identity does not contain a model; requested model is {model:?}"
+            ));
+            return outcome;
+        }
+        Err(error) => {
+            outcome.identity =
+                WriteEvidenceStage::failed(format!("D4 identity read failed: {error}"));
+            return outcome;
+        }
+    }
+
+    let original_value = match session.read_byte(address) {
+        Ok(value) => {
+            outcome.pre_read =
+                WriteEvidenceStage::completed("original byte read before any write", Some(value));
+            outcome.original_value = Some(value);
+            value
+        }
+        Err(error) => {
+            outcome.pre_read =
+                WriteEvidenceStage::failed(format!("original-byte pre-read failed: {error}"));
+            return outcome;
+        }
+    };
+    if original_value == requested_value {
+        outcome.test_write = WriteEvidenceStage::failed(
+            "requested test byte equals the pre-read original byte; refusing a non-evidentiary write",
+        );
+        return outcome;
+    }
+
+    let test_plan = match session.prepare_write_plan(&[(address, requested_value)]) {
+        Ok(plan) => plan,
+        Err(error) => {
+            outcome.backup =
+                WriteEvidenceStage::failed(format!("complete backup preparation failed: {error}"));
+            return outcome;
+        }
+    };
+    if test_plan.backup.value_at(address) != Some(original_value) {
+        outcome.backup = WriteEvidenceStage::failed(
+            "complete backup does not match the original-byte pre-read; refusing to write",
+        );
+        return outcome;
+    }
+    if let Err(error) = persist_backup(&test_plan.backup.bytes) {
+        outcome.backup = WriteEvidenceStage::failed(format!(
+            "durable complete backup persistence failed: {error}"
+        ));
+        return outcome;
+    }
+    outcome.backup = WriteEvidenceStage::completed(
+        "complete backup was created with create-new semantics and synced before the test write",
+        None,
+    );
+
+    match session.apply_write_plan(&test_plan) {
+        Ok(()) => {
+            outcome.test_write = WriteEvidenceStage::completed(
+                "test write completed with core read-back verification",
+                Some(requested_value),
+            );
+            match session.read_byte(address) {
+                Ok(actual) if actual == requested_value => {
+                    outcome.test_readback = WriteEvidenceStage::completed(
+                        "independent read-back matched the requested test byte",
+                        Some(actual),
+                    );
+                }
+                Ok(actual) => {
+                    outcome.test_readback = WriteEvidenceStage::failed(format!(
+                        "independent test write read-back mismatch: expected {requested_value:#04x}, got {actual:#04x}"
+                    ));
+                }
+                Err(error) => {
+                    outcome.test_readback = WriteEvidenceStage::failed(format!(
+                        "independent test write read-back failed: {error}"
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            outcome.test_write = WriteEvidenceStage::failed(format!(
+                "test write or its core read-back verification failed: {error}"
+            ));
+        }
+    }
+
+    let restoration_plan = EepromWritePlan {
+        backup: test_plan.backup.clone(),
+        updates: vec![(address, original_value)],
+    };
+    match session.apply_write_plan(&restoration_plan) {
+        Ok(()) => {
+            outcome.restoration = WriteEvidenceStage::completed(
+                "restoration write completed with core read-back verification",
+                Some(original_value),
+            );
+            match session.read_byte(address) {
+                Ok(actual) if actual == original_value => {
+                    outcome.restoration_readback = WriteEvidenceStage::completed(
+                        "independent restoration read-back matched the original byte",
+                        Some(actual),
+                    );
+                }
+                Ok(actual) => {
+                    outcome.restoration_readback = WriteEvidenceStage::failed(format!(
+                        "independent restoration read-back mismatch: expected {original_value:#04x}, got {actual:#04x}"
+                    ));
+                }
+                Err(error) => {
+                    outcome.restoration_readback = WriteEvidenceStage::failed(format!(
+                        "independent restoration read-back failed: {error}"
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            outcome.restoration = WriteEvidenceStage::failed(format!(
+                "restoration write or its core read-back verification failed: {error}"
+            ));
+        }
+    }
+
+    outcome
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -591,12 +919,88 @@ fn write_report_file(path: &Path, report: &str) -> Result<(), String> {
                 path.display()
             )
         })?;
-    file.write_all(report.as_bytes()).map_err(|error| {
+    file.write_all(report.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "could not persist private report file {}: {error}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn write_new_private_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "could not create private {kind} {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "could not persist private {kind} {}: {error}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn normalized_new_file_path(path: &Path, kind: &str) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let parent = parent.canonicalize().map_err(|error| {
         format!(
-            "could not write private report file {}: {error}",
-            path.display()
+            "could not resolve private {kind} parent directory {}: {error}",
+            parent.display()
         )
-    })
+    })?;
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("private {kind} path must name a file: {}", path.display()))?;
+    Ok(parent.join(file_name))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn validate_write_evidence_gates(
+    spec: &EpsonSpec,
+    address: u16,
+    backup_file: &Path,
+    report_file: &Path,
+    write_confirmation: Option<&str>,
+    restoration_confirmation: Option<&str>,
+) -> Result<(), String> {
+    if write_confirmation != Some(WRITE_EVIDENCE_WRITE_CONFIRMATION) {
+        return Err(format!(
+            "d4-eeprom-write-evidence requires --confirm-write {WRITE_EVIDENCE_WRITE_CONFIRMATION} exactly"
+        ));
+    }
+    if restoration_confirmation != Some(WRITE_EVIDENCE_RESTORATION_CONFIRMATION) {
+        return Err(format!(
+            "d4-eeprom-write-evidence requires --confirm-restoration-evidence {WRITE_EVIDENCE_RESTORATION_CONFIRMATION} exactly"
+        ));
+    }
+    validate_eeprom_read_addresses(spec, &[address])?;
+    validate_private_new_file_path(backup_file, "complete EEPROM backup")?;
+    validate_report_file_path(report_file)?;
+    if normalized_new_file_path(backup_file, "complete EEPROM backup")?
+        == normalized_new_file_path(report_file, "write-evidence report")?
+    {
+        return Err(
+            "complete EEPROM backup and write-evidence report must use different create-new paths"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -742,6 +1146,324 @@ fn finish_d4_operation<T, E: std::fmt::Display>(
         events,
         driver_handoff,
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WriteEvidenceCleanup {
+    d4_shutdown: WriteEvidenceStage,
+    usb_close: WriteEvidenceStage,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl WriteEvidenceCleanup {
+    fn not_started() -> Self {
+        Self {
+            d4_shutdown: WriteEvidenceStage::skipped("D4 session was not established"),
+            usb_close: WriteEvidenceStage::skipped("USB transport was not opened"),
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.d4_shutdown.succeeded() && self.usb_close.succeeded()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn write_evidence_stage_json(name: &str, stage: &WriteEvidenceStage) -> Value {
+    let mut value = json!({
+        "name": name,
+        "status": stage.status,
+        "detail": stage.detail,
+    });
+    if let Some(byte) = stage.value {
+        value["value"] = json!(format!("{byte:02X}"));
+    }
+    value
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn write_evidence_report(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: u8,
+    device_address: u8,
+    model: &str,
+    address: u16,
+    requested_value: u8,
+    backup_file: &Path,
+    connection: &WriteEvidenceStage,
+    outcome: Option<&WriteEvidenceOutcome>,
+    cleanup: &WriteEvidenceCleanup,
+    driver_handoff: DriverHandoffReport,
+) -> String {
+    let mut stages = vec![write_evidence_stage_json("d4-session-connect", connection)];
+    if let Some(outcome) = outcome {
+        stages.extend([
+            write_evidence_stage_json("identity-confirmation", &outcome.identity),
+            write_evidence_stage_json("original-byte-pre-read", &outcome.pre_read),
+            write_evidence_stage_json("complete-backup", &outcome.backup),
+            write_evidence_stage_json("test-write", &outcome.test_write),
+            write_evidence_stage_json("test-write-readback", &outcome.test_readback),
+            write_evidence_stage_json("restoration", &outcome.restoration),
+            write_evidence_stage_json("restoration-readback", &outcome.restoration_readback),
+        ]);
+    }
+    stages.extend([
+        write_evidence_stage_json("d4-session-shutdown", &cleanup.d4_shutdown),
+        write_evidence_stage_json("usb-close-and-driver-handoff", &cleanup.usb_close),
+    ]);
+    let completed_safely = connection.succeeded()
+        && outcome.is_some_and(WriteEvidenceOutcome::completed_safely)
+        && cleanup.succeeded();
+    json!({
+        "schema_version": 1,
+        "mode": "write_evidence",
+        "command": "d4-eeprom-write-evidence",
+        "status": if completed_safely { "completed" } else { "failed" },
+        "selector": {
+            "vendor_id": format!("{vendor_id:04X}"),
+            "product_id": format!("{product_id:04X}"),
+            "interface": interface,
+            "alternate_setting": alternate_setting,
+            "bus_number": bus_number,
+            "device_address": device_address,
+        },
+        "model": model,
+        "test": {
+            "address": format!("{address:04X}"),
+            "requested_value": format!("{requested_value:02X}"),
+            "original_value": outcome.and_then(|outcome| outcome.original_value).map(|value| format!("{value:02X}")),
+        },
+        "backup_file": backup_file,
+        "linux_driver_handoff": driver_handoff.json(),
+        "stages": stages,
+        "remediation": (!completed_safely).then_some(WRITE_EVIDENCE_REMEDIATION),
+        "next_step": if completed_safely {
+            "The selected byte was restored and independently verified. Retain this private evidence; do not issue any automatic follow-up write."
+        } else {
+            "Use the private stage outcomes to remediate the failure before any further device interaction."
+        },
+    })
+    .to_string()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn close_write_evidence_transport(
+    transport: RecordingTransport<reink_usb::ReadOnlyUsbTransport>,
+) -> (WriteEvidenceStage, DriverHandoffReport) {
+    let (mut transport, _) = transport.into_parts();
+    let close = transport.close();
+    if close.is_err() {
+        // Retry only cleanup, matching the normal D4 lifecycle's best-effort Drop behavior.
+        let _ = transport.close();
+    }
+    let driver_handoff = DriverHandoffReport::from_usb(transport.driver_handoff_outcome());
+    let stage = match close {
+        Ok(()) => {
+            WriteEvidenceStage::completed("USB interface released after the D4 session", None)
+        }
+        Err(error) => WriteEvidenceStage::failed(format!(
+            "USB close or Linux driver reattachment failed: {error}"
+        )),
+    };
+    (stage, driver_handoff)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn finish_write_evidence_session(
+    mut session: reink_app::EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
+) -> (WriteEvidenceCleanup, DriverHandoffReport) {
+    let d4_shutdown = match session.shutdown() {
+        Ok(()) => WriteEvidenceStage::completed("D4 service closed and Exit completed", None),
+        Err(error) => WriteEvidenceStage::failed(format!("D4 shutdown failed: {error}")),
+    };
+    let (usb_close, driver_handoff) = close_write_evidence_transport(session.into_transport());
+    (
+        WriteEvidenceCleanup {
+            d4_shutdown,
+            usb_close,
+        },
+        driver_handoff,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn finish_write_evidence_report(
+    report_file: &Path,
+    report: String,
+    completed_safely: bool,
+) -> Result<String, String> {
+    write_report_file(report_file, &report).map_err(|error| {
+        format!(
+            "write-evidence cleanup completed but the private report could not be persisted: {error}; {WRITE_EVIDENCE_REMEDIATION}"
+        )
+    })?;
+    if completed_safely {
+        Ok(
+            "Write-evidence completed and the private report was persisted after cleanup."
+                .to_owned(),
+        )
+    } else {
+        Err(format!(
+            "Write-evidence did not complete safely; the private report was persisted after cleanup. {WRITE_EVIDENCE_REMEDIATION}"
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_write_evidence(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: u8,
+    device_address: u8,
+    model: &str,
+    address: u16,
+    requested_value: u8,
+    backup_file: &Path,
+    report_file: &Path,
+    write_confirmation: Option<&str>,
+    restoration_confirmation: Option<&str>,
+) -> Result<String, String> {
+    let spec = ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .cloned()
+        .ok_or_else(|| format!("unknown model: {model}"))?;
+    validate_write_evidence_gates(
+        &spec,
+        address,
+        backup_file,
+        report_file,
+        write_confirmation,
+        restoration_confirmation,
+    )?;
+
+    let automatic_handoff = DriverHandoffReport::automatic();
+    let transport = match reink_usb::ReadOnlyUsbTransport::open(
+        reink_usb::UsbDeviceSelector::at_location(
+            vendor_id,
+            product_id,
+            bus_number,
+            device_address,
+        ),
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    ) {
+        Ok(transport) => transport,
+        Err(error) => {
+            let connection =
+                WriteEvidenceStage::failed(format!("USB transport open failed: {error}"));
+            let cleanup = WriteEvidenceCleanup::not_started();
+            let outcome = WriteEvidenceOutcome::new();
+            let report = write_evidence_report(
+                vendor_id,
+                product_id,
+                interface,
+                alternate_setting,
+                bus_number,
+                device_address,
+                model,
+                address,
+                requested_value,
+                backup_file,
+                &connection,
+                Some(&outcome),
+                &cleanup,
+                automatic_handoff,
+            );
+            return finish_write_evidence_report(report_file, report, false);
+        }
+    };
+
+    match reink_app::EpsonD4Session::connect_recoverable(RecordingTransport::new(transport), spec) {
+        Ok(mut session) => {
+            let connection =
+                WriteEvidenceStage::completed("D4 initialized and EPSON-CTRL opened", None);
+            let outcome =
+                execute_write_evidence(&mut session, model, address, requested_value, |bytes| {
+                    write_new_private_binary_file(backup_file, bytes, "complete EEPROM backup")
+                });
+            let (cleanup, driver_handoff) = finish_write_evidence_session(session);
+            let completed_safely = outcome.completed_safely() && cleanup.succeeded();
+            let report = write_evidence_report(
+                vendor_id,
+                product_id,
+                interface,
+                alternate_setting,
+                bus_number,
+                device_address,
+                model,
+                address,
+                requested_value,
+                backup_file,
+                &connection,
+                Some(&outcome),
+                &cleanup,
+                driver_handoff,
+            );
+            finish_write_evidence_report(report_file, report, completed_safely)
+        }
+        Err((error, transport)) => {
+            let connection = WriteEvidenceStage::failed(format!(
+                "D4 session setup failed before any EEPROM access: {error}"
+            ));
+            let (usb_close, driver_handoff) = close_write_evidence_transport(transport);
+            let cleanup = WriteEvidenceCleanup {
+                d4_shutdown: WriteEvidenceStage::skipped("D4 session setup did not complete"),
+                usb_close,
+            };
+            let outcome = WriteEvidenceOutcome::new();
+            let report = write_evidence_report(
+                vendor_id,
+                product_id,
+                interface,
+                alternate_setting,
+                bus_number,
+                device_address,
+                model,
+                address,
+                requested_value,
+                backup_file,
+                &connection,
+                Some(&outcome),
+                &cleanup,
+                driver_handoff,
+            );
+            finish_write_evidence_report(report_file, report, false)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[allow(clippy::too_many_arguments)]
+fn d4_eeprom_write_evidence(
+    _: u16,
+    _: u16,
+    _: u8,
+    _: u8,
+    _: u8,
+    _: u8,
+    _: &str,
+    _: u16,
+    _: u8,
+    _: &Path,
+    _: &Path,
+    _: Option<&str>,
+    _: Option<&str>,
+) -> Result<String, String> {
+    Err(
+        "hardware USB validation is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1273,6 +1995,14 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         .map_err(|_| "expected a 16-bit decimal or 0x-prefixed hexadecimal integer".to_owned())
 }
 
+fn parse_u8(value: &str) -> Result<u8, String> {
+    let (value, radix) = value
+        .strip_prefix("0x")
+        .map_or((value, 10), |value| (value, 16));
+    u8::from_str_radix(value, radix)
+        .map_err(|_| "expected a byte in decimal or 0x-prefixed hexadecimal form".to_owned())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn eeprom_dump_addresses(
     spec: &EpsonSpec,
@@ -1347,10 +2077,6 @@ fn usb_device_selector(
     }
 }
 
-fn is_sha256_reference(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn candidate_model_hints(
     candidate: &reink_usb::UsbPrinterCandidate,
@@ -1397,49 +2123,6 @@ fn usb_candidates_report(
         "command": "usb-candidates",
         "candidates": candidates,
         "next_step": "Select one candidate by its shown selector; its alias is session/report-only and a later IEEE 1284 identity read confirms the model.",
-    })
-    .to_string()
-}
-
-fn safety_gate(name: &str, satisfied: bool, requirement: &str) -> Value {
-    json!({
-        "name": name,
-        "status": if satisfied { "satisfied" } else { "blocked" },
-        "requirement": requirement,
-    })
-}
-
-fn write_validation_plan_report(
-    evidence_sha256: Option<&str>,
-    confirmation: Option<&str>,
-) -> String {
-    let evidence_is_sanitized_reference = evidence_sha256.is_some_and(is_sha256_reference);
-    let explicit_non_executable_confirmation =
-        confirmation == Some(NON_EXECUTABLE_WRITE_CONFIRMATION);
-    json!({
-        "schema_version": 1,
-        "mode": "non_executable",
-        "command": "write-validation-plan",
-        "execution": "disabled",
-        "evidence_sha256": evidence_is_sanitized_reference.then_some(evidence_sha256),
-        "gates": [
-            safety_gate(
-                "sanitized-hardware-evidence-reference",
-                evidence_is_sanitized_reference,
-                "Provide the SHA-256 reference of a separately retained sanitized read-only hardware report.",
-            ),
-            safety_gate(
-                "explicit-non-executable-confirmation",
-                explicit_non_executable_confirmation,
-                "Pass --confirmation I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES exactly.",
-            ),
-            safety_gate(
-                "separate-write-safety-review",
-                false,
-                "A human safety review must approve backup, read-back, rollback, and device-specific evidence before any future implementation can be considered.",
-            ),
-        ],
-        "next_step": "Retain sanitized evidence and obtain separate human safety review. This command cannot enable, queue, or execute a physical write or reset.",
     })
     .to_string()
 }
@@ -1622,7 +2305,7 @@ fn read_sequence_report(
         "read-sequence",
         driver_handoff,
         steps,
-        "Review this read-only preflight evidence before using d4-identity or d4-eeprom-read; write and reset validation remain unavailable.",
+        "Review this read-only preflight evidence before using d4-identity or d4-eeprom-read. This report does not authorize a write; use only an explicitly authorized write-evidence or confirmed CLI operation.",
     )
 }
 
@@ -1639,7 +2322,7 @@ fn d4_identity_report(identity: Value, driver_handoff: impl Into<DriverHandoffRe
             completed_step("identity-read", identity),
             completed_step("d4-session-shutdown", json!({"exit": "completed"})),
         ],
-        "Review identity evidence before selecting any EEPROM addresses; write and reset validation remain unavailable.",
+        "Review identity evidence before selecting EEPROM addresses. Physical writes require their own explicit write-evidence or confirmed CLI gates.",
     )
 }
 
@@ -1659,7 +2342,7 @@ fn d4_eeprom_read_report(
             completed_step("eeprom-read", json!({"values": values})),
             completed_step("d4-session-shutdown", json!({"exit": "completed"})),
         ],
-        "Preserve this read-only EEPROM evidence for future write-safety review; write and reset validation remain unavailable.",
+        "Preserve this read-only EEPROM evidence. It does not authorize a write; use only an explicitly authorized write-evidence or confirmed CLI operation.",
     )
 }
 
@@ -1728,23 +2411,27 @@ fn d4_eeprom_boundary_probe_report(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         path::{Path, PathBuf},
     };
 
     use clap::Parser;
+    use reink_app::EepromImage;
     use reink_platform::TransportEvent;
     use serde_json::{Value, json};
 
     use super::{
-        Cli, Command, DriverHandoffReport, NON_EXECUTABLE_WRITE_CONFIRMATION,
-        OUT_OF_RANGE_READ_CONFIRMATION, ReadOnlyFailureKind, TRACE_SANITIZATION_CONFIRMATION,
-        d4_eeprom_boundary_probe_report, d4_eeprom_dump_report, d4_eeprom_read_report,
-        d4_failure_report, d4_identity_report, dump_progress, eeprom_dump_addresses, emit_report,
-        parse_trace_events, parse_u16, read_sequence_report, simulated_read_only_report,
-        trace_json, trace_to_transcript, transcript_template, usb_candidates_report,
-        usb_device_selector, validate_boundary_probe, validate_eeprom_read_addresses,
-        validate_report_file_path, validate_trace_file_path, write_validation_plan_report,
+        Cli, Command, DriverHandoffReport, OUT_OF_RANGE_READ_CONFIRMATION, ReadOnlyFailureKind,
+        TRACE_SANITIZATION_CONFIRMATION, WRITE_EVIDENCE_RESTORATION_CONFIRMATION,
+        WRITE_EVIDENCE_WRITE_CONFIRMATION, WriteEvidenceCleanup, WriteEvidenceSession,
+        WriteEvidenceStage, d4_eeprom_boundary_probe_report, d4_eeprom_dump_report,
+        d4_eeprom_read_report, d4_failure_report, d4_identity_report, dump_progress,
+        eeprom_dump_addresses, emit_report, execute_write_evidence, parse_trace_events, parse_u16,
+        read_sequence_report, simulated_read_only_report, trace_json, trace_to_transcript,
+        transcript_template, usb_candidates_report, usb_device_selector, validate_boundary_probe,
+        validate_eeprom_read_addresses, validate_report_file_path, validate_trace_file_path,
+        validate_write_evidence_gates, write_evidence_report,
     };
 
     fn report(output: String) -> Value {
@@ -1760,6 +2447,63 @@ mod tests {
             assert_eq!(step["name"], *expected_name);
             assert_eq!(step["status"], "completed");
             assert!(step.get("result").is_some());
+        }
+    }
+
+    struct MockWriteEvidenceSession {
+        identities: VecDeque<Result<Option<String>, String>>,
+        reads: VecDeque<Result<u8, String>>,
+        plans: VecDeque<Result<reink_app::EepromWritePlan, String>>,
+        applies: VecDeque<Result<(), String>>,
+        applied_updates: Vec<Vec<(u16, u8)>>,
+    }
+
+    impl WriteEvidenceSession for MockWriteEvidenceSession {
+        fn identity_model(&mut self) -> Result<Option<String>, String> {
+            self.identities
+                .pop_front()
+                .expect("test identity response was configured")
+        }
+
+        fn read_byte(&mut self, _: u16) -> Result<u8, String> {
+            self.reads
+                .pop_front()
+                .expect("test EEPROM read response was configured")
+        }
+
+        fn prepare_write_plan(
+            &mut self,
+            _: &[(u16, u8)],
+        ) -> Result<reink_app::EepromWritePlan, String> {
+            self.plans
+                .pop_front()
+                .expect("test EEPROM plan was configured")
+        }
+
+        fn apply_write_plan(&mut self, plan: &reink_app::EepromWritePlan) -> Result<(), String> {
+            self.applied_updates.push(plan.updates.clone());
+            self.applies
+                .pop_front()
+                .expect("test EEPROM apply result was configured")
+        }
+    }
+
+    fn test_write_plan(
+        spec: &reink_core::EpsonSpec,
+        address: u16,
+        original_value: u8,
+        requested_value: u8,
+    ) -> reink_app::EepromWritePlan {
+        reink_app::EepromWritePlan {
+            backup: EepromImage {
+                model: spec.model.clone(),
+                start_address: spec.memory_low,
+                bytes: vec![
+                    original_value;
+                    usize::from(spec.memory_high) - usize::from(spec.memory_low) + 1
+                ],
+            },
+            updates: vec![(address, requested_value)],
         }
     }
 
@@ -1879,7 +2623,7 @@ mod tests {
                 "read-sequence",
                 vec![("usb-device-id", json!({"bytes_received": 25}))],
                 ("parse-device-id", kind, message),
-                "Resolve the reported read-only condition before retrying; no write or reset is available.",
+                "Resolve the reported read-only condition before retrying; this read-only result does not authorize a write or reset.",
             ));
             assert_eq!(output["schema_version"], 3);
             assert_eq!(output["mode"], "read_only");
@@ -1953,7 +2697,7 @@ idProduct = 0x1234
     }
 
     #[test]
-    fn parses_only_explicit_read_only_commands() {
+    fn parses_explicit_read_only_and_write_evidence_commands() {
         let cli = Cli::try_parse_from(["reink-hardware-test", "usb-candidates"]).unwrap();
         assert!(matches!(cli.command, Command::UsbCandidates));
 
@@ -2119,6 +2863,60 @@ idProduct = 0x1234
                 confirm_out_of_range_read: Some(ref confirmation),
                 ..
             } if confirmation == OUT_OF_RANGE_READ_CONFIRMATION
+        ));
+
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "d4-eeprom-write-evidence",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--alternate-setting",
+            "0",
+            "--bus-number",
+            "1",
+            "--device-address",
+            "2",
+            "--model",
+            "C90",
+            "--address",
+            "0x000c",
+            "--value",
+            "0x42",
+            "--backup-file",
+            "private/complete-backup.bin",
+            "--report-file",
+            "private/write-evidence-report.json",
+            "--confirm-write",
+            WRITE_EVIDENCE_WRITE_CONFIRMATION,
+            "--confirm-restoration-evidence",
+            WRITE_EVIDENCE_RESTORATION_CONFIRMATION,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::D4EepromWriteEvidence {
+                vendor_id: 0x04b8,
+                product_id: 1234,
+                interface: 0,
+                alternate_setting: 0,
+                bus_number: 1,
+                device_address: 2,
+                address: 0x000c,
+                value: 0x42,
+                backup_file,
+                report_file,
+                confirm_write: Some(ref confirm_write),
+                confirm_restoration_evidence: Some(ref confirm_restoration_evidence),
+                ref model,
+            } if model == "C90"
+                && backup_file == Path::new("private/complete-backup.bin")
+                && report_file == Path::new("private/write-evidence-report.json")
+                && confirm_write == WRITE_EVIDENCE_WRITE_CONFIRMATION
+                && confirm_restoration_evidence == WRITE_EVIDENCE_RESTORATION_CONFIRMATION
         ));
     }
 
@@ -2398,46 +3196,192 @@ transcript.expect_write(vec![0xAA]);\n\
     }
 
     #[test]
-    fn write_validation_plan_stays_non_executable_when_gates_are_blocked() {
-        let plan = report(write_validation_plan_report(None, None));
+    fn write_evidence_gates_are_exact_local_and_require_distinct_new_paths() {
+        let database = reink_core::ModelDatabase::builtin().unwrap();
+        let spec = database.get("C90").unwrap();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let backup = directory.join(format!("write-evidence-backup-{}.bin", std::process::id()));
+        let report = directory.join(format!("write-evidence-report-{}.json", std::process::id()));
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&report);
 
-        assert_eq!(plan["mode"], "non_executable");
-        assert_eq!(plan["execution"], "disabled");
-        assert!(plan["evidence_sha256"].is_null());
         assert!(
-            plan["gates"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|gate| gate["status"] == "blocked")
+            validate_write_evidence_gates(
+                spec,
+                spec.memory_low,
+                &backup,
+                &report,
+                None,
+                Some(WRITE_EVIDENCE_RESTORATION_CONFIRMATION),
+            )
+            .is_err()
         );
         assert!(
-            plan["next_step"]
-                .as_str()
-                .unwrap()
-                .contains("cannot enable")
+            validate_write_evidence_gates(
+                spec,
+                spec.memory_low,
+                &backup,
+                &report,
+                Some(WRITE_EVIDENCE_WRITE_CONFIRMATION),
+                Some("I_CONFIRM_RESTORE"),
+            )
+            .is_err()
+        );
+        let out_of_range = spec
+            .memory_high
+            .checked_add(1)
+            .unwrap_or_else(|| spec.memory_low.checked_sub(1).unwrap());
+        assert!(
+            validate_write_evidence_gates(
+                spec,
+                out_of_range,
+                &backup,
+                &report,
+                Some(WRITE_EVIDENCE_WRITE_CONFIRMATION),
+                Some(WRITE_EVIDENCE_RESTORATION_CONFIRMATION),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_write_evidence_gates(
+                spec,
+                spec.memory_low,
+                &backup,
+                &backup,
+                Some(WRITE_EVIDENCE_WRITE_CONFIRMATION),
+                Some(WRITE_EVIDENCE_RESTORATION_CONFIRMATION),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_write_evidence_gates(
+                spec,
+                spec.memory_low,
+                &backup,
+                &report,
+                Some(WRITE_EVIDENCE_WRITE_CONFIRMATION),
+                Some(WRITE_EVIDENCE_RESTORATION_CONFIRMATION),
+            )
+            .is_ok()
         );
     }
 
     #[test]
-    fn write_validation_plan_requires_sanitized_reference_and_exact_confirmation() {
-        let evidence = "a".repeat(64);
-        let plan = report(write_validation_plan_report(
-            Some(&evidence),
-            Some(NON_EXECUTABLE_WRITE_CONFIRMATION),
-        ));
-        assert_eq!(plan["execution"], "disabled");
-        assert_eq!(plan["evidence_sha256"], evidence);
-        assert_eq!(plan["gates"][0]["status"], "satisfied");
-        assert_eq!(plan["gates"][1]["status"], "satisfied");
-        assert_eq!(plan["gates"][2]["status"], "blocked");
+    fn write_evidence_uses_core_plans_and_restores_after_verified_test_write() {
+        let spec = reink_core::ModelDatabase::builtin()
+            .unwrap()
+            .get("C90")
+            .unwrap()
+            .clone();
+        let address = spec.memory_low;
+        let mut session = MockWriteEvidenceSession {
+            identities: VecDeque::from([Ok(Some("C90".to_owned()))]),
+            reads: VecDeque::from([Ok(0x10), Ok(0x42), Ok(0x10)]),
+            plans: VecDeque::from([Ok(test_write_plan(&spec, address, 0x10, 0x42))]),
+            applies: VecDeque::from([Ok(()), Ok(())]),
+            applied_updates: Vec::new(),
+        };
+        let mut persisted_backup_len = None;
 
-        let invalid = report(write_validation_plan_report(
-            Some("not-a-sha256-reference"),
-            Some("I_CONFIRM_WRITES"),
+        let outcome = execute_write_evidence(&mut session, "C90", address, 0x42, |bytes| {
+            persisted_backup_len = Some(bytes.len());
+            Ok(())
+        });
+
+        assert!(outcome.completed_safely());
+        assert_eq!(
+            persisted_backup_len,
+            Some(
+                test_write_plan(&spec, address, 0x10, 0x42)
+                    .backup
+                    .bytes
+                    .len()
+            )
+        );
+        assert_eq!(
+            session.applied_updates,
+            vec![vec![(address, 0x42)], vec![(address, 0x10)]]
+        );
+    }
+
+    #[test]
+    fn write_evidence_attempts_restoration_when_the_test_write_fails() {
+        let spec = reink_core::ModelDatabase::builtin()
+            .unwrap()
+            .get("C90")
+            .unwrap()
+            .clone();
+        let address = spec.memory_low;
+        let mut session = MockWriteEvidenceSession {
+            identities: VecDeque::from([Ok(Some("C90".to_owned()))]),
+            reads: VecDeque::from([Ok(0x10), Ok(0x10)]),
+            plans: VecDeque::from([Ok(test_write_plan(&spec, address, 0x10, 0x42))]),
+            applies: VecDeque::from([Err("write rejected".to_owned()), Ok(())]),
+            applied_updates: Vec::new(),
+        };
+
+        let outcome = execute_write_evidence(&mut session, "C90", address, 0x42, |_| Ok(()));
+
+        assert_eq!(outcome.test_write.status, "failed");
+        assert_eq!(outcome.restoration.status, "completed");
+        assert_eq!(outcome.restoration_readback.status, "completed");
+        assert_eq!(
+            session.applied_updates,
+            vec![vec![(address, 0x42)], vec![(address, 0x10)]]
+        );
+    }
+
+    #[test]
+    fn write_evidence_report_distinguishes_restoration_failure_after_cleanup() {
+        let spec = reink_core::ModelDatabase::builtin()
+            .unwrap()
+            .get("C90")
+            .unwrap()
+            .clone();
+        let address = spec.memory_low;
+        let mut session = MockWriteEvidenceSession {
+            identities: VecDeque::from([Ok(Some("C90".to_owned()))]),
+            reads: VecDeque::from([Ok(0x10), Ok(0x42)]),
+            plans: VecDeque::from([Ok(test_write_plan(&spec, address, 0x10, 0x42))]),
+            applies: VecDeque::from([Ok(()), Err("restore rejected".to_owned())]),
+            applied_updates: Vec::new(),
+        };
+        let outcome = execute_write_evidence(&mut session, "C90", address, 0x42, |_| Ok(()));
+        let cleanup = WriteEvidenceCleanup {
+            d4_shutdown: WriteEvidenceStage::completed("shutdown complete", None),
+            usb_close: WriteEvidenceStage::completed("USB close complete", None),
+        };
+        let connection = WriteEvidenceStage::completed("connected", None);
+        let output = report(write_evidence_report(
+            0x04b8,
+            0x1234,
+            0,
+            0,
+            1,
+            2,
+            "C90",
+            address,
+            0x42,
+            Path::new("private/backup.bin"),
+            &connection,
+            Some(&outcome),
+            &cleanup,
+            false.into(),
         ));
-        assert!(invalid["evidence_sha256"].is_null());
-        assert_eq!(invalid["gates"][0]["status"], "blocked");
-        assert_eq!(invalid["gates"][1]["status"], "blocked");
+
+        assert_eq!(output["mode"], "write_evidence");
+        assert_eq!(output["status"], "failed");
+        assert_eq!(output["stages"][6]["name"], "restoration");
+        assert_eq!(output["stages"][6]["status"], "failed");
+        assert!(
+            output["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("Do not repeat")
+        );
+        assert_eq!(
+            session.applied_updates,
+            vec![vec![(address, 0x42)], vec![(address, 0x10)]]
+        );
     }
 }

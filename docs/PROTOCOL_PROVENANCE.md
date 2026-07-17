@@ -92,11 +92,11 @@ in the test comment only when it is available under the project's license.
 
 ## Vendor-command safety gate
 
-The EEPROM factory **write** encoder is intentionally not connected to any
-public hardware workflow. The read-only hardware driver may issue explicitly
-selected EEPROM reads to collect the sanitized request/response evidence needed
-for each supported address-width family. Before enabling a write or reset
-operation, require all of the following:
+The EEPROM factory **write** encoder is exposed only through confirmed CLI
+commands and the dedicated `d4-eeprom-write-evidence` physical-test command.
+The latter is not a generic reset command and never runs as part of a read-only
+workflow. Before executing a physical write or reset operation, require all of
+the following:
 
 1. Vendor documentation or repeatable capture evidence for the exact model
    family and command.
@@ -106,14 +106,18 @@ operation, require all of the following:
 5. No installation, detach, rebind, or association change of a Windows driver.
    A Windows selected-printer operation may claim only an already
    libusb-accessible interface and must stop safely if that claim fails.
-6. A separately retained sanitized read-only report, identified by a SHA-256
-   reference rather than embedded raw hardware data.
-7. A separate human safety review covering backups, read-back, rollback, and
-   device-specific evidence.
+6. Explicit authorization for the selected target operation; a prior
+   read-only report is useful evidence but is not itself permission.
+7. The dedicated command's two exact acknowledgements: one for the write and
+   one for restoration/private evidence.
+8. A complete create-new backup that is persisted before the test write, plus
+   post-write and post-restoration read-back verification.
 
-`reink-hardware-test write-validation-plan` records the sanitized-reference,
-explicit-acknowledgement, and separate-review gates as a non-executable
-checklist. Its acknowledgement can only satisfy the acknowledgement gate; the
-separate-review gate is intentionally always blocked, and the report cannot
-select a device, open a transport, queue a command, or execute a write or
-reset.
+`reink-hardware-test d4-eeprom-write-evidence` requires an exact
+vendor/product/interface/alternate-setting/bus/device selector, exact D4 model
+identity, one in-range address, and an explicit test byte. It creates its
+private structured report only after cleanup. If a test write fails after the
+original byte is known, it still attempts restoration and records the test
+write, restoration, verification, and cleanup outcomes separately. No default
+command, read-evidence runner, or GUI action is permitted to execute a physical
+write without an explicitly authorized target operation.

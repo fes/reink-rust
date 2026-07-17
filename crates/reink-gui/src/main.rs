@@ -855,7 +855,7 @@ impl ReinkGui {
                             ),
                         );
                     });
-                    ui.label("Unavailable until hardware evidence and safety review authorize it.");
+                    ui.label("Unavailable in the GUI; use only the separate gated write-evidence or confirmed CLI workflow after evidence passes.");
                     ui.add_enabled_ui(false, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(format!(
@@ -985,7 +985,7 @@ impl ReinkGui {
             ui.heading("Waste-ink counter");
             ui.label("Fixture value: 1,048");
             ui.add_enabled(false, egui::Button::new("Reset to zero"));
-            ui.label("Reset is unavailable: no physical write or reset path is linked.");
+            ui.label("Reset is unavailable in the GUI: no GUI write or reset path is linked.");
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1000,13 +1000,13 @@ impl ReinkGui {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.heading("First-write backup");
             ui.label(
-                "Before the first persistent write to a connected printer, ReInk will ask whether to save an EEPROM backup.",
+                "Persistent writes require a complete backup and command-specific confirmations.",
             );
             ui.label(
-                "A canceled save dialog will not count as declining the backup; continuing without one requires a separate explicit acknowledgement.",
+                "The GUI remains disabled; use only the separate gated write-evidence or confirmed CLI workflow after evidence passes.",
             );
             ui.add_enabled(false, egui::Button::new("Choose EEPROM backup..."));
-            ui.label("Unavailable until a hardware write path passes the separate safety review.");
+            ui.label("GUI backup selection is intentionally unavailable.");
         });
     }
 

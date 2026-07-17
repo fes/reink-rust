@@ -76,7 +76,10 @@ fn usb_interface_descriptor(interface: rusb::InterfaceDescriptor<'_>) -> UsbInte
     }
 }
 
-/// A claimed read-only USB printer interface backed by libusb.
+/// A claimed USB printer interface backed by libusb.
+///
+/// The historical type name is retained for compatibility. Callers decide
+/// whether their protocol operation is read-only or an explicitly gated write.
 pub struct ReadOnlyUsbTransport {
     _context: Context,
     handle: DeviceHandle<Context>,

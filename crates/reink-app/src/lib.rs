@@ -156,9 +156,9 @@ impl<T: ByteTransport> EpsonD4Session<T> {
     ///
     /// Callers with explicit transport cleanup can use the returned transport
     /// to report cleanup failures. The Epson entry exchange is
-    /// source-compatible with ReInkPy and is intentionally exercised only with
-    /// scripted transports until hardware evidence is available for a selected
-    /// printer family.
+    /// source-compatible with ReInkPy. Hardware use is limited to explicitly
+    /// selected read sessions and the gated reversible write-evidence workflow;
+    /// no caller may treat this API as authorization for an automatic write.
     pub fn connect_recoverable(
         mut target: T,
         spec: EpsonSpec,

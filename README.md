@@ -1,5 +1,10 @@
 # ReInk
 
+> [!IMPORTANT]
+> This Rust port is 100% AI-written. Treat it as experimental software: review
+> the source, validate behavior against hardware, and retain backups before any
+> persistent printer operation.
+
 ReInk is an in-progress Rust port of
 [ReInkPy](https://codeberg.org/atufi/reinkpy), a utility for inspecting and
 resetting waste-ink counters on selected Epson printers.
@@ -10,19 +15,20 @@ and Windows through explicit OS adapters. It does **not** replace physical
 waste-ink pads.
 
 > [!WARNING]
-> ReInk will eventually write persistent printer state. EEPROM writes and
-> counter resets must remain explicit user actions, verify their result by
-> default, and be used only after appropriate physical maintenance. Before the
-> first connected-printer write in a session, ReInk must offer an EEPROM backup;
-> declining it requires a separate explicit acknowledgement.
+> When ReInk writes persistent printer state, EEPROM writes and counter resets
+> must remain explicit user actions, verify their result by default, and be used
+> only after appropriate physical maintenance. A physical write requires an
+> explicitly authorized target operation, a complete backup, and the
+> command-specific acknowledgements.
 
 ## Status
 
 The workspace contains platform contracts, deterministic test doubles, Epson
 domain logic, and an application service that composes a selected transport
-with the Epson D4 and control-channel layers. It includes an explicit
-EEPROM-operation CLI and a read-only terminal UI; its scripted D4 entry
-exchange is not hardware-ready.
+with the Epson D4 and control-channel layers. It includes explicit EEPROM
+operations and a dedicated reversible physical write-evidence command. No
+hardware write is automatic: it requires a selected target and every command
+specific gate.
 
 | Area | Status |
 | --- | --- |
@@ -31,12 +37,12 @@ exchange is not hardware-ready.
 | IEEE 1284 identity parsing | Implemented |
 | Epson model database, command encoding, and EEPROM reply parsing | Implemented |
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
-| Epson command execution and EEPROM read/write orchestration | Implemented with scripted transports |
-| Epson D4 application service with write plans | Implemented with scripted transports |
-| Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; no hardware validation claimed |
+| Epson command execution and EEPROM read/write orchestration | Implemented with scripted tests and core verification |
+| Epson D4 application service with write plans | Implemented; used by the gated hardware write-evidence workflow |
+| Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; used by explicit read workflows and gated write evidence |
 | SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
-| Windows native USB read-only sessions | Implemented through libusb; no hardware validation claimed |
-| CLI inspection and explicit EEPROM operations | Implemented with scripted transports |
+| Windows native USB sessions | Implemented through libusb; no automatic write path |
+| CLI inspection and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
 | Read-only terminal UI model browser | Implemented |
 
 ## Porting approach
@@ -92,10 +98,10 @@ Current and planned workspace crates:
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
 | `reink-app` | Epson D4 session, entry-probe, and validated write-plan application services |
-| `reink-usb` | Read-only Linux, macOS, and Windows libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
+| `reink-usb` | Linux, macOS, and Windows libusb bulk transport, generic bounded exchange probes, and USB printer-interface selection |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
-| `reink-hardware-test` | Opt-in Linux, macOS, and Windows read-only validation driver; hardware validation remains unclaimed |
+| `reink-hardware-test` | Opt-in Linux, macOS, and Windows validation driver, including a gated reversible single-byte write-evidence command |
 | `reink-cli` | Model, identity, discovery, and explicit USB EEPROM commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
 | `reink-gui` | Optional descriptor-only graphical read-only UI with a session-only future transport trace sink |
@@ -245,8 +251,10 @@ device, sends traffic, or changes a driver binding.
 
 ### `reink-cli`
 
-`reink-cli` contains only read-only commands. It does not accept write keys,
-reset counters, or send EEPROM write requests.
+`reink-cli` provides inspection commands plus explicitly confirmed EEPROM
+write and restore commands. It never performs a default or automatic write;
+those commands require a selected target, an exact model match, an exact
+confirmation, and a create-new complete backup.
 
 `parse-id`, `snmp-id`, and `usb-id` report the parsed IEEE 1284 fields together
 with a detected model candidate and any match in the built-in model database.
@@ -298,10 +306,13 @@ cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-
 D4 identity in the same session and rejects a model mismatch before reading
 EEPROM. The output path must be new and have an existing parent directory.
 
-`usb-eeprom-write` and `usb-eeprom-restore` are the only CLI commands that
-mutate EEPROM. They require an exact D4 model match, an exact confirmation, and
-a new backup path before USB is opened. They always attempt orderly D4 shutdown
-and USB close; cleanup failures are included in the command error.
+On Linux and macOS, `usb-eeprom-write` and `usb-eeprom-restore` are confirmed
+CLI mutation commands. They require an exact D4 model match, an exact
+confirmation, and a new backup path before USB is opened. They always attempt
+orderly D4 shutdown and USB close; cleanup failures are included in the command
+error. On all supported USB platforms, use the separate
+`d4-eeprom-write-evidence` command below when the goal is to write and restore
+one byte as auditable physical evidence.
 
 ```powershell
 cargo run -p reink-cli -- usb-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --output-file <new-image.bin>
@@ -418,11 +429,12 @@ cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-
 
 All successful reports use schema version 3 with `mode: "read_only"` and
 ordered step objects (`name`, `status`, and `result`). Preserve those reports as
-hardware evidence. The driver performs no physical write or reset operation;
-its `write-sequence` command is deliberately unavailable. Failure reports are
-also schema version 3, include reconnect/power-cycle/reboot remediation, and
-record the failing stage without raw trace bytes or
-invented successful EEPROM values.
+hardware evidence. Read-only commands never write. Physical writes are
+supported only by the explicit, gated write-evidence command or confirmed CLI
+commands; no default workflow, read-evidence runner, or GUI action writes
+printer state. Read-only failure reports are also schema version 3, include
+reconnect/power-cycle/reboot remediation, and record the failing stage without
+raw trace bytes or invented successful EEPROM values.
 
 Normal `d4-eeprom-read` rejects addresses outside the selected model's
 `mem_low..=mem_high` range before opening USB. The separate
@@ -436,7 +448,8 @@ cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 
 ```
 
 For an explicitly selected Linux interface, `read-sequence`, `d4-identity`,
-`d4-eeprom-read`, `d4-eeprom-dump`, and `d4-eeprom-boundary-probe`
+`d4-eeprom-read`, `d4-eeprom-dump`, `d4-eeprom-boundary-probe`, and
+`d4-eeprom-write-evidence`
 automatically detach, claim, release, and reattach only the active driver for
 each operation. Schema-version-3 reports include
 `linux_driver_handoff` with automatic, detached, and reattached outcomes; they
@@ -455,19 +468,26 @@ only completed-address count and failed address, never a partial values list.
 If its explicit trace capture succeeds, the process still fails and labels that
 file as incomplete private evidence.
 
-`write-validation-plan` is a separate **non-executable** safety-gate report.
-It never selects a USB device, opens a session, queues a write, or resets a
-printer. It accepts only the SHA-256 reference of a separately retained,
-sanitized read-only report and an exact acknowledgement:
+`d4-eeprom-write-evidence` is a separate executable physical-test command. It
+requires the complete selector (including bus and device address), exact D4
+model identity, one in-range address and distinct test value, two exact
+confirmations, and different create-new backup and report paths before USB is
+opened. It pre-reads the original byte, creates and syncs a complete backup,
+writes with core read-back verification, independently reads the test value,
+then always attempts to restore the original byte whenever it was read. It
+independently verifies restoration and writes its private structured report
+only after D4 and USB cleanup have been attempted.
 
 ```powershell
-cargo run -p reink-hardware-test -- write-validation-plan --evidence-sha256 <64-hex-character-sha256> --confirmation I_CONFIRM_THIS_DOES_NOT_EXECUTE_WRITES
+cargo run -p reink-hardware-test -- d4-eeprom-write-evidence --vendor-id 0x04b8 --product-id <product-id> --interface <number> --alternate-setting <number> --bus-number <bus> --device-address <device> --model <model> --address <in-range-address> --value <different-test-byte> --backup-file <new-private-complete-backup.bin> --report-file <new-private-write-evidence-report.json> --confirm-write I_CONFIRM_THIS_WILL_WRITE_EEPROM --confirm-restoration-evidence I_CONFIRM_THIS_WILL_RESTORE_EEPROM_AND_RETAIN_PRIVATE_EVIDENCE
 ```
 
-The report always has `execution: "disabled"`. Even when the sanitized-evidence
-reference and acknowledgement gates are satisfied, its mandatory
-`separate-write-safety-review` gate remains blocked. No current command can
-turn that plan into a physical EEPROM write or reset.
+If the test write or its read-back fails, the command still attempts
+restoration when the original byte is available and reports test-write,
+restoration, read-back, and cleanup outcomes separately. A restoration or
+cleanup failure is a nonzero result with explicit remediation; do not retry or
+issue another write until the private report has been reviewed and the original
+byte has been separately verified.
 
 `snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
 credentials from the process environment:
@@ -571,8 +591,8 @@ printer interface; ordinary development does not modify USB drivers.
 ### Windows: build, test, and read-only USB evidence
 
 Windows supports the workspace's pure crates, CLI, terminal UI, descriptor/real
-GUI (with explicit fixture opt-in), mDNS, SNMP, and selected read-only libusb
-USB sessions. Windows USB access claims only an already libusb-accessible
+GUI (with explicit fixture opt-in), mDNS, SNMP, selected read-only evidence,
+and explicitly gated write-evidence libusb USB sessions. Windows USB access claims only an already libusb-accessible
 selected interface. It never installs, detaches, rebinds, changes, or restores
 a driver; an access failure is a safe stop.
 
@@ -610,6 +630,9 @@ cargo run -p reink-gui
 `usb-id`, `usb-d4-probe`, and the read-only `usb-eeprom-dump` workflow are
 available on Windows for an explicitly selected libusb-accessible interface.
 `usb-eeprom-write` and `usb-eeprom-restore` remain unavailable on Windows.
+The cross-platform `d4-eeprom-write-evidence` command is available only as its
+separate gated, reversible workflow; it is never invoked by the Windows
+read-evidence runner.
 For the complete hardware-test evidence sequence, use the sibling
 `reink-results\run-windows-read-evidence.ps1` runner with its explicit
 selector and model parameters. It keeps raw paths, reports, traces, and EEPROM
@@ -683,8 +706,9 @@ clearly; reconnect or power-cycle the printer, then reboot the host if needed.
    than hiding it or requiring an external handoff session.
 4. Never commit raw captures, serial numbers, USB paths, IP addresses, SNMP
    credentials, or other device-specific data. Use sanitized transcripts only.
-5. Do not add write/reset commands until the protocol-provenance safety gate
-   and hardware evidence requirements are satisfied.
+5. Do not add an automatic or generic write/reset command. Preserve the
+   protocol-provenance, explicit-target, confirmation, backup, read-back, and
+   restoration requirements of the dedicated write-evidence workflow.
 
 ## Build, test, and lint
 
@@ -727,8 +751,9 @@ session.shutdown()?;
 ```
 
 `transport` must come from an explicitly selected adapter such as the libusb
-USB backend. This API is read-only; no CLI command or application-level
-hardware write/reset path exists yet.
+USB backend. The example is read-only; validated write plans are exposed only
+to the dedicated write-evidence workflow and confirmed CLI commands, never as
+an automatic application action.
 
 ## Compatibility and safety
 
