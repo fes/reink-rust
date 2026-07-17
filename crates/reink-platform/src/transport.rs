@@ -38,13 +38,23 @@ pub enum TransportEvent {
 pub struct RecordingTransport<T> {
     inner: T,
     events: Vec<TransportEvent>,
+    recording_enabled: bool,
 }
 
 impl<T> RecordingTransport<T> {
     pub fn new(inner: T) -> Self {
+        Self::new_with_recording(inner, true)
+    }
+
+    /// Wraps a transport while retaining successful transfers only when enabled.
+    ///
+    /// This lets a UI keep diagnostic capture opt-in without changing the
+    /// transport stack used for a selected operation.
+    pub fn new_with_recording(inner: T, recording_enabled: bool) -> Self {
         Self {
             inner,
             events: Vec::new(),
+            recording_enabled,
         }
     }
 
@@ -57,14 +67,18 @@ impl<T> RecordingTransport<T> {
 impl<T: ByteTransport> ByteTransport for RecordingTransport<T> {
     fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
         self.inner.write_all(data)?;
-        self.events.push(TransportEvent::Tx(data.to_vec()));
+        if self.recording_enabled {
+            self.events.push(TransportEvent::Tx(data.to_vec()));
+        }
         Ok(())
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         let count = self.inner.read(buffer)?;
-        self.events
-            .push(TransportEvent::Rx(buffer[..count].to_vec()));
+        if self.recording_enabled {
+            self.events
+                .push(TransportEvent::Rx(buffer[..count].to_vec()));
+        }
         Ok(count)
     }
 
@@ -153,6 +167,21 @@ mod tests {
 
         assert_eq!(transport.write_all(&[0xaa]).unwrap_err(), write_error);
         assert_eq!(transport.read(&mut buffer).unwrap_err(), read_error);
+
+        let (_, events) = transport.into_parts();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn can_run_without_capturing_transfers() {
+        let mut transport = RecordingTransport::new_with_recording(
+            ScriptedTransport::new([Ok(())], [Ok(vec![0x10])]),
+            false,
+        );
+        let mut buffer = [0; 1];
+
+        transport.write_all(&[0xaa]).unwrap();
+        assert_eq!(transport.read(&mut buffer).unwrap(), 1);
 
         let (_, events) = transport.into_parts();
         assert!(events.is_empty());

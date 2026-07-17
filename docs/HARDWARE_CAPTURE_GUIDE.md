@@ -19,7 +19,8 @@ It applies when a device is available and supplements
    Keep this metadata private if it identifies a device or person.
 5. A capture is evidence of observed behavior, not permission for a generic
    write/reset action. A physical write or semantic counter reset remains
-   available only through the explicit write-evidence or confirmed CLI gates.
+   available only through an explicit write-evidence, confirmed CLI, or
+   separately guarded GUI gate.
 6. The `--trace-file` output is an original/raw byte trace. Store it outside
    this repository, never commit it, and share only a separately redacted
    derivative when authorized.
@@ -130,6 +131,27 @@ write/restore. Unlike `d4-eeprom-write-evidence`, a successful reset is not
 automatically restored and does not create a hardware-test report: retain the
 private backup and command result. Do not add this command to read-evidence
 runners or use it solely to produce a capture.
+
+### Guarded GUI operations
+
+The GUI's connected controls are not evidence runners and never start from
+startup, candidate selection, file selection, or a typed acknowledgement alone.
+On Linux and Windows (and macOS only where the existing libusb interface claim
+is accessible), a user must select one descriptor candidate and one
+bundled expected model, then press an operation button. Exact VID/PID
+associations are display hints only. The worker reads the D4 identity and
+refuses any identity/model mismatch before status, dump, or model-specific
+access.
+
+The GUI can save a durable complete dump to a new user-selected private file.
+Generic write, restore, waste reset, and platen-pad reset each require a new
+user-selected complete backup path, create and sync that backup before writing,
+and require their respective exact typed confirmation. Restore also requires a
+user-selected complete image of the exact model range. Every mutation uses the
+same guarded read-back and rollback path as the application service; its result
+reports current values, verification or rollback detail, D4 shutdown, and USB
+cleanup. Keep GUI images, backups, displayed values, and opt-in debug traffic
+private and out of default logs and this repository.
 
 ```powershell
 cargo run -p reink-cli -- usb-eeprom-reset --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --target waste --backup-file <new-private-complete-backup.bin> --confirmation I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS

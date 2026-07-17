@@ -78,7 +78,7 @@ an async runtime.
 ## Architecture
 
 ```text
-CLI / terminal UI / fixture GUI
+CLI / terminal UI / guarded GUI
         |
 application service
         |
@@ -104,7 +104,7 @@ Current and planned workspace crates:
 | `reink-hardware-test` | Opt-in Linux, macOS, and Windows validation driver, including a gated reversible single-byte write-evidence command |
 | `reink-cli` | Model, identity, discovery, and explicit USB EEPROM commands |
 | `reink-tui` | Read-only keyboard-driven model browser and workflow guide |
-| `reink-gui` | Optional descriptor-only graphical read-only UI with a session-only future transport trace sink |
+| `reink-gui` | Optional guarded graphical UI for selected USB status, durable EEPROM images, and explicitly confirmed EEPROM operations |
 
 `reink-platform` supports USB selectors, explicit device paths, and IPv4/IPv6
 network locations. Linux discovery enumerates `/dev/lp*` and `/dev/usb/lp*`
@@ -357,6 +357,27 @@ before USB access and maps every image byte in order onto the selected declared
 range; it saves a complete create-new rollback backup before applying that
 plan. EEPROM images and backups are private device-specific data: retain them
 securely and never commit them.
+
+### `reink-gui`
+
+The optional GUI starts in descriptor-only mode. Selecting a candidate never
+opens USB or starts an operation. On Linux and Windows (and macOS where the
+existing libusb interface claim is accessible), explicit selected-printer
+buttons run status, complete EEPROM dump, generic byte write, full-image
+restore, and model-aware waste/platen-pad resets on a worker thread. Every
+connected operation requires an operator-selected expected bundled model; any
+exact VID/PID association is only a hint, and the D4 identity must exactly
+match before access.
+
+Persistent GUI operations require a user-selected create-new, synchronized full
+backup and action-specific typed confirmation. Writes use the existing
+read-back and rollback plan. Restore additionally requires a user-selected
+complete image with the exact selected-model length. The result pane reports
+preflight/current values, read-back or rollback outcome, D4 shutdown, and USB
+cleanup. Debug transfer recording remains session-only and is captured only
+when its existing opt-in was enabled before the operation began. EEPROM images,
+backup paths, and transport traffic are private and are never written to
+default logs.
 
 `analyze-binary` is an offline, local-only port of ReInkPy's `search_bin`
 helper. It recognizes bounded Epson factory-read/write signatures and, except

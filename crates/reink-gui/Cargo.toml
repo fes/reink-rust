@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only graphical user interface for ReInk"
+description = "Guarded graphical user interface for ReInk"
 
 [dependencies]
 eframe = "0.35"

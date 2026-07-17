@@ -30,9 +30,9 @@ Tabs render only inside the primary content pane:
 
 | Tab | Primary content |
 | --- | --- |
-| Status | Selected source identity/model information or descriptor-only candidate metadata |
-| EEPROM | EEPROM inspection and field interpretation |
-| Tools | Opt-in fixture validation, maintenance workflow, and future write-safety controls |
+| Status | Selected source identity/model information, status, and durable dump controls |
+| EEPROM | EEPROM inspection, field interpretation, and guarded selected-byte write entry |
+| Tools | Opt-in fixture validation plus guarded backup, restore, and semantic reset controls |
 
 The Debug traffic pane is global. It must not be replaced, hidden, or reset
 when switching tabs.
@@ -45,9 +45,10 @@ automatically. Fixtures are hidden unless the GUI is launched with `--fixtures`;
 only that explicit opt-in permits selecting a fixture and running fixture
 validation. Raw EEPROM file inspection remains available in both modes.
 
-Default mode never opens or claims a device, hands off a driver, sends control,
-D4, or EEPROM traffic, and does not render fixture EEPROM bytes. Selecting a
-candidate, raw file, or enabled fixture clears every other source choice.
+Default startup and candidate selection never open or claim a device, hand off
+a driver, or send control, D4, or EEPROM traffic. A user must explicitly start
+a connected operation after selecting a candidate and expected model. Selecting
+a candidate, raw file, or enabled fixture clears every other source choice.
 
 ## Sub-panes
 
@@ -69,24 +70,37 @@ Enumeration is strictly descriptor-only: it must never open or claim a device,
 detach or hand off a driver, issue a control request, send D4 or EEPROM
 traffic, or enable writes. No GUI driver-handoff control is present. Selecting
 a candidate clears the raw EEPROM source; selecting a fixture or raw file
-clears the candidate. A candidate has no identity or EEPROM data and makes
-fixture validation unavailable until an explicit read-only operation is selected.
-For a candidate with exactly one model hint, **Read EEPROM** confirms the
-printer identity, performs the model-bounded dump, restores the selected
-interface association on Linux, and shows the in-memory image. On Windows and
-macOS it only claims and releases an already libusb-accessible interface; it
-never installs, detaches, rebinds, or changes a driver.
+clears the candidate. A candidate has no identity or EEPROM data and makes fixture validation
+unavailable until an explicit connected operation is selected. The user chooses
+one expected bundled model; an exact VID/PID association, when available, is
+only a hint. Every operation then confirms the D4 identity exactly matches that
+model. **Read printer status** and **Save complete EEPROM dump** run on a worker
+thread. The dump uses a user-selected create-new file and keeps the saved image
+available for local inspection.
+
+On Linux and Windows (and macOS where the existing libusb claim is accessible),
+the Tools and EEPROM panes also expose guarded generic byte write, full-image
+restore, and waste/platen-pad reset dialogs. They require an explicitly
+selected candidate/model, a user-selected create-new synchronized full backup,
+and the action-specific exact typed acknowledgement. Restore also requires a
+user-selected complete model-length image. The reset dialog derives only
+explicitly declared reset bytes. Every mutation uses `EepromWritePlan` read-back
+verification and rollback-on-failure. Result details include preflight/current
+values and D4/USB cleanup; selecting a candidate never starts any of them.
+Linux restores only a driver the selected transport detached. Windows and macOS
+only claim and release an already libusb-accessible interface; they never
+install, detach, rebind, or change a driver.
 
 ## Safety and diagnostics
 
-The GUI remains transport-free for fixtures and descriptor candidates. Debug
-traffic is a live, opt-in, bounded in-memory session-only pane for
-recorded-session TX/RX events. Selecting a descriptor candidate alone produces
-no traffic; an explicit **Read EEPROM** operation can append its records. No
-GUI operation exports them.
-The GUI has no physical-write or reset path. Confirmed CLI semantic resets may
-operate only on explicitly declared model bytes, but GUI controls remain
-disabled until a separate GUI gate has been explicitly implemented and
-validated. Even then, writes are performed only through explicit gated
-write-evidence or confirmed CLI commands; the GUI must never trigger a default
-or automatic write.
+Fixtures remain transport-free. Debug traffic is a live, opt-in, bounded
+in-memory session-only pane for `RecordingTransport` TX/RX events. Selecting a
+descriptor candidate alone produces no traffic. An operation records events
+only when the user enabled capture before starting it; no GUI operation exports
+them. Default result panes do not retain raw identity fields, and no private
+image, path, or traffic data is emitted to default logs.
+
+Physical GUI writes and resets are available only through the explicit guarded
+dialogs above. They never run by default, on candidate selection, after file
+selection, or after entering a confirmation; the user must press the final
+operation-specific confirmation button.

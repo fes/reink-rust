@@ -3,18 +3,24 @@
 use eframe::egui::{self, Color32, RichText};
 use regex::RegexBuilder;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use reink_app::{EepromImage, EpsonD4Session};
+use reink_app::{
+    EepromImage, UsbCleanupStatus, UsbSessionCleanup, declared_counter_reset_updates,
+    restore_eeprom_updates, verify_exact_model, with_selected_usb_epson_session,
+    write_new_binary_file,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use reink_core::ModelDatabase;
+use reink_core::{CounterResetTarget, EpsonSpec, ModelDatabase};
 use reink_gui::{
     DebugTrafficTrace, DescriptorCandidate, GuiState, Page, SourceMode, ValidationStatus,
 };
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use reink_platform::RecordingTransport;
 use reink_platform::TransportEvent;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::path::PathBuf;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::mpsc::{Receiver, TryRecvError};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::{fs::File, io::Read};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -40,14 +46,19 @@ pub struct ReinkGui {
     loaded_eeprom: Option<LoadedEeprom>,
     usb_candidates: Vec<DescriptorCandidate>,
     selected_usb_candidate: Option<usize>,
+    selected_usb_model: Option<String>,
     usb_scan_status: UsbScanStatus,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     usb_scan_receiver: Option<Receiver<Result<Vec<reink_usb::UsbPrinterCandidate>, String>>>,
     file_error: Option<String>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    usb_dump_receiver: Option<Receiver<UsbEepromDumpOutcome>>,
-    usb_dump_error: Option<String>,
+    usb_operation_receiver: Option<Receiver<UsbOperationOutcome>>,
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    usb_operation_result: Option<UsbOperationResultReport>,
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pending_usb_operation: Option<PendingUsbOperation>,
     model_filter: String,
+    usb_model_filter: String,
     debug_traffic: DebugTrafficTrace,
     debug_height: f32,
 }
@@ -76,10 +87,97 @@ enum UsbScanStatus {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-struct UsbEepromDumpOutcome {
-    result: Result<EepromImage, String>,
+struct UsbOperationOutcome {
+    operation: Result<UsbOperationSuccess, String>,
+    cleanup: UsbSessionCleanup,
     events: Vec<TransportEvent>,
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum UsbOperationSuccess {
+    Status {
+        model: String,
+        response_bytes: usize,
+        display: String,
+    },
+    Dump {
+        image: EepromImage,
+        output_file: PathBuf,
+    },
+    Mutation {
+        action: &'static str,
+        model: String,
+        backup_file: PathBuf,
+        current_values: Vec<(u16, u8)>,
+        update_count: usize,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum UsbOperationRequest {
+    Status,
+    Dump {
+        output_file: PathBuf,
+    },
+    Write {
+        updates: Vec<(u16, u8)>,
+        backup_file: PathBuf,
+    },
+    Restore {
+        image: Vec<u8>,
+        backup_file: PathBuf,
+    },
+    Reset {
+        target: CounterResetTarget,
+        backup_file: PathBuf,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum PendingUsbOperation {
+    Write {
+        address: String,
+        value: String,
+        backup_file: Option<PathBuf>,
+        confirmation: String,
+    },
+    Restore {
+        restore_image: Option<RestoreImagePreflight>,
+        backup_file: Option<PathBuf>,
+        confirmation: String,
+    },
+    Reset {
+        target: CounterResetTarget,
+        backup_file: Option<PathBuf>,
+        confirmation: String,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct RestoreImagePreflight {
+    path: PathBuf,
+    result: Result<ValidatedRestoreImage, String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct ValidatedRestoreImage {
+    bytes: Vec<u8>,
+    update_count: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct UsbOperationResultReport {
+    success: bool,
+    headline: String,
+    lines: Vec<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const EEPROM_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const EEPROM_RESTORE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESTORE_EEPROM";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const EEPROM_COUNTER_RESET_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS";
 
 fn source_mode_from_args(arguments: impl IntoIterator<Item = String>) -> SourceMode {
     if arguments
@@ -102,14 +200,19 @@ impl ReinkGui {
             loaded_eeprom: None,
             usb_candidates: Vec::new(),
             selected_usb_candidate: None,
+            selected_usb_model: None,
             usb_scan_status: UsbScanStatus::Unavailable,
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             usb_scan_receiver: None,
             file_error: None,
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            usb_dump_receiver: None,
-            usb_dump_error: None,
+            usb_operation_receiver: None,
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            usb_operation_result: None,
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            pending_usb_operation: None,
             model_filter: String::new(),
+            usb_model_filter: String::new(),
             debug_traffic: DebugTrafficTrace::new(),
             debug_height: 180.0,
         };
@@ -117,17 +220,26 @@ impl ReinkGui {
         gui
     }
 
-    /// Adds the ordered result of a future read-only `RecordingTransport` session.
+    /// Adds events captured under the explicit operation's sampled debug opt-in.
     ///
     /// This is intentionally a session-only integration seam: the trace model
-    /// discards these events until the user has explicitly enabled capture.
+    /// retains these events only because the selected worker operation started
+    /// after the user explicitly enabled capture.
     pub fn append_recorded_transport_events(&mut self, events: Vec<TransportEvent>) -> usize {
-        self.debug_traffic.append_events(events)
+        self.debug_traffic.append_captured_events(events)
     }
 
     fn selected_usb_candidate(&self) -> Option<&DescriptorCandidate> {
         self.selected_usb_candidate
             .and_then(|index| self.usb_candidates.get(index))
+    }
+
+    fn selected_usb_model(&self) -> Option<&str> {
+        selected_model_for_usb_candidate(
+            &self.state,
+            self.selected_usb_candidate(),
+            self.selected_usb_model.as_deref(),
+        )
     }
 
     fn source_label(&self) -> String {
@@ -251,7 +363,6 @@ impl ReinkGui {
         match std::fs::read(&path) {
             Ok(bytes) if bytes.is_empty() => {
                 self.file_error = Some("The selected EEPROM file is empty.".to_owned());
-                self.usb_dump_error = None;
             }
             Ok(bytes) => {
                 self.loaded_eeprom = Some(LoadedEeprom {
@@ -262,15 +373,19 @@ impl ReinkGui {
                     model: None,
                 });
                 self.selected_usb_candidate = None;
+                self.selected_usb_model = None;
                 self.selected_fixture = None;
                 self.file_error = None;
-                self.usb_dump_error = None;
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                {
+                    self.usb_operation_result = None;
+                    self.pending_usb_operation = None;
+                }
                 self.show_validation_report = false;
                 self.state.navigate_to(Page::Eeprom);
             }
             Err(error) => {
                 self.file_error = Some(format!("Unable to open EEPROM file: {error}"));
-                self.usb_dump_error = None;
             }
         }
     }
@@ -328,6 +443,7 @@ impl ReinkGui {
                     })
                     .collect();
                 self.selected_usb_candidate = None;
+                self.selected_usb_model = None;
                 self.usb_scan_status = UsbScanStatus::Ready;
             }
             Err(error) => self.usb_scan_status = UsbScanStatus::Failed(error),
@@ -338,22 +454,23 @@ impl ReinkGui {
     fn poll_usb_candidates(&mut self) {}
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn usb_dump_in_progress(&self) -> bool {
-        self.usb_dump_receiver.is_some()
+    fn usb_operation_in_progress(&self) -> bool {
+        self.usb_operation_receiver.is_some()
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn poll_usb_eeprom_dump(&mut self) {
+    fn poll_usb_operation(&mut self) {
         let result =
-            self.usb_dump_receiver
+            self.usb_operation_receiver
                 .as_ref()
                 .and_then(|receiver| match receiver.try_recv() {
                     Ok(result) => Some(result),
                     Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(UsbEepromDumpOutcome {
-                        result: Err(
-                            "The selected-printer EEPROM dump stopped unexpectedly.".to_owned()
+                    Err(TryRecvError::Disconnected) => Some(UsbOperationOutcome {
+                        operation: Err(
+                            "The selected-printer operation stopped unexpectedly.".to_owned()
                         ),
+                        cleanup: UsbSessionCleanup::not_attempted(),
                         events: Vec::new(),
                     }),
                 });
@@ -361,53 +478,169 @@ impl ReinkGui {
             return;
         };
 
-        self.usb_dump_receiver = None;
-        let UsbEepromDumpOutcome { result, events } = result;
+        self.usb_operation_receiver = None;
+        let UsbOperationOutcome {
+            operation,
+            cleanup,
+            events,
+        } = result;
         if !events.is_empty() {
             self.append_recorded_transport_events(events);
         }
-        match result {
-            Ok(image) => {
+        let cleanup_lines = cleanup_report_lines(&cleanup);
+        match operation {
+            Ok(UsbOperationSuccess::Status {
+                model,
+                response_bytes,
+                display,
+            }) => {
+                self.usb_operation_result = Some(UsbOperationResultReport {
+                    success: cleanup_is_successful(&cleanup),
+                    headline: if cleanup_is_successful(&cleanup) {
+                        "Printer status completed".to_owned()
+                    } else {
+                        "Printer status read completed; cleanup needs attention".to_owned()
+                    },
+                    lines: [
+                        vec![
+                            format!("Exact D4 identity/model match confirmed for {model}."),
+                            format!("Status response ({response_bytes} byte(s)): {display}"),
+                        ],
+                        cleanup_lines,
+                    ]
+                    .concat(),
+                });
+            }
+            Ok(UsbOperationSuccess::Dump { image, output_file }) => {
                 self.loaded_eeprom = Some(LoadedEeprom {
-                    path: format!("USB dump: {}", image.model),
+                    path: output_file.display().to_string(),
                     bytes: image.bytes,
                     start_address: usize::from(image.start_address),
                     selected_offset: 0,
                     model: Some(image.model),
                 });
-                self.selected_usb_candidate = None;
                 self.selected_fixture = None;
                 self.file_error = None;
-                self.usb_dump_error = None;
                 self.show_validation_report = false;
                 self.state.navigate_to(Page::Eeprom);
+                self.usb_operation_result = Some(UsbOperationResultReport {
+                    success: cleanup_is_successful(&cleanup),
+                    headline: if cleanup_is_successful(&cleanup) {
+                        "EEPROM dump saved".to_owned()
+                    } else {
+                        "EEPROM dump saved; cleanup needs attention".to_owned()
+                    },
+                    lines: [
+                        vec![
+                            "Exact D4 identity/model match confirmed before EEPROM access."
+                                .to_owned(),
+                            format!(
+                                "Saved a complete {}-byte model-bounded image (0x{:04X}..=0x{:04X}) to {}.",
+                                self.loaded_eeprom.as_ref().map_or(0, |file| file.bytes.len()),
+                                self.loaded_eeprom.as_ref().map_or(0, |file| file.start_address),
+                                self.loaded_eeprom.as_ref().map_or(0, |file| {
+                                    file.start_address + file.bytes.len().saturating_sub(1)
+                                }),
+                                output_file.display(),
+                            ),
+                        ],
+                        cleanup_lines,
+                    ]
+                    .concat(),
+                });
             }
-            Err(error) => self.usb_dump_error = Some(error),
+            Ok(UsbOperationSuccess::Mutation {
+                action,
+                model,
+                backup_file,
+                current_values,
+                update_count,
+            }) => {
+                self.usb_operation_result = Some(UsbOperationResultReport {
+                    success: cleanup_is_successful(&cleanup),
+                    headline: if cleanup_is_successful(&cleanup) {
+                        format!("EEPROM {action} completed")
+                    } else {
+                        format!("EEPROM {action} completed; cleanup needs attention")
+                    },
+                    lines: [
+                        vec![
+                            format!("Exact D4 identity/model match confirmed for {model}."),
+                            format!(
+                                "Created and synchronized complete pre-operation backup: {}.",
+                                backup_file.display()
+                            ),
+                            format!(
+                                "Current values captured before the write: {}.",
+                                format_current_values(&current_values)
+                            ),
+                            format!(
+                                "Read-back verification succeeded for all {update_count} written byte(s); rollback was not needed."
+                            ),
+                        ],
+                        cleanup_lines,
+                    ]
+                    .concat(),
+                });
+            }
+            Err(error) => {
+                self.usb_operation_result = Some(UsbOperationResultReport {
+                    success: false,
+                    headline: "Selected-printer operation failed".to_owned(),
+                    lines: [
+                        vec![
+                            error,
+                            "If a write reached EEPROM, the guarded write plan attempted read-back verification and rollback; the operation error reports any rollback failure."
+                                .to_owned(),
+                        ],
+                        cleanup_lines,
+                    ]
+                    .concat(),
+                });
+            }
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    fn poll_usb_eeprom_dump(&mut self) {}
+    fn poll_usb_operation(&mut self) {}
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn start_selected_usb_eeprom_dump(&mut self) {
-        if self.usb_dump_receiver.is_some() {
+    fn start_selected_usb_operation(&mut self, request: UsbOperationRequest) {
+        if self.usb_operation_receiver.is_some() {
+            return;
+        }
+        if matches!(&self.usb_scan_status, UsbScanStatus::Scanning) {
+            self.usb_operation_result = Some(UsbOperationResultReport {
+                success: false,
+                headline: "Selected-printer operation blocked".to_owned(),
+                lines: vec![
+                    "Wait for USB candidate enumeration to finish before starting an operation."
+                        .to_owned(),
+                ],
+            });
             return;
         }
         let Some(candidate) = self.selected_usb_candidate().cloned() else {
             return;
         };
-        if candidate.model_hints.len() != 1 {
-            self.usb_dump_error = Some(
-                "Selected printer candidate must resolve to exactly one model hint before dumping EEPROM.".to_owned(),
-            );
+        let Some(expected_model) = self.selected_usb_model().map(str::to_owned) else {
+            self.usb_operation_result = Some(UsbOperationResultReport {
+                success: false,
+                headline: "Selected-printer operation blocked".to_owned(),
+                lines: vec![
+                    "Select one expected bundled model for the selected candidate before opening USB."
+                        .to_owned(),
+                ],
+            });
             return;
-        }
+        };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        self.usb_dump_receiver = Some(receiver);
-        self.usb_dump_error = None;
+        self.usb_operation_receiver = Some(receiver);
+        self.usb_operation_result = None;
+        let record_traffic = self.debug_traffic.capture_enabled();
         std::thread::spawn(move || {
-            let outcome = dump_selected_usb_eeprom(candidate);
+            let outcome =
+                run_selected_usb_operation(candidate, expected_model, request, record_traffic);
             let _ = sender.send(outcome);
         });
     }
@@ -444,7 +677,25 @@ impl ReinkGui {
                             .selected_text(source_display)
                             .width(320.0)
                             .show_ui(ui, |ui| {
+                                #[cfg(any(
+                                    target_os = "linux",
+                                    target_os = "macos",
+                                    target_os = "windows"
+                                ))]
+                                let source_changes_allowed = !self.usb_operation_in_progress();
+                                #[cfg(not(any(
+                                    target_os = "linux",
+                                    target_os = "macos",
+                                    target_os = "windows"
+                                )))]
+                                let source_changes_allowed = true;
                                 ui.strong("USB descriptor candidates");
+                                if !source_changes_allowed {
+                                    ui.label(
+                                        "Source selection is locked until the selected-printer operation finishes.",
+                                    );
+                                }
+                                ui.add_enabled_ui(source_changes_allowed, |ui| {
                                 if self.usb_candidates.is_empty() {
                                     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                                     ui.label(match &self.usb_scan_status {
@@ -470,9 +721,16 @@ impl ReinkGui {
                                         .clicked()
                                     {
                                         self.selected_usb_candidate = Some(index);
+                                        self.selected_usb_model = (candidate.model_hints.len() == 1)
+                                            .then(|| candidate.model_hints[0].clone());
                                         self.loaded_eeprom = None;
                                         self.selected_fixture = None;
                                         self.show_validation_report = false;
+                                        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                                        {
+                                            self.usb_operation_result = None;
+                                            self.pending_usb_operation = None;
+                                        }
                                     }
                                 }
                                 if self.source_mode.fixtures_enabled() {
@@ -492,9 +750,15 @@ impl ReinkGui {
                                         {
                                             self.loaded_eeprom = None;
                                             self.selected_usb_candidate = None;
+                                            self.selected_usb_model = None;
                                             self.selected_fixture = Some(index);
                                             self.state.select_fixture(index);
                                             self.show_validation_report = false;
+                                            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                                            {
+                                                self.usb_operation_result = None;
+                                                self.pending_usb_operation = None;
+                                            }
                                         }
                                     }
                                 }
@@ -502,6 +766,7 @@ impl ReinkGui {
                                 if ui.button("Open EEPROM file...").clicked() {
                                     open_file = true;
                                 }
+                                });
                             });
                         source_response.response.on_hover_text(source_label);
                         if open_file {
@@ -511,7 +776,8 @@ impl ReinkGui {
                         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                         if ui
                             .add_enabled(
-                                !matches!(&self.usb_scan_status, UsbScanStatus::Scanning),
+                                !matches!(&self.usb_scan_status, UsbScanStatus::Scanning)
+                                    && !self.usb_operation_in_progress(),
                                 egui::Button::new("Refresh USB candidates"),
                             )
                             .clicked()
@@ -523,69 +789,84 @@ impl ReinkGui {
                         ui.label(self.usb_scan_status_label());
 
                         if self.loaded_eeprom.is_some() {
-                            let current_model = self
-                                .loaded_eeprom
-                                .as_ref()
-                                .and_then(|file| file.model.clone());
-                            let mut selected_model = current_model.clone();
-                            let model_names = self
-                                .state
-                                .model_names()
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>();
-                            let filter = RegexBuilder::new(&self.model_filter)
-                                .case_insensitive(true)
-                                .build()
-                                .ok();
-                            let combo_id = ui.make_persistent_id("eeprom-model");
-                            let focus_filter = selected_model.is_none()
-                                && !egui::ComboBox::is_open(ui.ctx(), combo_id);
-                            let model_popup_height =
-                                72.0 + 5.0 * ui.spacing().interact_size.y;
-                            egui::ComboBox::from_id_salt("eeprom-model")
-                                .selected_text(
-                                    selected_model.as_deref().unwrap_or("Select model..."),
-                                )
-                                .width(180.0)
-                                .height(model_popup_height)
-                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                .show_ui(ui, |ui| {
-                                    ui.label("Filter (case-insensitive regex)");
-                                    let filter_response = ui.add(
-                                        egui::TextEdit::singleline(&mut self.model_filter)
-                                            .id_salt("eeprom-model-filter"),
-                                    );
-                                    if focus_filter {
-                                        filter_response.request_focus();
-                                    }
-                                    if !self.model_filter.is_empty() && filter.is_none() {
-                                        ui.colored_label(Color32::RED, "Invalid regular expression");
-                                    }
-                                    ui.separator();
-                                    for model in &model_names {
-                                        if !self.model_filter.is_empty()
-                                            && !filter.as_ref().is_some_and(|regex| regex.is_match(model))
-                                        {
-                                            continue;
+                            if self.selected_usb_candidate().is_some() {
+                                ui.label(
+                                    self.loaded_eeprom
+                                        .as_ref()
+                                        .and_then(|file| file.model.as_deref())
+                                        .unwrap_or("D4-confirmed model unavailable"),
+                                );
+                                ui.label("D4-confirmed model");
+                            } else {
+                                let current_model = self
+                                    .loaded_eeprom
+                                    .as_ref()
+                                    .and_then(|file| file.model.clone());
+                                let mut selected_model = current_model.clone();
+                                let model_names = self
+                                    .state
+                                    .model_names()
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>();
+                                let filter = RegexBuilder::new(&self.model_filter)
+                                    .case_insensitive(true)
+                                    .build()
+                                    .ok();
+                                let combo_id = ui.make_persistent_id("eeprom-model");
+                                let focus_filter = selected_model.is_none()
+                                    && !egui::ComboBox::is_open(ui.ctx(), combo_id);
+                                let model_popup_height =
+                                    72.0 + 5.0 * ui.spacing().interact_size.y;
+                                egui::ComboBox::from_id_salt("eeprom-model")
+                                    .selected_text(
+                                        selected_model.as_deref().unwrap_or("Select model..."),
+                                    )
+                                    .width(180.0)
+                                    .height(model_popup_height)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .show_ui(ui, |ui| {
+                                        ui.label("Filter (case-insensitive regex)");
+                                        let filter_response = ui.add(
+                                            egui::TextEdit::singleline(&mut self.model_filter)
+                                                .id_salt("eeprom-model-filter"),
+                                        );
+                                        if focus_filter {
+                                            filter_response.request_focus();
                                         }
-                                        if ui
-                                            .selectable_label(
-                                                selected_model.as_deref() == Some(model.as_str()),
-                                                model,
-                                            )
-                                            .clicked()
-                                        {
-                                            selected_model = Some(model.clone());
-                                            ui.close();
+                                        if !self.model_filter.is_empty() && filter.is_none() {
+                                            ui.colored_label(
+                                                Color32::RED,
+                                                "Invalid regular expression",
+                                            );
                                         }
+                                        ui.separator();
+                                        for model in &model_names {
+                                            if !self.model_filter.is_empty()
+                                                && !filter
+                                                    .as_ref()
+                                                    .is_some_and(|regex| regex.is_match(model))
+                                            {
+                                                continue;
+                                            }
+                                            if ui
+                                                .selectable_label(
+                                                    selected_model.as_deref()
+                                                        == Some(model.as_str()),
+                                                    model,
+                                                )
+                                                .clicked()
+                                            {
+                                                selected_model = Some(model.clone());
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                if selected_model != current_model {
+                                    if let Some(file) = &mut self.loaded_eeprom {
+                                        file.model = selected_model;
                                     }
-                                });
-                            if selected_model != current_model {
-                                if let Some(file) = &mut self.loaded_eeprom {
-                                    file.model = selected_model;
                                 }
                             }
-                            ui.label("Model");
                         }
                     },
                 );
@@ -595,7 +876,7 @@ impl ReinkGui {
 
     fn status(&mut self, ui: &mut egui::Ui) {
         ui.heading("Printer status");
-        if let Some(candidate) = self.selected_usb_candidate() {
+        if let Some(candidate) = self.selected_usb_candidate().cloned() {
             egui::Grid::new("usb-descriptor-candidate")
                 .num_columns(2)
                 .spacing([18.0, 8.0])
@@ -626,26 +907,137 @@ impl ReinkGui {
                     ui.end_row();
                     ui.label("Bundled model hints");
                     ui.label(if candidate.model_hints.is_empty() {
-                        "No exact VID/PID matches in the bundled model database".to_owned()
+                        "No exact VID/PID associations in the bundled model database".to_owned()
                     } else {
                         candidate.model_hints.join(", ")
                     });
                     ui.end_row();
                 });
             ui.add_space(8.0);
-            ui.label("Hints are not identity confirmation.");
-            ui.strong("No printer connection has been opened");
-            ui.label("Identity/EEPROM reads require a future explicit read-only operation.");
-            if candidate.model_hints.len() == 1 {
-                ui.label(format!("Resolved model hint: {}", candidate.model_hints[0]));
-                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                {
-                    if self.usb_dump_in_progress() {
-                        ui.label("Dumping selected printer EEPROM…");
-                    } else if ui.button("Dump selected printer EEPROM").clicked() {
-                        self.start_selected_usb_eeprom_dump();
-                    }
+            ui.label(
+                "Select an expected model as an operator-supplied guard. VID/PID associations are hints, not printer identity confirmation; every explicit operation reads the D4 identity and requires an exact model match before access.",
+            );
+            let selected_model = self.selected_usb_model.clone();
+            let model_names = self
+                .state
+                .model_names()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let filter = RegexBuilder::new(&self.usb_model_filter)
+                .case_insensitive(true)
+                .build()
+                .ok();
+            let combo_id = ui.make_persistent_id("selected-usb-model");
+            let focus_filter =
+                selected_model.is_none() && !egui::ComboBox::is_open(ui.ctx(), combo_id);
+            let model_popup_height = 72.0 + 5.0 * ui.spacing().interact_size.y;
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            let model_selection_enabled = !self.usb_operation_in_progress();
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            let model_selection_enabled = true;
+            ui.add_enabled_ui(model_selection_enabled, |ui| {
+                egui::ComboBox::from_id_salt("selected-usb-model")
+                    .selected_text(
+                        selected_model
+                            .as_deref()
+                            .unwrap_or("Choose expected model..."),
+                    )
+                    .width(220.0)
+                    .height(model_popup_height)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        ui.label("Filter (case-insensitive regex)");
+                        let filter_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.usb_model_filter)
+                                .id_salt("selected-usb-model-filter"),
+                        );
+                        if focus_filter {
+                            filter_response.request_focus();
+                        }
+                        if !self.usb_model_filter.is_empty() && filter.is_none() {
+                            ui.colored_label(Color32::RED, "Invalid regular expression");
+                        }
+                        ui.separator();
+                        for model in &model_names {
+                            if !self.usb_model_filter.is_empty()
+                                && !filter.as_ref().is_some_and(|regex| regex.is_match(model))
+                            {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(selected_model.as_deref() == Some(model), model)
+                                .clicked()
+                            {
+                                self.selected_usb_model = Some(model.clone());
+                                #[cfg(any(
+                                    target_os = "linux",
+                                    target_os = "macos",
+                                    target_os = "windows"
+                                ))]
+                                {
+                                    self.usb_operation_result = None;
+                                    self.pending_usb_operation = None;
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+            });
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            {
+                let enabled =
+                    self.selected_usb_model().is_some() && !self.usb_operation_in_progress();
+                if self.usb_operation_in_progress() {
+                    ui.strong("A selected-printer operation is running on a worker thread.");
+                } else {
+                    ui.label("No printer connection has been opened until one of these buttons is pressed.");
                 }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Read printer status"))
+                        .clicked()
+                    {
+                        self.start_selected_usb_operation(UsbOperationRequest::Status);
+                    }
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Save complete EEPROM dump..."))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("eeprom-image.bin")
+                            .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
+                            .save_file()
+                        {
+                            self.start_selected_usb_operation(UsbOperationRequest::Dump {
+                                output_file: path,
+                            });
+                        }
+                    }
+                });
+                ui.label(
+                    "Raw identity fields are not retained in the GUI result. The explicitly requested status response is shown in the result pane; EEPROM images are private device-specific files.",
+                );
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            {
+                ui.strong("Selected-printer operations are unavailable on this platform.");
+                ui.add_enabled(false, egui::Button::new("Read printer status"));
+                ui.add_enabled(false, egui::Button::new("Save complete EEPROM dump..."));
+            }
+            if self.selected_usb_model().is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(174, 112, 0),
+                    "Choose one expected model before opening the selected USB interface. It is confirmed only by the exact D4 identity read for the operation.",
+                );
+            }
+            if let Some(file) = &self.loaded_eeprom {
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "Most recent connected image: {} bytes, 0x{:04X}..=0x{:04X}.",
+                    file.bytes.len(),
+                    file.start_address,
+                    file.start_address + file.bytes.len().saturating_sub(1)
+                ));
             }
             return;
         }
@@ -719,10 +1111,10 @@ impl ReinkGui {
 
     fn eeprom_viewer(&mut self, ui: &mut egui::Ui) {
         ui.heading("EEPROM");
-        if self.selected_usb_candidate().is_some() {
+        if self.selected_usb_candidate().is_some() && self.loaded_eeprom.is_none() {
             ui.label("No EEPROM data is available for the selected descriptor-only candidate.");
             ui.label(
-                "No printer connection has been opened; a future explicit read-only operation is required before identity or EEPROM reads.",
+                "No printer connection has been opened; use the Status tab to explicitly save a complete EEPROM dump first.",
             );
             return;
         }
@@ -734,7 +1126,13 @@ impl ReinkGui {
             return;
         }
         if self.loaded_eeprom.is_some() {
-            ui.label("The selected raw EEPROM image is shown below. Choose a model in the tab bar to label known model-specific fields.");
+            if self.selected_usb_candidate().is_some() {
+                ui.label(
+                    "The most recently saved connected EEPROM image is shown below. It is a private device-specific file; displayed values are not a substitute for the pre-write backup taken by a persistent operation.",
+                );
+            } else {
+                ui.label("The selected raw EEPROM image is shown below. Choose a model in the tab bar to label known model-specific fields.");
+            }
         } else {
             ui.label(
                 "The full 256-byte fixture EEPROM is shown below; no physical EEPROM is read, written, backed up, restored, or reset.",
@@ -747,6 +1145,10 @@ impl ReinkGui {
         let selected_value = self.selected_value();
         let selected_label = self.selected_field_label();
         let selected_is_file = self.loaded_eeprom.is_some();
+        let file_start_address = self
+            .loaded_eeprom
+            .as_ref()
+            .map_or(0, |file| file.start_address);
         let file_fields = self.file_fields();
         let mut selected_address_from_dump = None;
         let field_column_width = eeprom_field_column_width(
@@ -801,9 +1203,13 @@ impl ReinkGui {
                                 );
                             } else if selected_is_file {
                                 for field in &file_fields {
-                                    if field.address >= bytes.len() {
+                                    let Some(offset) = eeprom_image_offset(
+                                        file_start_address,
+                                        bytes.len(),
+                                        field.address,
+                                    ) else {
                                         continue;
-                                    }
+                                    };
                                     ui.separator();
                                     let response = eeprom_table_row(
                                         ui,
@@ -812,7 +1218,7 @@ impl ReinkGui {
                                         value_width,
                                         &format!("0x{:04X}", field.address),
                                         &field.label,
-                                        &format!("0x{:02X}", bytes[field.address]),
+                                        &format!("0x{:02X}", bytes[offset]),
                                         field.address == selected_address,
                                         false,
                                         42.0,
@@ -845,27 +1251,44 @@ impl ReinkGui {
                             }
                         });
                     ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        let mut direct_editing = false;
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                    if self.selected_usb_candidate().is_some() {
+                        let enabled = self.selected_usb_model().is_some()
+                            && !self.usb_operation_in_progress();
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new("Prepare guarded write of selected byte..."),
+                            )
+                            .clicked()
+                        {
+                            self.pending_usb_operation = Some(PendingUsbOperation::Write {
+                                address: format!("0x{selected_address:04X}"),
+                                value: format!("0x{selected_value:02X}"),
+                                backup_file: None,
+                                confirmation: String::new(),
+                            });
+                        }
+                        ui.label(format!(
+                            "Selected cached field: {selected_label} at 0x{selected_address:04X}. The worker reads a complete fresh backup and reports the current value before writing."
+                        ));
+                    } else {
                         ui.add_enabled(
                             false,
-                            egui::Checkbox::new(
-                                &mut direct_editing,
-                                "Enable direct EEPROM editing",
-                            ),
+                            egui::Button::new("Prepare guarded write of selected byte..."),
                         );
-                    });
-                    ui.label("Unavailable in the GUI; confirmed CLI semantic resets remain separately gated after evidence passes.");
-                    ui.add_enabled_ui(false, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Selected field: {} at 0x{selected_address:04X}",
-                                selected_label
-                            ));
-                            let mut value = format!("0x{selected_value:02X}");
-                            ui.add(egui::TextEdit::singleline(&mut value).desired_width(80.0));
-                        });
-                    });
+                        ui.label(
+                            "Writing requires an explicit selected USB candidate, exact identity/model match, a create-new backup, and a typed confirmation.",
+                        );
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                    {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new("Prepare guarded write of selected byte..."),
+                        );
+                        ui.label("Selected-printer EEPROM writes are unavailable on this platform.");
+                    }
                 },
             );
             ui.separator();
@@ -931,11 +1354,123 @@ impl ReinkGui {
     fn tools(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         if self.selected_usb_candidate().is_some() {
-            ui.label("Connected operations are unavailable for this descriptor-only candidate.");
             ui.label(
-                "No printer connection has been opened, and fixture validation cannot run against a USB candidate.",
+                "Selected-printer operations are explicit, run on a worker thread, and never run when selecting this candidate.",
             );
-            ui.add_enabled(false, egui::Button::new("Run validation"));
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            {
+                let enabled =
+                    self.selected_usb_model().is_some() && !self.usb_operation_in_progress();
+                if self.selected_usb_model().is_none() {
+                    ui.colored_label(
+                        Color32::from_rgb(174, 112, 0),
+                        "Choose an expected model on the Status tab before enabling connected operations.",
+                    );
+                }
+                if self.usb_operation_in_progress() {
+                    ui.strong("A selected-printer operation is running on a worker thread.");
+                }
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Durable EEPROM dump");
+                    ui.label(
+                        "Reads a complete model-bounded image only after an exact D4 identity/model match, then creates a new user-selected private file.",
+                    );
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Save complete EEPROM dump..."))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("eeprom-image.bin")
+                            .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
+                            .save_file()
+                        {
+                            self.start_selected_usb_operation(UsbOperationRequest::Dump {
+                                output_file: path,
+                            });
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Generic EEPROM byte write");
+                    ui.label(
+                        "The confirmation dialog validates one model-bounded address/value, requires a create-new full backup, then uses read-back verification and rollback-on-failure.",
+                    );
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Prepare guarded EEPROM write..."))
+                        .clicked()
+                    {
+                        self.pending_usb_operation = Some(PendingUsbOperation::Write {
+                            address: String::new(),
+                            value: String::new(),
+                            backup_file: None,
+                            confirmation: String::new(),
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("EEPROM restore");
+                    ui.label(
+                        "Select a complete image and a separate new rollback backup. The model range and image length are validated before USB opens.",
+                    );
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Choose image and prepare restore..."))
+                        .clicked()
+                    {
+                        self.pending_usb_operation = Some(PendingUsbOperation::Restore {
+                            restore_image: None,
+                            backup_file: None,
+                            confirmation: String::new(),
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Model-aware counter reset");
+                    ui.label(
+                        "Only explicitly declared model reset bytes are eligible; missing reset metadata is never substituted with zero.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Prepare waste reset..."))
+                            .clicked()
+                        {
+                            self.pending_usb_operation = Some(PendingUsbOperation::Reset {
+                                target: CounterResetTarget::Waste,
+                                backup_file: None,
+                                confirmation: String::new(),
+                            });
+                        }
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new("Prepare platen-pad reset..."),
+                            )
+                            .clicked()
+                        {
+                            self.pending_usb_operation = Some(PendingUsbOperation::Reset {
+                                target: CounterResetTarget::PlatenPad,
+                                backup_file: None,
+                                confirmation: String::new(),
+                            });
+                        }
+                    });
+                });
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            {
+                ui.strong("Selected-printer operations are unavailable on this platform.");
+                ui.add_enabled(false, egui::Button::new("Save complete EEPROM dump..."));
+                ui.add_enabled(false, egui::Button::new("Prepare guarded EEPROM write..."));
+                ui.add_enabled(
+                    false,
+                    egui::Button::new("Choose image and prepare restore..."),
+                );
+                ui.add_enabled(false, egui::Button::new("Prepare waste reset..."));
+                ui.add_enabled(false, egui::Button::new("Prepare platen-pad reset..."));
+            }
             return;
         }
         if self.loaded_eeprom.is_none() && !self.fixture_selected() {
@@ -985,7 +1520,7 @@ impl ReinkGui {
             ui.heading("Waste-ink counter");
             ui.label("Fixture value: 1,048");
             ui.add_enabled(false, egui::Button::new("Reset to zero"));
-            ui.label("Semantic resets are available only through explicitly gated CLI commands; no GUI reset path is linked.");
+            ui.label("Fixture resets are intentionally unavailable; selected-printer resets require the guarded controls for a real USB candidate.");
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1003,11 +1538,264 @@ impl ReinkGui {
                 "Persistent writes require a complete backup and command-specific confirmations.",
             );
             ui.label(
-                "The GUI remains disabled until separately enabled and validated; use only gated write-evidence or confirmed CLI workflows after evidence passes.",
+                "Fixtures cannot select a USB target or create a backup. Use a real selected candidate for the separately gated controls.",
             );
             ui.add_enabled(false, egui::Button::new("Choose EEPROM backup..."));
             ui.label("GUI backup selection is intentionally unavailable.");
         });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn selected_operation_dialog(&mut self, context: &egui::Context) {
+        let Some(mut pending) = self.pending_usb_operation.take() else {
+            return;
+        };
+        let title = match &pending {
+            PendingUsbOperation::Write { .. } => "Confirm guarded EEPROM write",
+            PendingUsbOperation::Restore { .. } => "Confirm guarded EEPROM restore",
+            PendingUsbOperation::Reset { target, .. } => match *target {
+                CounterResetTarget::Waste => "Confirm guarded waste-counter reset",
+                CounterResetTarget::PlatenPad => "Confirm guarded platen-pad reset",
+            },
+        };
+        let expected_model = self.selected_usb_model().map(str::to_owned);
+        let spec = expected_model
+            .as_deref()
+            .and_then(|model| self.state.model_spec(model))
+            .cloned();
+        let mut open = true;
+        let mut close_dialog = false;
+        let mut dispatch = None;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(580.0)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.strong("This dialog does not start an operation by itself.");
+                ui.label(
+                    "The worker will re-read the exact D4 identity, require it to match this expected model, create and sync a new complete backup, then perform the confirmed action.",
+                );
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "Selected target: {}",
+                    self.selected_usb_candidate()
+                        .map_or("no selected USB candidate", |candidate| candidate.alias.as_str())
+                ));
+                ui.label(format!(
+                    "Expected model: {}",
+                    expected_model.as_deref().unwrap_or("not selected")
+                ));
+                let Some(spec) = spec.as_ref() else {
+                    ui.colored_label(
+                        Color32::from_rgb(181, 47, 47),
+                        "The expected model is no longer valid for this candidate. Close this dialog and select it again on Status.",
+                    );
+                    return;
+                };
+                ui.label(format!(
+                    "Model EEPROM range: 0x{:04X}..=0x{:04X}",
+                    spec.memory_low, spec.memory_high
+                ));
+                ui.separator();
+
+                match &mut pending {
+                    PendingUsbOperation::Write {
+                        address,
+                        value,
+                        backup_file,
+                        confirmation,
+                    } => {
+                        ui.heading("Preflight");
+                        ui.horizontal(|ui| {
+                            ui.label("Address");
+                            ui.add(
+                                egui::TextEdit::singleline(address)
+                                    .hint_text("0x000C or decimal")
+                                    .desired_width(140.0),
+                            );
+                            ui.label("Value");
+                            ui.add(
+                                egui::TextEdit::singleline(value)
+                                    .hint_text("0x00 or decimal")
+                                    .desired_width(120.0),
+                            );
+                        });
+                        let update = parse_u16_input(address)
+                            .and_then(|address| {
+                                parse_u8_input(value).map(|value| (address, value))
+                            })
+                            .and_then(|(address, value)| {
+                                if address < spec.memory_low || address > spec.memory_high {
+                                    Err(format!(
+                                        "Address 0x{address:04X} is outside the selected model range."
+                                    ))
+                                } else {
+                                    Ok((address, value))
+                                }
+                            });
+                        match &update {
+                            Ok((address, value)) => {
+                                ui.label(format!(
+                                    "Requested update: 0x{address:04X} = 0x{value:02X}. The fresh complete backup provides the current value immediately before writing."
+                                ));
+                            }
+                            Err(error) => {
+                                ui.colored_label(Color32::from_rgb(181, 47, 47), error);
+                            }
+                        }
+                        choose_backup_file(ui, backup_file, "eeprom-write-backup.bin");
+                        typed_confirmation(
+                            ui,
+                            confirmation,
+                            EEPROM_WRITE_CONFIRMATION,
+                            "EEPROM write",
+                        );
+                        let run = update.is_ok()
+                            && backup_file.is_some()
+                            && confirmation_matches(confirmation, EEPROM_WRITE_CONFIRMATION);
+                        dialog_actions(
+                            ui,
+                            &mut close_dialog,
+                            run,
+                            "Run confirmed EEPROM write",
+                            || {
+                            let (address, value) =
+                                update.expect("enabled only with a valid EEPROM update");
+                            dispatch = Some(UsbOperationRequest::Write {
+                                updates: vec![(address, value)],
+                                backup_file: backup_file
+                                    .clone()
+                                    .expect("enabled only after backup selection"),
+                            });
+                            },
+                        );
+                    }
+                    PendingUsbOperation::Restore {
+                        restore_image,
+                        backup_file,
+                        confirmation,
+                    } => {
+                        ui.heading("Preflight");
+                        if ui.button("Choose complete EEPROM image...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
+                                .pick_file()
+                            {
+                                *restore_image = Some(preflight_restore_image(&path, spec));
+                            }
+                        }
+                        if let Some(preflight) = restore_image.as_ref() {
+                            ui.monospace(preflight.path.display().to_string());
+                        } else {
+                            ui.label("No restore image selected.");
+                        }
+                        match restore_image.as_ref().map(|preflight| &preflight.result) {
+                            Some(Ok(image)) => {
+                                ui.label(format!(
+                                    "Image validation succeeded: {} model-bounded byte(s) will be restored. A separate fresh current-value backup is still required.",
+                                    image.update_count
+                                ));
+                            }
+                            Some(Err(error)) => {
+                                ui.colored_label(Color32::from_rgb(181, 47, 47), error);
+                            }
+                            None => {}
+                        }
+                        choose_backup_file(ui, backup_file, "eeprom-restore-rollback.bin");
+                        typed_confirmation(
+                            ui,
+                            confirmation,
+                            EEPROM_RESTORE_CONFIRMATION,
+                            "EEPROM restore",
+                        );
+                        let run = restore_image
+                            .as_ref()
+                            .is_some_and(|preflight| preflight.result.is_ok())
+                            && backup_file.is_some()
+                            && confirmation_matches(confirmation, EEPROM_RESTORE_CONFIRMATION);
+                        dialog_actions(
+                            ui,
+                            &mut close_dialog,
+                            run,
+                            "Run confirmed EEPROM restore",
+                            || {
+                            let image = restore_image
+                                .take()
+                                .expect("enabled only with a selected restore image")
+                                .result
+                                .expect("enabled only with a valid restore image")
+                                .bytes;
+                            dispatch = Some(UsbOperationRequest::Restore {
+                                image,
+                                backup_file: backup_file
+                                    .clone()
+                                    .expect("enabled only after backup selection"),
+                            });
+                            },
+                        );
+                    }
+                    PendingUsbOperation::Reset {
+                        target,
+                        backup_file,
+                        confirmation,
+                    } => {
+                        ui.heading("Preflight");
+                        let updates = declared_counter_reset_updates(spec, *target);
+                        match &updates {
+                            Ok(updates) => {
+                                ui.label(format!(
+                                    "Declared {} bytes only: {}.",
+                                    target.display_name(),
+                                    format_updates(updates)
+                                ));
+                            }
+                            Err(error) => {
+                                ui.colored_label(Color32::from_rgb(181, 47, 47), error);
+                            }
+                        }
+                        ui.label(
+                            "The worker captures the current values for these bytes from a fresh full backup before applying this semantic reset.",
+                        );
+                        choose_backup_file(ui, backup_file, "eeprom-reset-backup.bin");
+                        typed_confirmation(
+                            ui,
+                            confirmation,
+                            EEPROM_COUNTER_RESET_CONFIRMATION,
+                            "declared counter reset",
+                        );
+                        let run = updates.is_ok()
+                            && backup_file.is_some()
+                            && confirmation_matches(
+                                confirmation,
+                                EEPROM_COUNTER_RESET_CONFIRMATION,
+                            );
+                        let action_label = target.display_name();
+                        dialog_actions(
+                            ui,
+                            &mut close_dialog,
+                            run,
+                            &format!("Run confirmed {action_label}"),
+                            || {
+                                dispatch = Some(UsbOperationRequest::Reset {
+                                    target: *target,
+                                    backup_file: backup_file
+                                        .clone()
+                                        .expect("enabled only after backup selection"),
+                                });
+                            },
+                        );
+                    }
+                }
+            });
+        if close_dialog {
+            open = false;
+        }
+        if let Some(request) = dispatch {
+            self.start_selected_usb_operation(request);
+        } else if open {
+            self.pending_usb_operation = Some(pending);
+        }
     }
 
     fn debug_traffic_pane(&mut self, ui: &mut egui::Ui) {
@@ -1033,7 +1821,7 @@ impl ReinkGui {
                     self.debug_traffic.set_capture_enabled(capture_enabled);
                 }
                 ui.label(
-                    "Selecting a descriptor candidate alone produces no traffic. Only a future explicit connected read-only operation can append records.",
+                    "Selecting a candidate alone produces no traffic. Transfers are recorded only for an explicit selected-printer operation that starts while this opt-in is enabled; the GUI never exports them.",
                 );
                 ui.add_space(6.0);
                 if self.debug_traffic.count() == 0 {
@@ -1061,8 +1849,17 @@ impl ReinkGui {
                     ui.colored_label(Color32::from_rgb(181, 47, 47), error);
                     ui.add_space(6.0);
                 }
-                if let Some(error) = &self.usb_dump_error {
-                    ui.colored_label(Color32::from_rgb(181, 47, 47), error);
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                if let Some(report) = &self.usb_operation_result {
+                    let color = if report.success {
+                        Color32::from_rgb(36, 130, 76)
+                    } else {
+                        Color32::from_rgb(181, 47, 47)
+                    };
+                    ui.colored_label(color, &report.headline);
+                    for line in &report.lines {
+                        ui.label(line);
+                    }
                     ui.add_space(6.0);
                 }
                 match self.state.page() {
@@ -1128,29 +1925,172 @@ impl ReinkGui {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn dump_selected_usb_eeprom(candidate: DescriptorCandidate) -> UsbEepromDumpOutcome {
-    let hint = candidate
-        .model_hints
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "<missing model hint>".to_owned());
+fn selected_model_for_usb_candidate<'a>(
+    state: &GuiState,
+    candidate: Option<&DescriptorCandidate>,
+    selected_model: Option<&'a str>,
+) -> Option<&'a str> {
+    candidate?;
+    selected_model.filter(|model| state.model_spec(model).is_some())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn expected_restore_image_length(spec: &EpsonSpec) -> usize {
+    usize::from(spec.memory_high).saturating_sub(usize::from(spec.memory_low)) + 1
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn validate_restore_image_size(spec: &EpsonSpec, actual_size: u64) -> Result<usize, String> {
+    let expected_length = expected_restore_image_length(spec);
+    if actual_size != expected_length as u64 {
+        return Err(format!(
+            "EEPROM restore image has {actual_size} bytes; model {} requires exactly {expected_length} bytes for {:#06x}..={:#06x}",
+            spec.model, spec.memory_low, spec.memory_high
+        ));
+    }
+    Ok(expected_length)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn preflight_restore_image(path: &std::path::Path, spec: &EpsonSpec) -> RestoreImagePreflight {
+    let result = (|| {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            format!(
+                "Could not stat selected restore image {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "Selected restore image {} is not a regular file",
+                path.display()
+            ));
+        }
+        let expected_length = validate_restore_image_size(spec, metadata.len())?;
+        let file = File::open(path).map_err(|error| {
+            format!(
+                "Could not open selected restore image {}: {error}",
+                path.display()
+            )
+        })?;
+        let opened_metadata = file.metadata().map_err(|error| {
+            format!(
+                "Could not stat selected restore image {} after opening it: {error}",
+                path.display()
+            )
+        })?;
+        if !opened_metadata.is_file() {
+            return Err(format!(
+                "Selected restore image {} changed to a non-regular file",
+                path.display()
+            ));
+        }
+        validate_restore_image_size(spec, opened_metadata.len())?;
+
+        let mut bytes = Vec::with_capacity(expected_length);
+        let read_limit = (expected_length as u64)
+            .checked_add(1)
+            .expect("EEPROM image length is bounded by u16 addresses");
+        file.take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                format!(
+                    "Could not read selected restore image {}: {error}",
+                    path.display()
+                )
+            })?;
+        let update_count = restore_eeprom_updates(spec, &bytes)?.len();
+        Ok(ValidatedRestoreImage {
+            bytes,
+            update_count,
+        })
+    })();
+    RestoreImagePreflight {
+        path: path.to_path_buf(),
+        result,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn run_selected_usb_operation(
+    candidate: DescriptorCandidate,
+    expected_model: String,
+    request: UsbOperationRequest,
+    record_traffic: bool,
+) -> UsbOperationOutcome {
     let database = match ModelDatabase::builtin() {
         Ok(database) => database,
         Err(error) => {
-            return UsbEepromDumpOutcome {
-                result: Err(format!("model database load failed: {error}")),
+            return UsbOperationOutcome {
+                operation: Err(format!("model database load failed: {error}")),
+                cleanup: UsbSessionCleanup::not_attempted(),
                 events: Vec::new(),
             };
         }
     };
-    let spec = match database.get(&hint).cloned() {
+    let spec = match database.get(&expected_model).cloned() {
         Some(spec) => spec,
         None => {
-            return UsbEepromDumpOutcome {
-                result: Err(format!("unknown EEPROM model hint: {hint}")),
+            return UsbOperationOutcome {
+                operation: Err(format!("unknown selected expected model: {expected_model}")),
+                cleanup: UsbSessionCleanup::not_attempted(),
                 events: Vec::new(),
             };
         }
+    };
+    enum PreparedRequest {
+        Status,
+        Dump(PathBuf),
+        Mutation {
+            action: &'static str,
+            updates: Vec<(u16, u8)>,
+            backup_file: PathBuf,
+        },
+    }
+    let request = match request {
+        UsbOperationRequest::Status => PreparedRequest::Status,
+        UsbOperationRequest::Dump { output_file } => PreparedRequest::Dump(output_file),
+        UsbOperationRequest::Write {
+            updates,
+            backup_file,
+        } => PreparedRequest::Mutation {
+            action: "write",
+            updates,
+            backup_file,
+        },
+        UsbOperationRequest::Restore { image, backup_file } => {
+            match restore_eeprom_updates(&spec, &image) {
+                Ok(updates) => PreparedRequest::Mutation {
+                    action: "restore",
+                    updates,
+                    backup_file,
+                },
+                Err(error) => {
+                    return UsbOperationOutcome {
+                        operation: Err(error),
+                        cleanup: UsbSessionCleanup::not_attempted(),
+                        events: Vec::new(),
+                    };
+                }
+            }
+        }
+        UsbOperationRequest::Reset {
+            target,
+            backup_file,
+        } => match declared_counter_reset_updates(&spec, target) {
+            Ok(updates) => PreparedRequest::Mutation {
+                action: target.display_name(),
+                updates,
+                backup_file,
+            },
+            Err(error) => {
+                return UsbOperationOutcome {
+                    operation: Err(error),
+                    cleanup: UsbSessionCleanup::not_attempted(),
+                    events: Vec::new(),
+                };
+            }
+        },
     };
     let device = reink_usb::UsbDeviceSelector::at_location(
         candidate.vendor_id,
@@ -1162,84 +2102,267 @@ fn dump_selected_usb_eeprom(candidate: DescriptorCandidate) -> UsbEepromDumpOutc
         number: candidate.interface_number,
         alternate_setting: candidate.alternate_setting,
     };
-    let transport = match reink_usb::ReadOnlyUsbTransport::open(device, interface) {
-        Ok(transport) => transport,
-        Err(error) => {
-            return UsbEepromDumpOutcome {
-                result: Err(error.to_string()),
-                events: Vec::new(),
-            };
-        }
-    };
-
-    let recording = RecordingTransport::new(transport);
-    let mut session = match EpsonD4Session::connect_recoverable(recording, spec) {
-        Ok(session) => session,
-        Err((error, recording)) => {
-            let (mut transport, events) = recording.into_parts();
-            let close_error = transport.close().err().map(|error| error.to_string());
-            return UsbEepromDumpOutcome {
-                result: Err(match close_error {
-                    Some(close) => format!(
-                        "Epson D4 session setup failed: {error}; USB transport close failed: {close}"
-                    ),
-                    None => format!("Epson D4 session setup failed: {error}"),
-                }),
-                events,
-            };
-        }
-    };
-
-    let operation_result = (|| -> Result<EepromImage, String> {
-        let identity = session.read_identity().map_err(|error| error.to_string())?;
-        let identity_model = identity
-            .detected_model()
-            .ok_or_else(|| "printer identity did not report a model".to_owned())?;
-        if identity_model != hint {
-            return Err(format!(
-                "selected model hint {hint:?} did not match printer identity {identity_model:?}"
-            ));
-        }
-        session.dump_eeprom().map_err(|error| error.to_string())
-    })();
-    let shutdown_result = session.shutdown().map_err(|error| error.to_string());
-    let recording = session.into_transport();
-    let (mut transport, events) = recording.into_parts();
-    let close_result = transport.close().map_err(|error| error.to_string());
-
-    let result = match (operation_result, shutdown_result, close_result) {
-        (Ok(image), Ok(()), Ok(())) => Ok(image),
-        (Err(operation), Ok(()), Ok(())) => Err(operation),
-        (Ok(_), Err(shutdown), Ok(())) => Err(format!("D4 shutdown failed: {shutdown}")),
-        (Ok(_), Ok(()), Err(close)) => Err(format!("USB transport close failed: {close}")),
-        (Err(operation), Err(shutdown), Ok(())) => {
-            Err(format!("{operation}; D4 shutdown failed: {shutdown}"))
-        }
-        (Err(operation), Ok(()), Err(close)) => {
-            Err(format!("{operation}; USB transport close failed: {close}"))
-        }
-        (Ok(_), Err(shutdown), Err(close)) => Err(format!(
-            "D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
-        )),
-        (Err(operation), Err(shutdown), Err(close)) => Err(format!(
-            "{operation}; D4 shutdown failed: {shutdown}; USB transport close failed: {close}"
-        )),
-    };
-
-    UsbEepromDumpOutcome { result, events }
+    let outcome = with_selected_usb_epson_session(
+        device,
+        interface,
+        spec,
+        record_traffic,
+        move |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            verify_exact_model(&identity, &expected_model)?;
+            match request {
+                PreparedRequest::Status => {
+                    let response = session.read_status().map_err(|error| error.to_string())?;
+                    Ok(UsbOperationSuccess::Status {
+                        model: expected_model,
+                        response_bytes: response.len(),
+                        display: display_status_response(&response),
+                    })
+                }
+                PreparedRequest::Dump(output_file) => {
+                    let image = session.dump_eeprom().map_err(|error| error.to_string())?;
+                    write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
+                    Ok(UsbOperationSuccess::Dump { image, output_file })
+                }
+                PreparedRequest::Mutation {
+                    action,
+                    updates,
+                    backup_file,
+                } => {
+                    let plan = session
+                        .prepare_eeprom_write(&updates)
+                        .map_err(|error| format!("could not prepare EEPROM {action}: {error}"))?;
+                    let current_values = plan
+                        .updates
+                        .iter()
+                        .map(|&(address, _)| {
+                            plan.backup
+                                .value_at(address)
+                                .map(|value| (address, value))
+                                .ok_or_else(|| {
+                                    format!("complete backup did not contain {address:#06x}")
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let current_description = format_current_values(&current_values);
+                    write_new_binary_file(&backup_file, &plan.backup.bytes, "EEPROM backup")
+                        .map_err(|error| {
+                            format!(
+                                "{error}; pre-write current values captured from the complete backup: {current_description}"
+                            )
+                        })?;
+                    session.apply_eeprom_write(&plan).map_err(|error| {
+                        format!(
+                            "EEPROM {action} failed after capturing pre-write current values ({current_description}): {error}"
+                        )
+                    })?;
+                    Ok(UsbOperationSuccess::Mutation {
+                        action,
+                        model: expected_model,
+                        backup_file,
+                        current_values,
+                        update_count: plan.updates.len(),
+                    })
+                }
+            }
+        },
+    );
+    UsbOperationOutcome {
+        operation: outcome.operation,
+        cleanup: outcome.cleanup,
+        events: outcome.events,
+    }
 }
 
 impl eframe::App for ReinkGui {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.poll_usb_candidates();
-        self.poll_usb_eeprom_dump();
+        self.poll_usb_operation();
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        if matches!(&self.usb_scan_status, UsbScanStatus::Scanning) || self.usb_dump_in_progress() {
+        if matches!(&self.usb_scan_status, UsbScanStatus::Scanning)
+            || self.usb_operation_in_progress()
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.render_three_pane_layout(ui);
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        self.selected_operation_dialog(ui.ctx());
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn choose_backup_file(ui: &mut egui::Ui, backup_file: &mut Option<PathBuf>, suggested_name: &str) {
+    if ui.button("Choose new complete backup...").clicked() {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(suggested_name)
+            .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
+            .save_file()
+        {
+            *backup_file = Some(path);
+        }
+    }
+    match backup_file {
+        Some(path) => {
+            ui.monospace(format!("New backup path: {}", path.display()));
+            ui.label("The worker uses create-new semantics and rejects an existing path.");
+        }
+        None => {
+            ui.colored_label(
+                Color32::from_rgb(174, 112, 0),
+                "Choose a new complete backup path before this persistent operation can run.",
+            );
+        }
+    };
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn typed_confirmation(ui: &mut egui::Ui, confirmation: &mut String, required: &str, action: &str) {
+    ui.label(format!("Type this exact confirmation for the {action}:"));
+    ui.monospace(required);
+    ui.add(egui::TextEdit::singleline(confirmation).desired_width(430.0));
+    if !confirmation.is_empty() && !confirmation_matches(confirmation, required) {
+        ui.colored_label(
+            Color32::from_rgb(181, 47, 47),
+            "Confirmation does not exactly match.",
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn confirmation_matches(provided: &str, required: &str) -> bool {
+    provided == required
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn dialog_actions(
+    ui: &mut egui::Ui,
+    open: &mut bool,
+    enabled: bool,
+    label: &str,
+    run: impl FnOnce(),
+) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Cancel").clicked() {
+            *open = false;
+        }
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            run();
+            *open = false;
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn parse_u16_input(value: &str) -> Result<u16, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Enter an EEPROM address.".to_owned());
+    }
+    if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(value, 16).map_err(|_| "Invalid hexadecimal EEPROM address.".to_owned())
+    } else {
+        value
+            .parse::<u16>()
+            .map_err(|_| "Invalid decimal EEPROM address.".to_owned())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn parse_u8_input(value: &str) -> Result<u8, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Enter an EEPROM byte value.".to_owned());
+    }
+    if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u8::from_str_radix(value, 16)
+            .map_err(|_| "Invalid hexadecimal EEPROM byte value.".to_owned())
+    } else {
+        value
+            .parse::<u8>()
+            .map_err(|_| "Invalid decimal EEPROM byte value.".to_owned())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn display_status_response(bytes: &[u8]) -> String {
+    const MAX_STATUS_CHARACTERS: usize = 1_024;
+    match std::str::from_utf8(bytes) {
+        Ok(status) => {
+            let trimmed = status.trim();
+            let mut display = trimmed
+                .chars()
+                .take(MAX_STATUS_CHARACTERS)
+                .collect::<String>();
+            if trimmed.chars().count() > MAX_STATUS_CHARACTERS {
+                display.push_str("… (truncated)");
+            }
+            display
+        }
+        Err(_) => "Binary status response is not shown.".to_owned(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn format_updates(updates: &[(u16, u8)]) -> String {
+    format_current_values(updates)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn format_current_values(values: &[(u16, u8)]) -> String {
+    const DISPLAY_LIMIT: usize = 16;
+    let visible = values
+        .iter()
+        .take(DISPLAY_LIMIT)
+        .map(|(address, value)| format!("0x{address:04X}=0x{value:02X}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if values.len() > DISPLAY_LIMIT {
+        format!("{visible}, … ({} byte(s) total)", values.len())
+    } else if values.is_empty() {
+        "none".to_owned()
+    } else {
+        visible
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn cleanup_is_successful(cleanup: &UsbSessionCleanup) -> bool {
+    matches!(&cleanup.d4_shutdown, UsbCleanupStatus::Succeeded)
+        && matches!(&cleanup.usb_close, UsbCleanupStatus::Succeeded)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn cleanup_report_lines(cleanup: &UsbSessionCleanup) -> Vec<String> {
+    vec![
+        format!(
+            "D4 shutdown: {}.",
+            cleanup_status_label(&cleanup.d4_shutdown)
+        ),
+        format!("USB cleanup: {}.", cleanup_status_label(&cleanup.usb_close)),
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn cleanup_status_label(status: &UsbCleanupStatus) -> String {
+    match status {
+        UsbCleanupStatus::NotAttempted => "not attempted".to_owned(),
+        UsbCleanupStatus::Succeeded => "succeeded".to_owned(),
+        UsbCleanupStatus::Failed(error) => format!("failed ({error})"),
+    }
+}
+
+fn eeprom_image_offset(start_address: usize, byte_count: usize, address: usize) -> Option<usize> {
+    address
+        .checked_sub(start_address)
+        .filter(|offset| *offset < byte_count)
 }
 
 fn eeprom_table_row(
@@ -1477,7 +2600,14 @@ fn status_color(status: ValidationStatus) -> Color32 {
 mod tests {
     use reink_gui::SourceMode;
 
-    use super::source_mode_from_args;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    use super::{
+        confirmation_matches, display_status_response, format_current_values, parse_u8_input,
+        parse_u16_input, selected_model_for_usb_candidate, validate_restore_image_size,
+    };
+    use super::{eeprom_image_offset, source_mode_from_args};
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    use reink_gui::{DescriptorCandidate, GuiState};
 
     #[test]
     fn fixtures_require_an_explicit_flag_and_unknown_arguments_are_ignored() {
@@ -1488,6 +2618,83 @@ mod tests {
         assert_eq!(
             source_mode_from_args(["reink-gui".to_owned(), "--fixtures".to_owned()]),
             SourceMode::Fixtures
+        );
+    }
+
+    #[test]
+    fn model_bounded_image_fields_use_relative_offsets() {
+        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0214), Some(0x14));
+        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x01ff), None);
+        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0220), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn guarded_operation_inputs_require_exact_confirmation_and_bounded_bytes() {
+        assert!(confirmation_matches(
+            "I_CONFIRM_THIS_WILL_WRITE_EEPROM",
+            "I_CONFIRM_THIS_WILL_WRITE_EEPROM"
+        ));
+        assert!(!confirmation_matches(
+            "i_confirm_this_will_write_eeprom",
+            "I_CONFIRM_THIS_WILL_WRITE_EEPROM"
+        ));
+        assert_eq!(parse_u16_input("0x00FF"), Ok(0x00ff));
+        assert_eq!(parse_u16_input("255"), Ok(255));
+        assert!(parse_u16_input("0x10000").is_err());
+        assert_eq!(parse_u8_input("0x7F"), Ok(0x7f));
+        assert!(parse_u8_input("256").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn unassociated_usb_candidate_accepts_only_a_known_expected_model() {
+        let state = GuiState::new().unwrap();
+        let candidate = DescriptorCandidate {
+            alias: "usb-1".to_owned(),
+            vendor_id: 0x04b8,
+            product_id: 0x0001,
+            bus_number: 1,
+            device_address: 1,
+            interface_number: 0,
+            alternate_setting: 0,
+            model_hints: Vec::new(),
+        };
+
+        assert_eq!(
+            selected_model_for_usb_candidate(&state, Some(&candidate), Some("C90")),
+            Some("C90")
+        );
+        assert_eq!(
+            selected_model_for_usb_candidate(&state, Some(&candidate), Some("not-a-model")),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn restore_preflight_rejects_multi_gib_sizes_before_reading() {
+        let state = GuiState::new().unwrap();
+        let spec = state.model_spec("C90").unwrap();
+
+        assert!(validate_restore_image_size(spec, u64::MAX).is_err());
+        assert!(validate_restore_image_size(spec, 0).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn operation_results_bound_private_value_and_status_displays() {
+        assert_eq!(
+            format_current_values(&[(0x0006, 0x18), (0x0007, 0x04)]),
+            "0x0006=0x18, 0x0007=0x04"
+        );
+        assert_eq!(
+            display_status_response(b"@BDC ST2\r\nREADY\r\n"),
+            "@BDC ST2\r\nREADY"
+        );
+        assert_eq!(
+            display_status_response(&[0xff]),
+            "Binary status response is not shown."
         );
     }
 }

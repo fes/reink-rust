@@ -303,6 +303,9 @@ impl fmt::Display for EpsonError {
                         "; rollback failed at {rollback_address:#06x}: {rollback_reason}"
                     )?;
                 }
+                if rollback_errors.is_empty() {
+                    formatter.write_str("; rollback completed for all attempted bytes")?;
+                }
                 Ok(())
             }
             Self::MissingAtomicOriginal { address } => write!(

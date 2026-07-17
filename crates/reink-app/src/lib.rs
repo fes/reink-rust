@@ -3,14 +3,22 @@
 
 use std::error::Error;
 use std::fmt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 
 use reink_core::{
-    EepromReadReply, EepromWriteOptions, EpsonController, EpsonError, EpsonSpec, PrinterIdentity,
+    CounterResetTarget, EepromReadReply, EepromWriteOptions, EpsonController, EpsonError,
+    EpsonSpec, PrinterIdentity,
 };
 use reink_d4::{ChannelId, D4Error, D4Link};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_platform::UsbInterfaceSelector;
 use reink_platform::{ByteTransport, TransportError};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use reink_platform::{RecordingTransport, TransportEvent};
 
 const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@EJL\n";
 const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
@@ -146,6 +154,245 @@ pub struct EepromWritePlan {
     pub updates: Vec<(u16, u8)>,
 }
 
+/// Verifies that a connected printer's normalized model exactly matches the
+/// model selected before a D4 session was opened.
+pub fn verify_exact_model(identity: &PrinterIdentity, expected_model: &str) -> Result<(), String> {
+    match identity.detected_model() {
+        Some(model) if model == expected_model => Ok(()),
+        Some(model) => Err(format!(
+            "printer identity model {model:?} does not match selected model {expected_model:?}"
+        )),
+        None => Err(format!(
+            "printer identity does not contain a model; selected model is {expected_model:?}"
+        )),
+    }
+}
+
+/// Expands a complete restore image into model-bounded EEPROM updates.
+pub fn restore_eeprom_updates(spec: &EpsonSpec, bytes: &[u8]) -> Result<Vec<(u16, u8)>, String> {
+    let expected_length =
+        usize::from(spec.memory_high).saturating_sub(usize::from(spec.memory_low)) + 1;
+    if bytes.len() != expected_length {
+        return Err(format!(
+            "EEPROM restore image has {} bytes; model {} requires exactly {} bytes for {:#06x}..={:#06x}",
+            bytes.len(),
+            spec.model,
+            expected_length,
+            spec.memory_low,
+            spec.memory_high
+        ));
+    }
+    Ok(bytes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(offset, value)| (spec.memory_low + offset as u16, value))
+        .collect())
+}
+
+/// Returns only model bytes with explicitly declared reset values for one
+/// semantic counter family.
+pub fn declared_counter_reset_updates(
+    spec: &EpsonSpec,
+    target: CounterResetTarget,
+) -> Result<Vec<(u16, u8)>, String> {
+    let operation = spec.counter_reset(target).ok_or_else(|| {
+        format!(
+            "model {} has no explicitly declared {} reset bytes",
+            spec.model,
+            target.display_name()
+        )
+    })?;
+    if !operation.has_declared_reset_values() {
+        return Err(format!(
+            "model {} has no explicitly declared {} reset bytes",
+            spec.model,
+            target.display_name()
+        ));
+    }
+    let updates = operation
+        .addresses
+        .into_iter()
+        .zip(operation.reset_values)
+        .collect::<Vec<_>>();
+    validate_eeprom_updates(spec, &updates).map_err(|error| error.to_string())?;
+    Ok(updates)
+}
+
+/// Creates and durably synchronizes a new private binary file without
+/// overwriting an existing path.
+pub fn write_new_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
+    write_new_binary_file_with_parent_sync(path, bytes, kind, sync_parent_directory)
+}
+
+fn write_new_binary_file_with_parent_sync(
+    path: &Path,
+    bytes: &[u8],
+    kind: &str,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("could not create {kind} {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist {kind} {}: {error}", path.display()))?;
+    sync_parent(path).map_err(|error| {
+        format!(
+            "could not durably persist {kind} {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(target_os = "windows")]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?
+        .sync_all()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn sync_parent_directory(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "parent-directory synchronization is not supported on this platform",
+    ))
+}
+
+/// Status of a cleanup stage after a selected USB operation.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UsbCleanupStatus {
+    NotAttempted,
+    Succeeded,
+    Failed(String),
+}
+
+/// D4 and USB cleanup outcomes retained even when the requested operation fails.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsbSessionCleanup {
+    pub d4_shutdown: UsbCleanupStatus,
+    pub usb_close: UsbCleanupStatus,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+impl UsbSessionCleanup {
+    pub const fn not_attempted() -> Self {
+        Self {
+            d4_shutdown: UsbCleanupStatus::NotAttempted,
+            usb_close: UsbCleanupStatus::NotAttempted,
+        }
+    }
+}
+
+/// Result and cleanup record for one explicitly selected USB D4 operation.
+///
+/// `events` is empty unless the caller explicitly enables recording.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Debug)]
+pub struct SelectedUsbSessionOutcome<T> {
+    pub operation: Result<T, String>,
+    pub cleanup: UsbSessionCleanup,
+    pub events: Vec<TransportEvent>,
+}
+
+/// Opens one selected USB interface, runs a caller-authorized D4 operation, and
+/// always attempts orderly D4 and USB cleanup.
+///
+/// This function does not choose a device, model, or operation. Callers must
+/// verify the D4 identity in `operation` before reading model-specific state or
+/// applying a write plan. Transport events are retained only when
+/// `record_traffic` is true.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub fn with_selected_usb_epson_session<T>(
+    device: reink_usb::UsbDeviceSelector,
+    interface: UsbInterfaceSelector,
+    spec: EpsonSpec,
+    record_traffic: bool,
+    operation: impl FnOnce(
+        &mut EpsonD4Session<RecordingTransport<reink_usb::ReadOnlyUsbTransport>>,
+    ) -> Result<T, String>,
+) -> SelectedUsbSessionOutcome<T> {
+    let transport = match reink_usb::ReadOnlyUsbTransport::open(device, interface) {
+        Ok(transport) => transport,
+        Err(error) => {
+            return SelectedUsbSessionOutcome {
+                operation: Err(format!("could not open selected USB interface: {error}")),
+                cleanup: UsbSessionCleanup::not_attempted(),
+                events: Vec::new(),
+            };
+        }
+    };
+    let recording = RecordingTransport::new_with_recording(transport, record_traffic);
+    let mut session = match EpsonD4Session::connect_recoverable(recording, spec) {
+        Ok(session) => session,
+        Err((error, recording)) => {
+            let (mut transport, events) = recording.into_parts();
+            let d4_shutdown = match &error {
+                ApplicationError::SetupRecovered { .. } => UsbCleanupStatus::Succeeded,
+                ApplicationError::SetupRecovery { recovery, .. } => {
+                    UsbCleanupStatus::Failed(recovery.to_string())
+                }
+                _ => UsbCleanupStatus::NotAttempted,
+            };
+            let usb_close = match transport.close() {
+                Ok(()) => UsbCleanupStatus::Succeeded,
+                Err(close) => UsbCleanupStatus::Failed(close.to_string()),
+            };
+            return SelectedUsbSessionOutcome {
+                operation: Err(format!("Epson D4 session setup failed: {error}")),
+                cleanup: UsbSessionCleanup {
+                    d4_shutdown,
+                    usb_close,
+                },
+                events,
+            };
+        }
+    };
+
+    let operation = operation(&mut session);
+    let d4_shutdown = match session.shutdown() {
+        Ok(()) => UsbCleanupStatus::Succeeded,
+        Err(error) => UsbCleanupStatus::Failed(error.to_string()),
+    };
+    let recording = session.into_transport();
+    let (mut transport, events) = recording.into_parts();
+    let usb_close = match transport.close() {
+        Ok(()) => UsbCleanupStatus::Succeeded,
+        Err(error) => UsbCleanupStatus::Failed(error.to_string()),
+    };
+    SelectedUsbSessionOutcome {
+        operation,
+        cleanup: UsbSessionCleanup {
+            d4_shutdown,
+            usb_close,
+        },
+        events,
+    }
+}
+
 impl<T: ByteTransport> EpsonD4Session<T> {
     /// Enters Epson D4 mode, initializes the link, and opens `EPSON-CTRL`.
     pub fn connect(target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
@@ -181,7 +428,7 @@ impl<T: ByteTransport> EpsonD4Session<T> {
                 let target = link.target();
                 let error = match recovery {
                     Some(recovery) => ApplicationError::SetupRecovery { setup, recovery },
-                    None => setup.into(),
+                    None => ApplicationError::SetupRecovered { setup },
                 };
                 return Err((error, target));
             }
@@ -294,9 +541,12 @@ impl<T: ByteTransport> EpsonD4Session<T> {
 
     /// Closes the control channel and terminates the D4 conversation.
     pub fn shutdown(&mut self) -> Result<(), ApplicationError> {
-        self.link.close_channel(self.control_channel)?;
-        self.link.exit()?;
-        Ok(())
+        let close = self.link.close_channel(self.control_channel).err();
+        let exit = self.link.exit().err();
+        match (close, exit) {
+            (None, None) => Ok(()),
+            (close, exit) => Err(ApplicationError::Shutdown { close, exit }),
+        }
     }
 
     pub fn into_transport(self) -> T {
@@ -360,9 +610,16 @@ fn wait_for_entry_reply<T: ByteTransport>(target: &mut T) -> Result<(), Applicat
 pub enum ApplicationError {
     Transport(TransportError),
     D4(D4Error),
+    SetupRecovered {
+        setup: D4Error,
+    },
     SetupRecovery {
         setup: D4Error,
         recovery: D4Error,
+    },
+    Shutdown {
+        close: Option<D4Error>,
+        exit: Option<D4Error>,
     },
     Epson(EpsonError),
     WritePlan(String),
@@ -377,10 +634,39 @@ impl fmt::Display for ApplicationError {
         match self {
             Self::Transport(error) => write!(formatter, "transport error: {error}"),
             Self::D4(error) => write!(formatter, "D4 error: {error}"),
+            Self::SetupRecovered { setup } => write!(
+                formatter,
+                "D4 service setup failed: {setup}; orderly D4 exit succeeded"
+            ),
             Self::SetupRecovery { setup, recovery } => write!(
                 formatter,
                 "D4 service setup failed: {setup}; orderly D4 exit also failed: {recovery}"
             ),
+            Self::Shutdown {
+                close: Some(close),
+                exit: Some(exit),
+            } => write!(
+                formatter,
+                "D4 control channel close failed: {close}; D4 conversation exit also failed: {exit}"
+            ),
+            Self::Shutdown {
+                close: Some(close),
+                exit: None,
+            } => write!(
+                formatter,
+                "D4 control channel close failed: {close}; D4 conversation exit succeeded"
+            ),
+            Self::Shutdown {
+                close: None,
+                exit: Some(exit),
+            } => write!(
+                formatter,
+                "D4 control channel close succeeded; D4 conversation exit failed: {exit}"
+            ),
+            Self::Shutdown {
+                close: None,
+                exit: None,
+            } => unreachable!("shutdown errors contain at least one failure"),
             Self::Epson(error) => write!(formatter, "Epson error: {error}"),
             Self::WritePlan(error) => write!(formatter, "invalid EEPROM write plan: {error}"),
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -398,7 +684,18 @@ impl Error for ApplicationError {
         match self {
             Self::Transport(error) => Some(error),
             Self::D4(error) => Some(error),
-            Self::SetupRecovery { setup, .. } => Some(setup),
+            Self::SetupRecovered { setup } | Self::SetupRecovery { setup, .. } => Some(setup),
+            Self::Shutdown {
+                close: Some(error), ..
+            }
+            | Self::Shutdown {
+                close: None,
+                exit: Some(error),
+            } => Some(error),
+            Self::Shutdown {
+                close: None,
+                exit: None,
+            } => None,
             Self::Epson(error) => Some(error),
             Self::WritePlan(_) => None,
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -435,13 +732,24 @@ impl From<reink_usb::UsbOpenError> for ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use reink_core::{ModelDatabase, encode_command, encode_eeprom_read};
-    use reink_d4::{Packet, ProtocolRevision, TransactionMessage};
+    use std::{
+        cell::Cell,
+        fs, io,
+        path::PathBuf,
+        process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use reink_core::{
+        CounterResetTarget, ModelDatabase, PrinterIdentity, encode_command, encode_eeprom_read,
+    };
+    use reink_d4::{D4Error, Packet, ProtocolRevision, TransactionMessage};
     use reink_platform_test::{SanitizedTranscript, ScriptedTransport, TranscriptTransport};
 
     use super::{
         ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session,
-        FirstWriteBackupGate, validate_eeprom_updates,
+        FirstWriteBackupGate, declared_counter_reset_updates, restore_eeprom_updates,
+        validate_eeprom_updates, verify_exact_model, write_new_binary_file_with_parent_sync,
     };
 
     #[test]
@@ -461,6 +769,36 @@ mod tests {
         gate.record_backup_declined();
 
         assert!(!gate.requires_backup_choice());
+    }
+
+    #[test]
+    fn binary_file_write_is_gated_when_parent_sync_fails() {
+        let path = PathBuf::from(format!(
+            ".reink-parent-sync-gate-{}-{}.bin",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        ));
+        let sync_attempted = Cell::new(false);
+
+        let result = write_new_binary_file_with_parent_sync(&path, b"test", "test file", |_| {
+            sync_attempted.set(true);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "parent directory sync failed",
+            ))
+        });
+
+        assert!(sync_attempted.get());
+        fs::remove_file(&path).expect("test file is cleaned up");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("could not durably persist test file")
+        );
     }
 
     #[test]
@@ -484,6 +822,41 @@ mod tests {
             validate_eeprom_updates(&spec, &[(spec.memory_high.saturating_add(1), 1)]).is_err()
         );
         assert!(validate_eeprom_updates(&spec, &[(spec.memory_low, 1)]).is_ok());
+    }
+
+    #[test]
+    fn selected_model_must_exactly_match_the_connected_identity() {
+        let matching = PrinterIdentity::parse("MFG:EPSON;MDL:C90;SN:private;").unwrap();
+        let mismatched = PrinterIdentity::parse("MFG:EPSON;MDL:XP-352 Series;").unwrap();
+
+        assert!(verify_exact_model(&matching, "C90").is_ok());
+        assert!(verify_exact_model(&mismatched, "C90").is_err());
+    }
+
+    #[test]
+    fn restore_updates_cover_the_exact_model_range() {
+        let spec = spec();
+        let length = usize::from(spec.memory_high).saturating_sub(usize::from(spec.memory_low)) + 1;
+        let image = vec![0x5a; length];
+
+        let updates = restore_eeprom_updates(&spec, &image).unwrap();
+
+        assert_eq!(updates.len(), length);
+        assert_eq!(updates.first(), Some(&(spec.memory_low, 0x5a)));
+        assert_eq!(updates.last(), Some(&(spec.memory_high, 0x5a)));
+        assert!(restore_eeprom_updates(&spec, &image[..length - 1]).is_err());
+    }
+
+    #[test]
+    fn declared_counter_reset_excludes_undeclared_counter_families() {
+        let c90 = spec();
+
+        assert!(
+            !declared_counter_reset_updates(&c90, CounterResetTarget::Waste)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(declared_counter_reset_updates(&c90, CounterResetTarget::PlatenPad).is_err());
     }
 
     fn spec() -> reink_core::EpsonSpec {
@@ -637,6 +1010,101 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_exits_after_close_failure_and_reports_both_failures() {
+        let mut target = SanitizedTranscript::new("D4 shutdown attempts exit after close failure");
+        target.expect_write(EPSON_D4_ENTRY_COMMAND);
+        target.respond_fragmented([
+            EPSON_D4_ENTRY_REPLY[..4].to_vec(),
+            EPSON_D4_ENTRY_REPLY[4..].to_vec(),
+        ]);
+        target.expect_write(Packet::new(0, 0, [0, 0x20], 1, 0).unwrap().encode());
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::InitReply {
+                    result: 0,
+                    revision: ProtocolRevision::V20,
+                },
+                1,
+            ),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x09EPSON-CTRL".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::GetSocketIdReply {
+                    result: 0,
+                    socket_id: 2,
+                    service_name: "EPSON-CTRL".to_owned(),
+                },
+                1,
+            ),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x01\x02\x02\x01\x00\x01\x00\x00\x00".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::OpenChannelReply {
+                    result: 0,
+                    peer_socket: 2,
+                    source_socket: 2,
+                    max_packet_size: 0x100,
+                    max_service_size: 0x100,
+                    max_credit: 0,
+                    granted_credit: 1,
+                },
+                1,
+            ),
+        );
+        target.expect_write(
+            Packet::new(0, 0, b"\x02\x02\x02".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(
+                TransactionMessage::CloseChannelReply {
+                    result: 1,
+                    peer_socket: 2,
+                    source_socket: 2,
+                },
+                1,
+            ),
+        );
+        target.expect_write(Packet::new(0, 0, [0x08], 1, 0).unwrap().encode());
+        respond_fragmented_packet(
+            &mut target,
+            transaction_packet(TransactionMessage::ExitReply { result: 1 }, 1),
+        );
+
+        let mut session = EpsonD4Session::connect(target.into_transport(), spec()).unwrap();
+        let error = session.shutdown().unwrap_err();
+
+        assert!(matches!(
+            &error,
+            ApplicationError::Shutdown {
+                close: Some(D4Error::DeviceRejected { result: 1 }),
+                exit: Some(D4Error::UnexpectedTransactionReply),
+            }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("D4 conversation exit also failed")
+        );
+        session.into_transport().assert_finished();
+    }
+
+    #[test]
     fn rejects_an_unrecognized_epson_entry_reply() {
         let mut target = SanitizedTranscript::new("unrecognized Epson D4 entry reply");
         target.expect_write(EPSON_D4_ENTRY_COMMAND);
@@ -734,7 +1202,7 @@ mod tests {
                 Err(recovery) => recovery,
             };
 
-        assert!(matches!(error, ApplicationError::D4(_)));
+        assert!(matches!(error, ApplicationError::SetupRecovered { .. }));
         target.assert_finished();
     }
 }

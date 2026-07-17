@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
-//! Read-only UI state for the optional ReInk GUI.
+//! Guarded UI state for the optional ReInk GUI.
 //!
 //! Fixtures never open a transport. Connected USB candidates are descriptor-only:
-//! they do not identify a printer or permit device, EEPROM, or maintenance access.
+//! they do not identify a printer or permit device, EEPROM, or maintenance access
+//! until the executable's explicit selected-printer operation is confirmed.
 
 use std::collections::VecDeque;
 
@@ -66,9 +67,9 @@ impl DebugTrafficEntry {
 
 /// Bounded, in-memory debug traffic for the current GUI session.
 ///
-/// Capture is disabled by default. A future explicit connected read-only
-/// operation can pass `RecordingTransport::into_parts().1` to
-/// [`Self::append_events`]; the events are ignored unless capture is enabled.
+/// Capture is disabled by default. An explicit connected operation that sampled
+/// the opt-in before it started can pass `RecordingTransport::into_parts().1`
+/// to [`Self::append_captured_events`].
 #[derive(Debug)]
 pub struct DebugTrafficTrace {
     capture_enabled: bool,
@@ -102,7 +103,32 @@ impl DebugTrafficTrace {
         if !self.capture_enabled {
             return false;
         }
+        self.append_captured(event);
+        true
+    }
 
+    /// Appends ordered `RecordingTransport` events when capture is enabled.
+    ///
+    /// Read events are appended independently, including empty reads, so their
+    /// original boundaries remain visible in the trace.
+    pub fn append_events(&mut self, events: Vec<TransportEvent>) -> usize {
+        events.iter().filter(|event| self.append(event)).count()
+    }
+
+    /// Appends events that were captured under an already sampled explicit
+    /// operation opt-in.
+    ///
+    /// Callers must invoke this only when their operation started with capture
+    /// enabled. It preserves that decision even if the user toggles the
+    /// checkbox while the worker is still completing.
+    pub fn append_captured_events(&mut self, events: Vec<TransportEvent>) -> usize {
+        events
+            .iter()
+            .map(|event| self.append_captured(event))
+            .count()
+    }
+
+    fn append_captured(&mut self, event: &TransportEvent) {
         let (direction, bytes) = match event {
             TransportEvent::Tx(bytes) => (DebugTrafficDirection::Tx, bytes),
             TransportEvent::Rx(bytes) => (DebugTrafficDirection::Rx, bytes),
@@ -114,15 +140,6 @@ impl DebugTrafficTrace {
             direction,
             hex_bytes: format_hex_bytes(bytes),
         });
-        true
-    }
-
-    /// Appends ordered `RecordingTransport` events when capture is enabled.
-    ///
-    /// Read events are appended independently, including empty reads, so their
-    /// original boundaries remain visible in the trace.
-    pub fn append_events(&mut self, events: Vec<TransportEvent>) -> usize {
-        events.iter().filter(|event| self.append(event)).count()
     }
 
     pub fn clear(&mut self) {
@@ -483,6 +500,19 @@ mod tests {
 
         trace.set_capture_enabled(true);
         assert!(trace.append(&event));
+        assert_eq!(trace.count(), 1);
+    }
+
+    #[test]
+    fn sampled_operation_capture_survives_a_later_checkbox_toggle() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.set_capture_enabled(false);
+
+        assert_eq!(
+            trace.append_captured_events(vec![TransportEvent::Tx(vec![0xaa])]),
+            1
+        );
         assert_eq!(trace.count(), 1);
     }
 
