@@ -37,9 +37,10 @@ tool exposes them:
 2. D4 Init request/reply, including the negotiated revision.
 3. `EPSON-CTRL` service lookup and open request/replies.
 4. IEEE 1284 identity request/reply.
-5. EEPROM read request/reply for one address in each supported address-width
+5. Read-only Epson `st` status request/reply.
+6. EEPROM read request/reply for one address in each supported address-width
    family.
-6. Service close and D4 Exit request/replies.
+7. Service close and D4 Exit request/replies.
 
 When possible, also capture intentionally fragmented reads and normal
 back-to-back packets. Do not induce errors or send writes solely to create a
@@ -221,10 +222,15 @@ For an authorized read-only session, retain sanitized evidence of:
 
 1. Protocol version and authentication mode, without secrets.
 2. The IEEE 1284 device-ID OID request and response type.
-3. The Epson control OID request encoding for an identity read, if supported.
-4. Timeout, authentication-failure, and unsupported-OID behavior as observed.
+3. The Epson control OID request encoding for the read-only `st` status request,
+   if supported.
+4. After exact identity/model validation, the Epson control OID request and
+   response type for an in-range EEPROM read, if supported.
+5. Timeout, authentication-failure, and unsupported-OID behavior as observed.
 
 Never retain packet contents that contain SNMP authentication material.
+SNMP status and EEPROM inspection are evidence only: they must not be extended
+to a write, reset, or out-of-range probe.
 
 ## Turning evidence into a test
 

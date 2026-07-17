@@ -50,6 +50,12 @@ impl<'a, C: ControlChannel> EpsonController<'a, C> {
         Ok(PrinterIdentity::parse(identifier)?)
     }
 
+    /// Reads the printer's raw Epson status response without changing printer state.
+    pub fn read_status(&mut self) -> Result<Vec<u8>, EpsonError> {
+        let request = encode_command(*b"st", &[1])?;
+        Ok(self.channel.request(&request)?)
+    }
+
     /// Reads the requested EEPROM addresses in order.
     pub fn read_eeprom(&mut self, addresses: &[u16]) -> Result<Vec<EepromReadReply>, EpsonError> {
         addresses
@@ -307,6 +313,20 @@ mod tests {
         let mut controller = EpsonController::new(&mut channel, &spec);
         assert_eq!(controller.read_identity().unwrap().model(), Some("C90"));
         assert_eq!(controller.read_eeprom(&[0x0c]).unwrap()[0].value, 0x42);
+        channel.assert_finished();
+    }
+
+    #[test]
+    fn reads_raw_printer_status_without_writing() {
+        let spec = spec();
+        let mut channel = ScriptedControlChannel::new();
+        channel.expect_reply(
+            encode_command(*b"st", &[1]).unwrap(),
+            b"@BDC ST2\r\nREADY\r\n",
+        );
+
+        let mut controller = EpsonController::new(&mut channel, &spec);
+        assert_eq!(controller.read_status().unwrap(), b"@BDC ST2\r\nREADY\r\n");
         channel.assert_finished();
     }
 

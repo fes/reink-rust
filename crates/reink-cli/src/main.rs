@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +9,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
-use reink_core::{EpsonSpec, ModelDatabase, PrinterIdentity};
+use reink_core::{EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
@@ -58,6 +57,26 @@ enum Command {
     LocalDevices,
     /// Read an IEEE 1284 device ID via SNMP credentials from the environment.
     SnmpId,
+    /// Read Epson printer status through SNMP after validating the identified model.
+    SnmpStatus,
+    /// Read selected in-range EEPROM addresses through SNMP after an exact model check.
+    SnmpEepromRead {
+        /// Model that must exactly match the SNMP identity read from the printer.
+        #[arg(long)]
+        model: String,
+        /// EEPROM address in decimal or 0x-prefixed hexadecimal; repeat for multiple addresses.
+        #[arg(long, required = true, value_parser = parse_u16)]
+        address: Vec<u16>,
+    },
+    /// Save a complete model-bounded EEPROM image read through SNMP as a new binary file.
+    SnmpEepromDump {
+        /// Model that must exactly match the SNMP identity read from the printer.
+        #[arg(long)]
+        model: String,
+        /// New private binary image path. Existing files are never overwritten.
+        #[arg(long)]
+        output_file: std::path::PathBuf,
+    },
     /// Read a standard USB Printer Class device ID without entering Epson D4 mode.
     UsbId {
         /// USB vendor ID in decimal or 0x-prefixed hexadecimal.
@@ -78,6 +97,30 @@ enum Command {
         /// Optional USB device address; requires --bus-number.
         #[arg(long)]
         device_address: Option<u8>,
+    },
+    /// Read Epson printer status over an explicitly selected USB D4 session.
+    UsbStatus {
+        /// USB vendor ID in decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        /// USB product ID in decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        /// Explicit USB printer interface number.
+        #[arg(long)]
+        interface: u8,
+        /// Explicit alternate setting for the printer interface.
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        /// Optional USB bus number; requires --device-address.
+        #[arg(long)]
+        bus_number: Option<u8>,
+        /// Optional USB device address; requires --bus-number.
+        #[arg(long)]
+        device_address: Option<u8>,
+        /// Model that must exactly match the D4 identity read from the selected printer.
+        #[arg(long)]
+        model: String,
     },
     /// Probe only the Epson D4 entry reply; does not initialize D4 or open a service.
     UsbD4Probe {
@@ -234,6 +277,13 @@ fn run(cli: Cli) -> Result<(), String> {
             let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
             render_identity(&identity, &database, cli.json)
         }
+        Command::SnmpStatus => snmp_status_output(cli.json)?,
+        Command::SnmpEepromRead { model, address } => {
+            snmp_eeprom_read_output(&model, &address, cli.json)?
+        }
+        Command::SnmpEepromDump { model, output_file } => {
+            snmp_eeprom_dump_output(&model, &output_file, cli.json)?
+        }
         Command::UsbId {
             vendor_id,
             product_id,
@@ -248,6 +298,24 @@ fn run(cli: Cli) -> Result<(), String> {
             alternate_setting,
             bus_number,
             device_address,
+            cli.json,
+        )?,
+        Command::UsbStatus {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            model,
+        } => usb_status_output(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+            &model,
             cli.json,
         )?,
         Command::UsbD4Probe {
@@ -410,6 +478,172 @@ fn parse_eeprom_update(value: &str) -> Result<(u16, u8), String> {
     Ok((parse_u16(address)?, parse_u8(byte)?))
 }
 
+fn snmp_status_output(as_json: bool) -> Result<String, String> {
+    let config = SnmpConfig::from_environment().map_err(|error| error.to_string())?;
+    let mut channel = SnmpControlChannel::connect(config).map_err(|error| error.to_string())?;
+    let identity = channel
+        .printer_identity()
+        .map_err(|error| error.to_string())?;
+    let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+    let spec = database.resolve_identity(&identity).ok_or_else(|| {
+        "SNMP printer identity does not resolve to a built-in Epson model; refusing Epson status request"
+            .to_owned()
+    })?;
+    let status = EpsonController::new(&mut channel, spec)
+        .read_status()
+        .map_err(|error| error.to_string())?;
+    Ok(render_printer_status(&spec.model, &status, as_json))
+}
+
+fn snmp_eeprom_read_output(
+    model: &str,
+    addresses: &[u16],
+    as_json: bool,
+) -> Result<String, String> {
+    let spec = selected_model(model)?;
+    validate_eeprom_read_addresses(&spec, addresses)?;
+    let replies = with_validated_snmp_channel(spec, model, |channel, spec| {
+        EpsonController::new(channel, spec)
+            .read_eeprom(addresses)
+            .map_err(|error| error.to_string())
+    })?;
+    Ok(render_eeprom_readings(model, &replies, as_json))
+}
+
+fn snmp_eeprom_dump_output(
+    model: &str,
+    output_file: &Path,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_new_file_path(output_file, "EEPROM image")?;
+    let spec = selected_model(model)?;
+    let start_address = spec.memory_low;
+    let bytes = with_validated_snmp_channel(spec, model, |channel, spec| {
+        let addresses = (spec.memory_low..=spec.memory_high).collect::<Vec<_>>();
+        EpsonController::new(channel, spec)
+            .read_eeprom(&addresses)
+            .map(|replies| {
+                replies
+                    .into_iter()
+                    .map(|reply| reply.value)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.to_string())
+    })?;
+    write_new_binary_file(output_file, &bytes, "EEPROM image")?;
+    Ok(render_eeprom_dump(
+        model,
+        start_address,
+        bytes.len(),
+        output_file,
+        as_json,
+    ))
+}
+
+fn with_validated_snmp_channel<R>(
+    spec: EpsonSpec,
+    expected_model: &str,
+    operation: impl FnOnce(&mut SnmpControlChannel, &EpsonSpec) -> Result<R, String>,
+) -> Result<R, String> {
+    let config = SnmpConfig::from_environment().map_err(|error| error.to_string())?;
+    let mut channel = SnmpControlChannel::connect(config).map_err(|error| error.to_string())?;
+    let identity = channel
+        .printer_identity()
+        .map_err(|error| error.to_string())?;
+    verify_requested_model(&identity, expected_model)?;
+    operation(&mut channel, &spec)
+}
+
+fn render_printer_status(model: &str, status: &[u8], as_json: bool) -> String {
+    let status_text = std::str::from_utf8(status).ok();
+    let status_hex = hex_encode(status);
+    if as_json {
+        json!({
+            "mode": "read_only",
+            "model": model,
+            "status_text": status_text,
+            "status_hex": status_hex,
+        })
+        .to_string()
+    } else {
+        let text = status_text
+            .map(str::escape_default)
+            .map(|escaped| escaped.to_string())
+            .unwrap_or_else(|| "unavailable (non-UTF-8 response)".to_owned());
+        format!("model: {model}\nstatus: {text}\nstatus-hex: {status_hex}")
+    }
+}
+
+fn render_eeprom_readings(model: &str, replies: &[EepromReadReply], as_json: bool) -> String {
+    if as_json {
+        json!({
+            "mode": "read_only",
+            "model": model,
+            "eeprom": replies.iter().map(|reply| json!({
+                "address": format!("{:04X}", reply.address),
+                "value": format!("{:02X}", reply.value),
+            })).collect::<Vec<_>>(),
+        })
+        .to_string()
+    } else {
+        let readings = replies
+            .iter()
+            .map(|reply| format!("{:#06x}: {:#04x}", reply.address, reply.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("model: {model}\n{readings}")
+    }
+}
+
+fn render_eeprom_dump(
+    model: &str,
+    start_address: u16,
+    byte_count: usize,
+    output_file: &Path,
+    as_json: bool,
+) -> String {
+    let end_address = start_address.saturating_add(byte_count.saturating_sub(1) as u16);
+    if as_json {
+        json!({
+            "mode": "read_only",
+            "model": model,
+            "start_address": format!("{start_address:04X}"),
+            "end_address": format!("{end_address:04X}"),
+            "byte_count": byte_count,
+            "output_file": output_file,
+        })
+        .to_string()
+    } else {
+        format!(
+            "Saved {byte_count}-byte EEPROM image for {model} ({start_address:#06x}..={end_address:#06x}) to {}",
+            output_file.display()
+        )
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn validate_eeprom_read_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result<(), String> {
+    if addresses.is_empty() {
+        return Err("at least one --address is required".to_owned());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for &address in addresses {
+        if address < spec.memory_low || address > spec.memory_high {
+            return Err(format!(
+                "EEPROM read address {address:#06x} is outside model range {:#06x}..={:#06x}",
+                spec.memory_low, spec.memory_high
+            ));
+        }
+        if !seen.insert(address) {
+            return Err(format!("EEPROM read address {address:#06x} is duplicated"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn validate_eeprom_updates(spec: &EpsonSpec, updates: &[(u16, u8)]) -> Result<(), String> {
     if updates.is_empty() {
@@ -447,7 +681,6 @@ fn validate_confirmation(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
     if path.exists() {
         return Err(format!(
@@ -515,6 +748,53 @@ fn usb_device_selector(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
+fn usb_status_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: Option<u8>,
+    device_address: Option<u8>,
+    model: &str,
+    as_json: bool,
+) -> Result<String, String> {
+    let spec = selected_model(model)?;
+    let status = with_usb_epson_session(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        spec,
+        |session| {
+            verify_requested_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            session.read_status().map_err(|error| error.to_string())
+        },
+    )?;
+    Ok(render_printer_status(model, &status, as_json))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[allow(clippy::too_many_arguments)]
+fn usb_status_output(
+    _vendor_id: u16,
+    _product_id: u16,
+    _interface: u8,
+    _alternate_setting: u8,
+    _bus_number: Option<u8>,
+    _device_address: Option<u8>,
+    _model: &str,
+    _as_json: bool,
+) -> Result<String, String> {
+    Err("USB printer status is currently supported only on Linux, macOS, or Windows".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn usb_identity_output(
     vendor_id: u16,
     product_id: u16,
@@ -554,7 +834,7 @@ fn usb_eeprom_dump_output(
 ) -> Result<String, String> {
     validate_new_file_path(output_file, "EEPROM image")?;
     let spec = selected_model(model)?;
-    let image = with_usb_eeprom_session(
+    let image = with_usb_epson_session(
         vendor_id,
         product_id,
         interface,
@@ -614,7 +894,7 @@ fn usb_eeprom_write_output(
     let spec = selected_model(model)?;
     validate_eeprom_updates(&spec, updates)?;
 
-    with_usb_eeprom_session(
+    with_usb_epson_session(
         vendor_id,
         product_id,
         interface,
@@ -671,7 +951,7 @@ fn usb_eeprom_restore_output(
     let spec = selected_model(model)?;
     let updates = read_restore_image(input_file, &spec)?;
 
-    with_usb_eeprom_session(
+    with_usb_epson_session(
         vendor_id,
         product_id,
         interface,
@@ -708,7 +988,6 @@ fn usb_eeprom_restore_output(
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn selected_model(model: &str) -> Result<EpsonSpec, String> {
     ModelDatabase::builtin()
         .map_err(|error| error.to_string())?
@@ -717,20 +996,18 @@ fn selected_model(model: &str) -> Result<EpsonSpec, String> {
         .ok_or_else(|| format!("unknown model: {model}"))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn verify_requested_model(identity: &PrinterIdentity, model: &str) -> Result<(), String> {
     match identity.detected_model() {
         Some(detected) if detected == model => Ok(()),
         Some(detected) => Err(format!(
-            "D4 printer identity model {detected:?} does not match requested model {model:?}"
+            "printer identity model {detected:?} does not match requested model {model:?}"
         )),
         None => Err(format!(
-            "D4 printer identity does not contain a model; requested model is {model:?}"
+            "printer identity does not contain a model; requested model is {model:?}"
         )),
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn write_new_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -769,7 +1046,7 @@ fn eeprom_mutation_output(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
-fn with_usb_eeprom_session<R>(
+fn with_usb_epson_session<R>(
     vendor_id: u16,
     product_id: u16,
     interface: u8,
@@ -1024,12 +1301,13 @@ fn write_stdout(output: &str) -> Result<(), String> {
 mod tests {
     use clap::Parser;
 
-    use reink_core::ModelDatabase;
+    use reink_core::{EepromReadReply, ModelDatabase};
 
     use super::{
         Cli, Command, EEPROM_RESTORE_CONFIRMATION, EEPROM_WRITE_CONFIRMATION, parse_eeprom_update,
-        render_identity, render_models, validate_confirmation, validate_eeprom_updates,
-        validate_new_file_path,
+        render_eeprom_readings, render_identity, render_models, render_printer_status,
+        validate_confirmation, validate_eeprom_read_addresses, validate_eeprom_updates,
+        validate_new_file_path, verify_requested_model,
     };
 
     #[test]
@@ -1044,6 +1322,36 @@ mod tests {
         let cli = Cli::try_parse_from(["reink", "--json", "snmp-id"]).unwrap();
         assert!(cli.json);
         assert!(matches!(cli.command, Command::SnmpId));
+        let cli = Cli::try_parse_from(["reink", "snmp-status"]).unwrap();
+        assert!(matches!(cli.command, Command::SnmpStatus));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "snmp-eeprom-read",
+            "--model",
+            "C90",
+            "--address",
+            "0x000c",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::SnmpEepromRead { model, address }
+                if model == "C90" && address == vec![0x000c]
+        ));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "snmp-eeprom-dump",
+            "--model",
+            "C90",
+            "--output-file",
+            "new-image.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::SnmpEepromDump { model, output_file }
+                if model == "C90" && output_file == std::path::PathBuf::from("new-image.bin")
+        ));
         let cli = Cli::try_parse_from(["reink", "local-devices"]).unwrap();
         assert!(matches!(cli.command, Command::LocalDevices));
         let cli = Cli::try_parse_from([
@@ -1067,6 +1375,31 @@ mod tests {
                 bus_number: None,
                 device_address: None,
             }
+        ));
+        let cli = Cli::try_parse_from([
+            "reink",
+            "usb-status",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::UsbStatus {
+                vendor_id: 0x04b8,
+                product_id: 1234,
+                interface: 0,
+                alternate_setting: 0,
+                bus_number: None,
+                device_address: None,
+                model,
+            } if model == "C90"
         ));
         let cli = Cli::try_parse_from([
             "reink",
@@ -1158,6 +1491,46 @@ mod tests {
         assert_eq!(parse_eeprom_update("12=34").unwrap(), (12, 34));
         assert!(parse_eeprom_update("0x000c").is_err());
         assert!(parse_eeprom_update("0x000c=0x100").is_err());
+    }
+
+    #[test]
+    fn renders_status_without_emitting_terminal_control_characters() {
+        assert_eq!(
+            render_printer_status("C90", b"@BDC ST2\r\nREADY\r\n", false),
+            "model: C90\nstatus: @BDC ST2\\r\\nREADY\\r\\n\nstatus-hex: 40424443205354320D0A52454144590D0A"
+        );
+    }
+
+    #[test]
+    fn renders_read_only_eeprom_values_and_rejects_unsafe_addresses() {
+        let database = ModelDatabase::builtin().unwrap();
+        let spec = database.get("C90").unwrap();
+        assert!(validate_eeprom_read_addresses(spec, &[spec.memory_low, spec.memory_high]).is_ok());
+        assert!(validate_eeprom_read_addresses(spec, &[]).is_err());
+        assert!(validate_eeprom_read_addresses(spec, &[spec.memory_low, spec.memory_low]).is_err());
+        assert!(
+            validate_eeprom_read_addresses(spec, &[spec.memory_high.saturating_add(1)]).is_err()
+        );
+        assert_eq!(
+            render_eeprom_readings(
+                "C90",
+                &[EepromReadReply {
+                    address: 0x0c,
+                    value: 0x42,
+                }],
+                false,
+            ),
+            "model: C90\n0x000c: 0x42"
+        );
+    }
+
+    #[test]
+    fn rejects_a_model_that_does_not_match_the_printer_identity() {
+        let matching = reink_core::PrinterIdentity::parse("MFG:EPSON;MDL:C90;").unwrap();
+        let mismatched = reink_core::PrinterIdentity::parse("MFG:EPSON;MDL:XP-352;").unwrap();
+
+        assert!(verify_requested_model(&matching, "C90").is_ok());
+        assert!(verify_requested_model(&mismatched, "C90").is_err());
     }
 
     #[test]

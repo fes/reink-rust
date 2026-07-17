@@ -758,6 +758,7 @@ impl Error for DeviceIdentityError {
 mod tests {
     use std::collections::VecDeque;
 
+    use reink_core::{EpsonController, ModelDatabase, encode_command, encode_eeprom_read};
     use reink_platform::{ControlChannel, ControlError, TransportErrorKind};
 
     use super::{
@@ -820,6 +821,40 @@ mod tests {
         let mut channel = SnmpControlChannel::with_backend(backend);
 
         assert_eq!(channel.request(&request).unwrap(), vec![0xaa, 0xbb]);
+        channel.into_backend().assert_finished();
+    }
+
+    #[test]
+    fn identity_validated_control_channel_composes_status_and_eeprom_reads() {
+        let spec = ModelDatabase::builtin()
+            .unwrap()
+            .get("C90")
+            .unwrap()
+            .clone();
+        let status_request = encode_command(*b"st", &[1]).unwrap();
+        let eeprom_request = encode_eeprom_read(&spec, 0x0c).unwrap();
+        let mut backend = ScriptedBackend::default();
+        backend.expect(
+            IEEE_1284_DEVICE_ID_OID.to_vec(),
+            Ok(b"MFG:EPSON;MDL:C90;".to_vec()),
+        );
+        backend.expect(
+            epson_control_oid(&status_request),
+            Ok(b"@BDC ST2\r\nREADY\r\n".to_vec()),
+        );
+        backend.expect(
+            epson_control_oid(&eeprom_request),
+            Ok(b"@BDC PS EE:0C4200;".to_vec()),
+        );
+        let mut channel = SnmpControlChannel::with_backend(backend);
+        assert_eq!(
+            channel.printer_identity().unwrap().detected_model(),
+            Some("C90")
+        );
+        let mut controller = EpsonController::new(&mut channel, &spec);
+
+        assert_eq!(controller.read_status().unwrap(), b"@BDC ST2\r\nREADY\r\n");
+        assert_eq!(controller.read_eeprom(&[0x0c]).unwrap()[0].value, 0x42);
         channel.into_backend().assert_finished();
     }
 

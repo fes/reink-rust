@@ -202,6 +202,12 @@ impl<T: ByteTransport> EpsonD4Session<T> {
         Ok(EpsonController::new(&mut channel, &self.spec).read_identity()?)
     }
 
+    /// Reads the printer's raw Epson status response without changing printer state.
+    pub fn read_status(&mut self) -> Result<Vec<u8>, ApplicationError> {
+        let mut channel = self.link.control_channel(self.control_channel)?;
+        Ok(EpsonController::new(&mut channel, &self.spec).read_status()?)
+    }
+
     pub fn read_eeprom(
         &mut self,
         addresses: &[u16],
@@ -545,6 +551,17 @@ mod tests {
             ),
         );
         target.expect_write(
+            Packet::new(2, 2, encode_command(*b"st", &[1]).unwrap(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        respond_fragmented_packet(
+            &mut target,
+            Packet::new(2, 2, b"@BDC ST2\r\nREADY\r\n".to_vec(), 1, 0)
+                .unwrap()
+                .encode(),
+        );
+        target.expect_write(
             Packet::new(2, 2, encode_command(*b"di", &[1]).unwrap(), 1, 0)
                 .unwrap()
                 .encode(),
@@ -591,12 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn opens_a_read_only_session_and_reads_identity_and_eeprom() {
+    fn opens_a_read_only_session_and_reads_status_identity_and_eeprom() {
         let spec = spec();
         let target = read_only_d4_transcript(&spec);
 
         let mut session = EpsonD4Session::connect(target, spec).unwrap();
 
+        assert_eq!(session.read_status().unwrap(), b"@BDC ST2\r\nREADY\r\n");
         assert_eq!(session.read_identity().unwrap().model(), Some("C90"));
         assert_eq!(session.read_eeprom(&[0x0c]).unwrap()[0].value, 0x42);
         session.shutdown().unwrap();

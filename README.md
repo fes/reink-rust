@@ -35,14 +35,14 @@ specific gate.
 | OS-neutral transport and discovery contracts | Implemented |
 | Scripted test transports, control channels, and discovery | Implemented |
 | IEEE 1284 identity parsing | Implemented |
-| Epson model database, command encoding, and EEPROM reply parsing | Implemented |
+| Epson model database, command encoding, printer status, and EEPROM reply parsing | Implemented |
 | IEEE 1284.4 framing, transactions, and service channels | Implemented |
-| Epson command execution and EEPROM read/write orchestration | Implemented with scripted tests and core verification |
-| Epson D4 application service with write plans | Implemented; used by the gated hardware write-evidence workflow |
+| Epson command execution, read-only status, and EEPROM read/write orchestration | Implemented with scripted tests and core verification |
+| Epson D4 application service with status and write plans | Implemented; used by explicit read workflows and the gated hardware write-evidence workflow |
 | Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; used by explicit read workflows and gated write evidence |
-| SNMP control adapter and mDNS discovery | Implemented with deterministic tests |
+| SNMP control adapter, safe Epson status/EEPROM inspection, and mDNS discovery | Implemented with deterministic tests |
 | Windows native USB sessions | Implemented through libusb; no automatic write path |
-| CLI inspection and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
+| CLI inspection, selected USB status, SNMP EEPROM inspection, and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
 | Read-only terminal UI model browser | Implemented |
 
 ## Porting approach
@@ -175,7 +175,7 @@ typed, transport-independent operations:
 - encode regular Epson commands and factory EEPROM read/write commands;
 - parse EEPROM read replies without treating malformed responses as successful
   values;
-- execute identity, EEPROM read, EEPROM write, and waste-counter reset
+- execute identity, raw printer status, EEPROM read, EEPROM write, and waste-counter reset
   operations through an abstract `ControlChannel`.
 
 EEPROM writes use read-back verification by default. Atomic writes read all
@@ -215,7 +215,7 @@ cargo test -p reink-d4
 `reink-app::EpsonD4Session` is the application-service boundary between a
 selected `ByteTransport` and the Epson controller. It sends the source-
 compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
-exposes identity, EEPROM, and validated write-plan operations. It also closes
+exposes identity, raw status, EEPROM, and validated write-plan operations. It also closes
 the service channel and terminates D4 through `shutdown()`.
 
 On Linux, macOS, and Windows, `probe_epson_d4_entry` is the separate safe entry-probe API used by
@@ -236,10 +236,12 @@ cargo test -p reink-app
 
 `reink-snmp` provides a synchronous SNMP v1/v2c/v3 adapter. It maps Epson
 control requests to the vendor enterprise OID and reads the printer's IEEE
-1284 device ID through the documented Printer-MIB extension OID. The library
-redacts communities and USM credentials from debug output. `SnmpConfig` can
-load credentials from `REINK_SNMP_*` environment variables so read-only host
-applications and the CLI do not place secrets in command arguments.
+1284 device ID through the documented Printer-MIB extension OID. The CLI
+composes that control channel with the core controller only for read-only
+status and EEPROM inspection; it exposes no SNMP write or reset command. The
+library redacts communities and USM credentials from debug output. `SnmpConfig`
+can load credentials from `REINK_SNMP_*` environment variables so read-only
+host applications and the CLI do not place secrets in command arguments.
 
 `reink-discovery` browses `_ipp._tcp.local.`, `_ipps._tcp.local.`, and
 `_printer._tcp.local.` using mDNS. Discovery results are network locations;
@@ -301,6 +303,23 @@ or a bounded byte count:
 ```powershell
 cargo run -p reink-cli -- usb-d4-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number>
 ```
+
+`usb-status` opens a normal selected D4 session, reads the D4 identity, and
+requires its model to exactly match `--model` before sending the read-only Epson
+`st` request. It always follows the same orderly D4 shutdown and USB close
+path as EEPROM inspection. It does not invoke `usb-d4-probe`, write EEPROM,
+reset a counter, or issue any other mutation:
+
+```powershell
+cargo run -p reink-cli -- usb-status --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model>
+```
+
+On Linux, this uses the existing selected-interface driver handoff and cleanup
+path; it detaches and reattaches only a driver ReInk detached. The safe Linux
+inspection surfaces are `local-devices`, `usb-id`, `usb-status`,
+`usb-eeprom-dump`, `snmp-id`, `snmp-status`, `snmp-eeprom-read`, and
+`snmp-eeprom-dump`. The opt-in `usb-d4-probe` remains separate and is not part
+of those normal inspection commands.
 
 `usb-eeprom-dump` saves a complete model-bounded binary image. It reads the
 D4 identity in the same session and rejects a model mismatch before reading
@@ -489,14 +508,24 @@ cleanup failure is a nonzero result with explicit remediation; do not retry or
 issue another write until the private report has been reviewed and the original
 byte has been separately verified.
 
-`snmp-id` reads and parses an IEEE 1284 device ID through SNMP. It only reads
-credentials from the process environment:
+`snmp-id` reads and parses an IEEE 1284 device ID through SNMP. `snmp-status`
+first reads that identity and refuses the vendor `st` request unless it resolves
+to a built-in Epson model. `snmp-eeprom-read` and `snmp-eeprom-dump` require an
+explicit built-in `--model`, verify it exactly against the SNMP identity, and
+limit every read to that model's declared range. Dumps create a new binary file
+only after the complete read succeeds. These commands use SNMP GET operations
+only; they do not write EEPROM, reset counters, or probe USB.
+
+All SNMP commands read credentials only from the process environment:
 
 ```powershell
 $env:REINK_SNMP_HOST = "printer.example"
 $env:REINK_SNMP_VERSION = "2c"
 $env:REINK_SNMP_COMMUNITY = "<set outside shell history>"
 cargo run -p reink-cli -- snmp-id
+cargo run -p reink-cli -- snmp-status
+cargo run -p reink-cli -- snmp-eeprom-read --model <model> --address 0x000c
+cargo run -p reink-cli -- snmp-eeprom-dump --model <model> --output-file <new-image.bin>
 ```
 
 `REINK_SNMP_PORT` and `REINK_SNMP_TIMEOUT_SECONDS` are optional and default to
@@ -508,8 +537,10 @@ is needed, both `REINK_SNMP_PRIVACY_PROTOCOL` and
 `des`, `aes128`, `aes192`, and `aes256`.
 
 The CLI never accepts credentials as arguments and emits no credentials in JSON
-or text output. Its EEPROM write and restore commands require the explicit
-confirmations and backup workflow documented above.
+or text output. Status text is terminal-escaped for text output and always
+accompanied by lossless hexadecimal bytes. Its EEPROM write and restore commands
+remain non-default: they require the explicit confirmations and backup workflow
+documented above.
 
 ### `reink-tui`
 
