@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only libusb transport for ReInk printer interfaces"
+description = "USB transports and read-only Windows stock-driver access for ReInk printer interfaces"
 
 [dependencies]
 reink-platform = { path = "../reink-platform" }
@@ -17,3 +17,13 @@ rusb = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rusb = { version = "0.9", features = ["vendored"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }

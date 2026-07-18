@@ -124,6 +124,40 @@ pub struct EpsonD4Session<T> {
     spec: EpsonSpec,
 }
 
+/// Read-only application view of an Epson D4 session.
+///
+/// This view exposes only identity, status, and EEPROM reads. In particular it
+/// has no write-plan preparation or application API, which is the capability
+/// boundary used by the Windows stock-driver backend.
+pub struct ReadOnlyEpsonD4Session<'a, T> {
+    session: &'a mut EpsonD4Session<T>,
+}
+
+impl<T: ByteTransport> ReadOnlyEpsonD4Session<'_, T> {
+    pub fn spec(&self) -> &EpsonSpec {
+        self.session.spec()
+    }
+
+    pub fn read_identity(&mut self) -> Result<PrinterIdentity, ApplicationError> {
+        self.session.read_identity()
+    }
+
+    pub fn read_status(&mut self) -> Result<Vec<u8>, ApplicationError> {
+        self.session.read_status()
+    }
+
+    pub fn read_eeprom(
+        &mut self,
+        addresses: &[u16],
+    ) -> Result<Vec<EepromReadReply>, ApplicationError> {
+        self.session.read_eeprom(addresses)
+    }
+
+    pub fn dump_eeprom(&mut self) -> Result<EepromImage, ApplicationError> {
+        self.session.dump_eeprom()
+    }
+}
+
 /// A complete, read-only EEPROM image for one resolved model range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EepromImage {
@@ -373,6 +407,84 @@ pub fn with_selected_usb_epson_session<T>(
     };
 
     let operation = operation(&mut session);
+    let d4_shutdown = match session.shutdown() {
+        Ok(()) => UsbCleanupStatus::Succeeded,
+        Err(error) => UsbCleanupStatus::Failed(error.to_string()),
+    };
+    let recording = session.into_transport();
+    let (mut transport, events) = recording.into_parts();
+    let usb_close = match transport.close() {
+        Ok(()) => UsbCleanupStatus::Succeeded,
+        Err(error) => UsbCleanupStatus::Failed(error.to_string()),
+    };
+    SelectedUsbSessionOutcome {
+        operation,
+        cleanup: UsbSessionCleanup {
+            d4_shutdown,
+            usb_close,
+        },
+        events,
+    }
+}
+
+/// Runs one read-only D4 operation through a selected Windows USBPRINT token.
+///
+/// The callback receives only [`ReadOnlyEpsonD4Session`], so generic EEPROM
+/// write, restore, and reset APIs are unavailable through this composition.
+#[cfg(target_os = "windows")]
+pub fn with_selected_windows_native_epson_session<T>(
+    candidate: &reink_usb::WindowsNativePrinterCandidate,
+    spec: EpsonSpec,
+    record_traffic: bool,
+    operation: impl FnOnce(
+        &mut ReadOnlyEpsonD4Session<
+            '_,
+            RecordingTransport<reink_usb::WindowsNativeReadOnlyTransport>,
+        >,
+    ) -> Result<T, String>,
+) -> SelectedUsbSessionOutcome<T> {
+    let transport = match reink_usb::WindowsNativeReadOnlyTransport::open(candidate) {
+        Ok(transport) => transport,
+        Err(error) => {
+            return SelectedUsbSessionOutcome {
+                operation: Err(format!(
+                    "could not open selected Windows stock-driver interface: {error}"
+                )),
+                cleanup: UsbSessionCleanup::not_attempted(),
+                events: Vec::new(),
+            };
+        }
+    };
+    let recording = RecordingTransport::new_with_recording(transport, record_traffic);
+    let mut session = match EpsonD4Session::connect_recoverable(recording, spec) {
+        Ok(session) => session,
+        Err((error, recording)) => {
+            let (mut transport, events) = recording.into_parts();
+            let d4_shutdown = match &error {
+                ApplicationError::SetupRecovered { .. } => UsbCleanupStatus::Succeeded,
+                ApplicationError::SetupRecovery { recovery, .. } => {
+                    UsbCleanupStatus::Failed(recovery.to_string())
+                }
+                _ => UsbCleanupStatus::NotAttempted,
+            };
+            let usb_close = match transport.close() {
+                Ok(()) => UsbCleanupStatus::Succeeded,
+                Err(close) => UsbCleanupStatus::Failed(close.to_string()),
+            };
+            return SelectedUsbSessionOutcome {
+                operation: Err(format!("Epson D4 session setup failed: {error}")),
+                cleanup: UsbSessionCleanup {
+                    d4_shutdown,
+                    usb_close,
+                },
+                events,
+            };
+        }
+    };
+
+    let operation = operation(&mut ReadOnlyEpsonD4Session {
+        session: &mut session,
+    });
     let d4_shutdown = match session.shutdown() {
         Ok(()) => UsbCleanupStatus::Succeeded,
         Err(error) => UsbCleanupStatus::Failed(error.to_string()),

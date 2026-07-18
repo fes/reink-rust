@@ -1,32 +1,34 @@
-#![forbid(unsafe_code)]
-//! USB printer interface selection and libusb transport.
+#![deny(unsafe_code)]
+//! USB printer interface selection, libusb transport, and read-only Windows
+//! stock-driver transport.
 //!
 //! On Linux, operations on an explicitly selected interface temporarily detach
 //! and restore only the active kernel driver that they detached. Its concrete
 //! libusb transport is available on Linux, macOS, and Windows.
 
 mod descriptor;
+mod native;
 mod selection;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod adapter;
+// Raw SetupAPI and overlapped-I/O calls are isolated here. Every unsafe block
+// documents the Windows ownership or buffer invariant it relies on.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+mod windows_native;
 
 /// Controls whether an active Linux kernel driver may be temporarily detached.
 ///
 /// The default automatically detaches and restores the driver for an explicitly
 /// selected interface. This has no driver-management effect on macOS or Windows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UsbDriverHandoff {
     /// Retain a restrictive policy for internal callers that must not detach.
     Refuse,
     /// Temporarily detach an active Linux kernel driver and reattach it on close.
+    #[default]
     TemporarilyDetach,
-}
-
-impl Default for UsbDriverHandoff {
-    fn default() -> Self {
-        Self::TemporarilyDetach
-    }
 }
 
 /// Observed lifecycle of an optional USB driver handoff.
@@ -68,6 +70,11 @@ pub use descriptor::{
     UsbInterfaceDescriptor, UsbPrinterCandidate, select_printer_candidates,
     select_printer_interface,
 };
+pub use native::{
+    BackendCapabilities, NativeCandidateSelectionError, NativePrinterSelector, PrinterBackend,
+    WindowsNativePrinterCandidate, parse_usb_hardware_id, redact_identity_serial_fields,
+    select_native_candidate,
+};
 pub use selection::{
     UsbDeviceDescriptor, UsbDeviceLocation, UsbDeviceSelectionError, UsbDeviceSelector,
     select_usb_device,
@@ -85,6 +92,9 @@ pub type LinuxUsbTransport = ReadOnlyUsbTransport;
 
 #[cfg(target_os = "macos")]
 pub type MacOsUsbTransport = ReadOnlyUsbTransport;
+
+#[cfg(target_os = "windows")]
+pub use windows_native::{WindowsNativeReadOnlyTransport, list_windows_native_printer_candidates};
 
 #[cfg(target_os = "windows")]
 pub type WindowsUsbTransport = ReadOnlyUsbTransport;

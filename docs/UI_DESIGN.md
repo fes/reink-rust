@@ -66,12 +66,14 @@ guarded byte editing continues to operate on one explicit byte.
 
 ## Descriptor-only USB candidates
 
-On Linux, macOS, and Windows, startup and **Refresh USB candidates**
-asynchronously call only `reink_usb::list_printer_candidates()`. The selector shows this distinct
-group before fixtures. Each candidate gets a session-only alias and shows only
-VID/PID, bus/address, interface/alternate setting, and exact bundled VID/PID
-model hints. It must not show USB manufacturer, product, or serial strings.
-Hints are not identity confirmation.
+On Linux and macOS, startup and **Refresh USB candidates** asynchronously list
+libusb descriptor candidates. Windows lists those plus present
+`GUID_DEVINTERFACE_USBPRINT` native candidates. Each candidate gets a
+session-only alias and explicit backend label. Native candidates show only
+VID/PID and an optional MI obtained from documented hardware IDs; they never
+invent bus/address values. The selector must not show serials, raw
+device-instance IDs, interface paths, or arbitrary device strings. Model hints
+remain local VID/PID hints, not identity confirmation.
 
 Enumeration is strictly descriptor-only: it must never open or claim a device,
 detach or hand off a driver, issue a control request, send D4 or EEPROM
@@ -94,16 +96,20 @@ user-selected complete model-length image. The reset dialog derives only
 explicitly declared reset bytes. Every mutation uses `EepromWritePlan` read-back
 verification and rollback-on-failure. Result details include preflight/current
 values and D4/USB cleanup; selecting a candidate never starts any of them.
-Linux restores only a driver the selected transport detached. Windows and macOS
-only claim and release an already libusb-accessible interface; they never
-install, detach, rebind, or change a driver.
+Linux restores only a driver the selected transport detached. Windows and macOS libusb candidates only claim and release an already
+libusb-accessible interface. A Windows native stock-driver candidate instead
+shows status, private-file dump, and serial-redacted status-debug controls with
+a clear read-only explanation. Native dump bytes are not loaded into the UI or
+retained in Debug traffic because EEPROM may contain a serial. Generic write,
+restore, and reset controls are disabled and dispatch is rejected before opening
+it.
 
-Reviewed level-C L1300 results markdown (`reink-results` commit `6459092`,
-`wic_analysis/L1300_WIC_ANALYSIS.md`) records WIC traffic routed through
-Winspool, `spoolsv`, and the Epson driver to USB D4. The exact public versus
-proprietary API boundary remains unknown; do not guess a `WritePrinter`,
-`ReadPrinter`, `ExtEscape`, IOCTL, or other stock-driver backend. This finding
-does not add a Windows stock backend.
+Reviewed level-C L1300 API-boundary evidence now validates an observed WIC read
+route from an opaque direct USB interface handle through `WriteFile`/`ReadFile`.
+It explicitly did not use `WritePrinter`, `ReadPrinter`, `ExtEscape`, or a named
+pipe at the D4 boundary. The GUI uses SetupAPI enumeration and the opaque
+process-local token only; Microsoft USBPRINT-specific documentation still does
+not explicitly define that data plane, and no write/reset behavior was observed.
 
 ## Safety and diagnostics
 
@@ -119,8 +125,10 @@ observations remain visible and do not reset packet reassembly. Selecting a
 descriptor candidate alone produces no traffic. An operation records events
 only when the user
 enabled capture before starting it; only an explicit copy action exports
-captured traffic to the clipboard. Default result panes do not retain raw
-identity fields, and no private image, path, or traffic data is
+captured traffic to the clipboard. For native USBPRINT operations, identity
+serial values are replaced before events enter the pane or clipboard while
+successful TX/RX ordering and boundaries are retained. Default result panes do
+not retain raw identity fields, and no private image, path, or traffic data is
 emitted to default logs.
 
 Physical GUI writes and resets are available only through the explicit guarded

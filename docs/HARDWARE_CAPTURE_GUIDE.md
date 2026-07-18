@@ -137,14 +137,14 @@ runners or use it solely to produce a capture.
 The GUI's connected controls are not evidence runners and never start from
 startup, candidate selection, file selection, or a typed acknowledgement alone.
 On Linux and Windows (and macOS only where the existing libusb interface claim
-is accessible), a user must select one descriptor candidate and one
+is accessible), a user must select one candidate and one
 bundled expected model, then press an operation button. Exact VID/PID
 associations are display hints only. The worker reads the D4 identity and
 refuses any identity/model mismatch before status, dump, or model-specific
 access.
 
 The GUI can save a durable complete dump to a new user-selected private file.
-Generic write, restore, waste reset, and platen-pad reset each require a new
+For a libusb candidate, generic write, restore, waste reset, and platen-pad reset each require a new
 user-selected complete backup path, create and sync that backup before writing,
 and require their respective exact typed confirmation. Restore also requires a
 user-selected complete image of the exact model range. Every mutation uses the
@@ -152,6 +152,13 @@ same guarded read-back and rollback path as the application service; its result
 reports current values, verification or rollback detail, D4 shutdown, and USB
 cleanup. Keep GUI images, backups, displayed values, and opt-in debug traffic
 private and out of default logs and this repository.
+
+A Windows native USBPRINT candidate is different: status, a private-file dump,
+and serial-redacted status debug capture are available, but native dump bytes
+are not loaded/captured in the GUI because EEPROM may contain a serial. Write,
+restore, and reset are disabled and rejected before the native device is
+opened. Selecting the native candidate cannot authorize the separate libusb
+mutation workflow.
 
 ```powershell
 cargo run -p reink-cli -- usb-eeprom-reset --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --target waste --backup-file <new-private-complete-backup.bin> --confirmation I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS
@@ -172,6 +179,33 @@ operation using the complete displayed selector. `model_hints` are only
 bundled-database vendor/product label/filter hints; they are not identity,
 cannot select a device automatically, and may be empty even for Epson devices.
 A later IEEE 1284 identity read is required to confirm the model.
+
+With the normal Windows USBPRINT driver installed, enumerate the separate
+read-only backend:
+
+```powershell
+cargo run -p reink-hardware-test -- windows-native-candidates
+```
+
+SetupAPI provides an opaque process-local token; reports contain only generic
+VID/PID, optional documented MI, backend, capabilities, and local model hints.
+They never contain interface paths, device-instance IDs, or serials. Native
+selection by VID/PID/optional MI must resolve exactly once or it fails safely.
+The standard USB Printer Class device-ID control request is not available
+through this backend; D4 identity is used instead.
+
+```powershell
+cargo run -p reink-hardware-test -- windows-native-d4-identity --vendor-id 0x04b8 --product-id <product-id> --model <model>
+cargo run -p reink-hardware-test -- windows-native-d4-status --vendor-id 0x04b8 --product-id <product-id> --model <model>
+cargo run -p reink-hardware-test -- windows-native-d4-eeprom-read --vendor-id 0x04b8 --product-id <product-id> --model <model> --address 0x000c
+cargo run -p reink-hardware-test -- windows-native-d4-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --model <model>
+```
+
+These commands expose no native write/reset/write-evidence surface. The
+existing `d4-eeprom-write-evidence` command remains an explicit, fully located
+libusb workflow and is never a fallback from native access. The hardware-test
+native dump reports range/count only and deliberately omits EEPROM bytes; use
+the CLI native dump when a private binary image is required.
 
 Before any D4 interaction, use the Linux, macOS, or Windows `usb-id` command with an
 exact vendor/product/interface selection to request the standard USB Printer
@@ -230,16 +264,26 @@ must not be committed.
 
 ### Automated Windows run
 
-For native Windows, use the companion
-`reink-results/run-windows-read-evidence.ps1` runner with explicit
-vendor/product/interface/alternate-setting/bus/device/model parameters. It
-records descriptor candidates first and rejects a selector that does not match
-exactly one candidate. It captures the same preflight (with the D4 entry probe
-skipped), identity, selected reads, model-bounded dump, boundary probe, and
-conditional durable image. All output remains in an ignored private evidence
-directory; the runner does not print private paths or values. Windows commands
-only claim an already libusb-accessible interface and never install, detach,
-rebind, or change a driver.
+The companion `run-windows-read-evidence.ps1` supports two explicit modes. Its
+default `LibUsb` mode uses a complete libusb selector and may safely stop when
+the stock driver owns the interface. `-Backend WindowsNative` uses the
+read-only `windows-native-*` commands with VID/PID/interface selection through
+the normal USBPRINT binding:
+
+```powershell
+cd ..\reink-results
+.\run-windows-read-evidence.ps1 -Backend WindowsNative `
+  -VendorId 0x04b8 -ProductId <product-id> -Model L1300
+```
+
+The native run collects candidates, exact D4 identity, status, selected
+non-sensitive EEPROM reads, a range/count-only hardware-test dump report, and a
+private durable EEPROM image. It does not issue the libusb preflight or
+out-of-range boundary probe because those are not validated stock-driver
+operations. Add `-Interface <mi>` when the candidate report includes an
+interface number or VID/PID alone is ambiguous. Do not silently substitute one
+backend for the other. Neither route installs, detaches, rebinds, or changes a
+Windows driver.
 
 ## Read-only validation matrix
 

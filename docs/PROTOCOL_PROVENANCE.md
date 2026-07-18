@@ -44,6 +44,7 @@ reviewed sanitized provenance evidence or an authoritative source.
 | IEEE 1284 device ID | `reink-core/src/identity.rs` | C: `reinkpy/__init__.py` parser | IEEE 1284 device-ID definition | Pending review |
 | Epson printer status (`st`) | `reink-core/src/controller.rs`, `reink-app/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/epson.py` `do_status()` | Epson documentation or sanitized capture | Scripted core, D4-session, and SNMP-control composition tests; hardware evidence required |
 | USB printer interface selection, standard device ID, and generic bounded bulk exchange | `reink-usb/src/descriptor.rs`, `adapter.rs` | C: `reinkpy/usb.py`; private observed Linux preflight run (not committed provenance evidence) | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-protocol-session device-ID read succeeded on one selected printer; selected Linux operations now automatically hand off and reattach an active driver; reviewed sanitized provenance evidence and clause-level review remain pending |
+| Windows stock-driver USBPRINT enumeration and direct D4 byte transport | `reink-usb/src/native.rs`, `windows_native.rs` | A: Microsoft SetupAPI, file-I/O, and overlapped-I/O API contracts; C: reviewed sanitized WIC/L1300 API-boundary summary | Microsoft SetupAPI and file-I/O documentation; vendor confirmation of USBPRINT data-plane support | SetupAPI discovery, opaque tokens, bounded cancellation, error mapping, and read-only application gating implemented. Observed `CreateFileW`/`WriteFile`/`ReadFile` D4 is validated for the reviewed read workflow; Microsoft USBPRINT-specific documentation does not explicitly bless that data plane |
 | SNMP printer identification and read-only Epson control composition | `reink-snmp/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/snmp.py`; RFC 3805 for standard MIB context | RFC 3805 where applicable; Epson enterprise MIB for private OIDs | Identity-validated status and model-bounded EEPROM CLI surfaces use GET only; deterministic composition tests implemented; private OID evidence still required |
 | Epson EEPROM factory commands and semantic counter plans | `reink-core/src/command.rs`, `controller.rs`, `epson.rs` | C: `reinkpy/epson.py`, model TOML; reviewed sanitized L1300 results in `reink-results` commit `6459092`, `EEPROM_MAP_STATIC_ANALYSIS.md` and `wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md` | Epson documentation or broader reviewed sanitized captures | Reviewed level-C L1300 evidence validates the USB endpoints and factory-read key/command/reply form. It does not validate resets, writes, write order, checksums, or other models |
 | Offline factory-request binary analysis | `reink-cli/src/main.rs` | C: ReInkPy `epson.py` `search_bin()` | No device protocol authority required; input remains local | Deterministic bounded parser tests implemented |
@@ -66,14 +67,23 @@ reviewed sanitized provenance evidence or an authoritative source.
 
 ## Reviewed sanitized L1300 Windows finding
 
-Level-C reviewed results markdown in `reink-results` commit `6459092`
-(`wic_analysis/L1300_WIC_ANALYSIS.md` and
-`wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md`) records an L1300 WIC route through
-Winspool, `spoolsv`, and the Epson driver to USB D4. The exact public versus
-proprietary API boundary remains unknown. In particular, this evidence does not
-identify `WritePrinter`, `ReadPrinter`, `ExtEscape`, an IOCTL, or any other
-backend, so ReInk must not guess one or implement a Windows stock-driver
-transport from this finding.
+The current reviewed technical summary corrects the earlier ProcMon-only
+interpretation. For the observed harmless WIC reads, the D4 boundary was:
+`wicreset.exe` opening an opaque private direct USB device-interface with
+`CreateFileW`, writing D4 with `WriteFile`, and receiving D4 with `ReadFile`.
+The observed frames did not traverse `WritePrinter`, `ReadPrinter`,
+`ExtEscape`, a named pipe, or an Epson helper DLL at that boundary. Surrounding
+spooler/driver initialization was context, not the D4 byte API.
+
+The captured interface path remains private and is neither portable nor a
+selector. ReInk therefore enumerates present `GUID_DEVINTERFACE_USBPRINT`
+interfaces through SetupAPI, correlates generic VID/PID identity from documented
+devnode properties/hardware IDs, treats each path as an opaque process-local
+token, and never emits it. Microsoft documents SetupAPI, `CreateFileW`, and
+overlapped file I/O, but USBPRINT-specific documentation does not explicitly
+guarantee this direct data plane. The evidence observed reads only: no native
+EEPROM write, restore, reset, or write-evidence capability is authorized or
+exposed.
 
 The L1300 read-only map represents `0x0026..0x0027` as a little-endian
 counter. The reviewed result's observed WIC denominator of 11,809 is retained
@@ -142,8 +152,9 @@ the following:
 3. A test proving read-back verification and failure handling.
 4. Application-layer explicit confirmation and device identity display.
 5. No installation, detach, rebind, or association change of a Windows driver.
-   A Windows selected-printer operation may claim only an already
-   libusb-accessible interface and must stop safely if that claim fails.
+   A Windows mutation or write-evidence operation may use only an already
+   libusb-accessible explicit selector. The native USBPRINT backend is excluded
+   from every mutation gate before its handle can be opened.
 6. Explicit authorization for the selected target operation; a prior
    read-only report is useful evidence but is not itself permission.
 7. The exact command acknowledgement: the dedicated evidence command needs its

@@ -9,9 +9,13 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
-use reink_core::{
-    CounterResetTarget, EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity,
+#[cfg(target_os = "windows")]
+use reink_app::{
+    ReadOnlyEpsonD4Session, SelectedUsbSessionOutcome, with_selected_windows_native_epson_session,
 };
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use reink_core::CounterResetTarget;
+use reink_core::{EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
 use reink_discovery::LinuxDeviceFileDiscovery;
 use reink_discovery::MdnsDiscovery;
@@ -37,6 +41,7 @@ enum CounterResetSelection {
     PlatenPad,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl CounterResetSelection {
     const fn target(self) -> CounterResetTarget {
         match self {
@@ -125,6 +130,64 @@ enum Command {
         /// Optional USB device address; requires --bus-number.
         #[arg(long)]
         device_address: Option<u8>,
+    },
+    /// List read-only USBPRINT candidates available through the Windows stock driver.
+    #[cfg(target_os = "windows")]
+    WindowsNativeCandidates,
+    /// Read and validate D4 identity through the read-only Windows stock-driver backend.
+    #[cfg(target_os = "windows")]
+    WindowsNativeIdentity {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        /// Optional USB interface number from a documented hardware ID.
+        #[arg(long)]
+        interface: Option<u8>,
+        /// Expected model used for D4 framing and exact identity validation.
+        #[arg(long)]
+        model: String,
+    },
+    /// Read Epson status through the read-only Windows stock-driver backend.
+    #[cfg(target_os = "windows")]
+    WindowsNativeStatus {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+    },
+    /// Read selected model-bounded EEPROM addresses through Windows USBPRINT.
+    #[cfg(target_os = "windows")]
+    WindowsNativeEepromRead {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, required = true, value_parser = parse_u16)]
+        address: Vec<u16>,
+    },
+    /// Save a model-bounded EEPROM dump read through Windows USBPRINT.
+    #[cfg(target_os = "windows")]
+    WindowsNativeEepromDump {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        /// New private binary image path. Existing files are never overwritten.
+        #[arg(long)]
+        output_file: PathBuf,
     },
     /// Read Epson printer status over an explicitly selected USB D4 session.
     UsbStatus {
@@ -357,6 +420,47 @@ fn run(cli: Cli) -> Result<(), String> {
             alternate_setting,
             bus_number,
             device_address,
+            cli.json,
+        )?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeCandidates => windows_native_candidates_output(cli.json)?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeIdentity {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+        } => windows_native_identity_output(vendor_id, product_id, interface, &model, cli.json)?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeStatus {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+        } => windows_native_status_output(vendor_id, product_id, interface, &model, cli.json)?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeEepromRead {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            address,
+        } => windows_native_eeprom_read_output(
+            vendor_id, product_id, interface, &model, &address, cli.json,
+        )?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeEepromDump {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            output_file,
+        } => windows_native_eeprom_dump_output(
+            vendor_id,
+            product_id,
+            interface,
+            &model,
+            &output_file,
             cli.json,
         )?,
         Command::UsbStatus {
@@ -1035,6 +1139,249 @@ fn read_restore_image(path: &Path, spec: &EpsonSpec) -> Result<Vec<(u16, u8)>, S
         .enumerate()
         .map(|(offset, value)| (spec.memory_low + offset as u16, value))
         .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_candidate(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+) -> Result<reink_usb::WindowsNativePrinterCandidate, String> {
+    let candidates =
+        reink_usb::list_windows_native_printer_candidates().map_err(|error| error.to_string())?;
+    let selector = interface.map_or_else(
+        || reink_usb::NativePrinterSelector::new(vendor_id, product_id),
+        |number| reink_usb::NativePrinterSelector::with_interface(vendor_id, product_id, number),
+    );
+    reink_usb::select_native_candidate(&candidates, selector).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn finish_windows_native_operation<T>(outcome: SelectedUsbSessionOutcome<T>) -> Result<T, String> {
+    let mut errors = Vec::new();
+    let value = match outcome.operation {
+        Ok(value) => Some(value),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    if let reink_app::UsbCleanupStatus::Failed(error) = outcome.cleanup.d4_shutdown {
+        errors.push(format!("D4 shutdown failed: {error}"));
+    }
+    if let reink_app::UsbCleanupStatus::Failed(error) = outcome.cleanup.usb_close {
+        errors.push(format!(
+            "Windows stock-driver transport close failed: {error}"
+        ));
+    }
+    if errors.is_empty() {
+        Ok(value.expect("successful operation retains its value"))
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn with_windows_native_read_session<T>(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    operation: impl FnOnce(
+        &mut ReadOnlyEpsonD4Session<
+            '_,
+            RecordingTransport<reink_usb::WindowsNativeReadOnlyTransport>,
+        >,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    let candidate = windows_native_candidate(vendor_id, product_id, interface)?;
+    let spec = selected_model(model)?;
+    finish_windows_native_operation(with_selected_windows_native_epson_session(
+        &candidate, spec, false, operation,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_candidates_output(as_json: bool) -> Result<String, String> {
+    let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
+    let candidates =
+        reink_usb::list_windows_native_printer_candidates().map_err(|error| error.to_string())?;
+    let rendered = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let model_hints = database
+                .models()
+                .filter(|model| {
+                    database.get(model).is_some_and(|spec| {
+                        spec.vendor_id == candidate.vendor_id
+                            && spec.product_id == Some(candidate.product_id)
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "alias": format!("windows-native-{}", index + 1),
+                "backend": "windows_native_usbprint",
+                "vendor_id": format!("{:04x}", candidate.vendor_id),
+                "product_id": format!("{:04x}", candidate.product_id),
+                "interface": candidate.interface_number,
+                "model_hints": model_hints,
+                "capabilities": {
+                    "d4_read": true,
+                    "usb_device_id": false,
+                    "persistent_mutation": false,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(if as_json {
+        json!({"mode": "read_only", "candidates": rendered}).to_string()
+    } else if rendered.is_empty() {
+        "No present Windows stock-driver USBPRINT candidates.".to_owned()
+    } else {
+        rendered
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{} — {}:{}, interface {}, read-only D4 (no USB device-ID or mutation)",
+                    candidate["alias"].as_str().unwrap_or("windows-native"),
+                    candidate["vendor_id"].as_str().unwrap_or("unknown"),
+                    candidate["product_id"].as_str().unwrap_or("unknown"),
+                    candidate["interface"]
+                        .as_u64()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "not reported".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_identity_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    as_json: bool,
+) -> Result<String, String> {
+    let identity =
+        with_windows_native_read_session(vendor_id, product_id, interface, model, |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            verify_requested_model(&identity, model)?;
+            Ok(identity)
+        })?;
+    Ok(if as_json {
+        json!({
+            "backend": "windows_native_usbprint",
+            "manufacturer": identity.manufacturer(),
+            "model": identity.model(),
+            "detected_model": identity.detected_model(),
+            "command_set": identity.command_set(),
+        })
+        .to_string()
+    } else {
+        format!(
+            "Backend: Windows native USBPRINT (read-only)\nManufacturer: {}\nModel: {}\nCommand set: {}",
+            identity.manufacturer().unwrap_or("unknown"),
+            identity.model().unwrap_or("unknown"),
+            identity.command_set().join(", "),
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_status_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    as_json: bool,
+) -> Result<String, String> {
+    let mut status =
+        with_windows_native_read_session(vendor_id, product_id, interface, model, |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            verify_requested_model(&identity, model)?;
+            session.read_status().map_err(|error| error.to_string())
+        })?;
+    reink_usb::redact_identity_serial_fields(&mut status);
+    Ok(render_printer_status(model, &status, as_json))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_eeprom_read_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    addresses: &[u16],
+    as_json: bool,
+) -> Result<String, String> {
+    let spec = selected_model(model)?;
+    validate_eeprom_read_addresses(&spec, addresses)?;
+    validate_native_sensitive_addresses(&spec, addresses)?;
+    let readings =
+        with_windows_native_read_session(vendor_id, product_id, interface, model, |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            verify_requested_model(&identity, model)?;
+            session
+                .read_eeprom(addresses)
+                .map_err(|error| error.to_string())
+        })?;
+    Ok(render_eeprom_readings(model, &readings, as_json))
+}
+
+#[cfg(target_os = "windows")]
+fn validate_native_sensitive_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result<(), String> {
+    if let Some(address) = addresses.iter().copied().find(|address| {
+        spec.read_only_fields
+            .iter()
+            .any(|field| field.sensitive && (field.address..=field.end_address).contains(address))
+    }) {
+        return Err(format!(
+            "EEPROM address {address:#06x} is part of a sensitive identity field and cannot be displayed by the Windows native command; use a private binary dump if authorized"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_eeprom_dump_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    output_file: &Path,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_new_file_path(output_file, "EEPROM image")?;
+    let image =
+        with_windows_native_read_session(vendor_id, product_id, interface, model, |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            verify_requested_model(&identity, model)?;
+            session.dump_eeprom().map_err(|error| error.to_string())
+        })?;
+    write_new_binary_file(output_file, &image.bytes, "EEPROM image")?;
+    Ok(if as_json {
+        json!({
+            "mode": "read_only",
+            "backend": "windows_native_usbprint",
+            "model": image.model,
+            "start_address": format!("{:04X}", image.start_address),
+            "end_address": format!("{:04X}", image.end_address()),
+            "byte_count": image.bytes.len(),
+            "output_file": output_file,
+        })
+        .to_string()
+    } else {
+        format!(
+            "Saved {}-byte read-only Windows stock-driver EEPROM image for {} to {}",
+            image.bytes.len(),
+            image.model,
+            output_file.display()
+        )
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -1927,6 +2274,36 @@ mod tests {
                 confirmation: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_read_only_windows_native_commands_without_mutation_selectors() {
+        let cli = Cli::try_parse_from([
+            "reink",
+            "windows-native-eeprom-read",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "0x1234",
+            "--interface",
+            "0",
+            "--model",
+            "C90",
+            "--address",
+            "0x000c",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::WindowsNativeEepromRead {
+                vendor_id: 0x04b8,
+                product_id: 0x1234,
+                interface: Some(0),
+                model,
+                address,
+            } if model == "C90" && address == [0x000c]
         ));
     }
 

@@ -88,18 +88,27 @@ impl PrinterIdentity {
 }
 
 /// A malformed printer device identifier.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum IdentityParseError {
     NonAscii,
     MalformedField { field: String },
+}
+
+impl fmt::Debug for IdentityParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonAscii => formatter.write_str("NonAscii"),
+            Self::MalformedField { .. } => formatter.write_str("MalformedField(<redacted>)"),
+        }
+    }
 }
 
 impl fmt::Display for IdentityParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NonAscii => formatter.write_str("IEEE 1284 device ID is not ASCII"),
-            Self::MalformedField { field } => {
-                write!(formatter, "malformed IEEE 1284 device ID field: {field:?}")
+            Self::MalformedField { .. } => {
+                formatter.write_str("malformed IEEE 1284 device ID field")
             }
         }
     }

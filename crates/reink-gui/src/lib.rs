@@ -821,18 +821,48 @@ pub struct FixtureDevice {
 
 /// Descriptor-only USB printer information shown for the current GUI session.
 ///
-/// This intentionally omits USB strings and any device handle. The alias is
-/// session-local and model hints are only exact VID/PID database matches.
+/// This intentionally omits USB strings and public device handles. A native
+/// token, when present, is process-local and redacted by its `Debug`
+/// implementation. The alias is session-local and model hints are only exact
+/// VID/PID database matches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DescriptorCandidateBackend {
+    LibUsb,
+    #[cfg(target_os = "windows")]
+    WindowsNative(reink_usb::WindowsNativePrinterCandidate),
+}
+
+impl DescriptorCandidateBackend {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::LibUsb => "libusb",
+            #[cfg(target_os = "windows")]
+            Self::WindowsNative(_) => "Windows stock driver (read-only)",
+        }
+    }
+
+    pub const fn permits_persistent_mutation(&self) -> bool {
+        matches!(self, Self::LibUsb)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DescriptorCandidate {
     pub alias: String,
+    pub backend: DescriptorCandidateBackend,
     pub vendor_id: u16,
     pub product_id: u16,
-    pub bus_number: u8,
-    pub device_address: u8,
-    pub interface_number: u8,
-    pub alternate_setting: u8,
+    pub bus_number: Option<u8>,
+    pub device_address: Option<u8>,
+    pub interface_number: Option<u8>,
+    pub alternate_setting: Option<u8>,
     pub model_hints: Vec<String>,
+}
+
+impl DescriptorCandidate {
+    pub const fn permits_persistent_mutation(&self) -> bool {
+        self.backend.permits_persistent_mutation()
+    }
 }
 
 fn model_hints_for_usb_candidate(

@@ -12,7 +12,8 @@ use reink_app::{
 use reink_core::{CounterResetTarget, EpsonSpec, ModelDatabase};
 use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
 use reink_gui::{
-    DebugTrafficTrace, DescriptorCandidate, GuiState, Page, SourceMode, ValidationStatus,
+    DebugTrafficTrace, DescriptorCandidate, DescriptorCandidateBackend, GuiState, Page, SourceMode,
+    ValidationStatus,
 };
 use reink_platform::TransportEvent;
 
@@ -50,7 +51,7 @@ pub struct ReinkGui {
     selected_usb_model: Option<String>,
     usb_scan_status: UsbScanStatus,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    usb_scan_receiver: Option<Receiver<Result<Vec<reink_usb::UsbPrinterCandidate>, String>>>,
+    usb_scan_receiver: Option<Receiver<Result<Vec<DescriptorCandidate>, String>>>,
     file_error: Option<String>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     usb_operation_receiver: Option<Receiver<UsbOperationOutcome>>,
@@ -109,6 +110,7 @@ enum UsbOperationSuccess {
     Dump {
         image: EepromImage,
         output_file: PathBuf,
+        load_for_display: bool,
     },
     Mutation {
         action: &'static str,
@@ -422,7 +424,7 @@ impl ReinkGui {
         self.usb_scan_receiver = Some(receiver);
         self.usb_scan_status = UsbScanStatus::Scanning;
         std::thread::spawn(move || {
-            let result = reink_usb::list_printer_candidates().map_err(|error| error.to_string());
+            let result = scan_descriptor_candidates();
             let _ = sender.send(result);
         });
     }
@@ -451,23 +453,7 @@ impl ReinkGui {
         self.usb_scan_receiver = None;
         match result {
             Ok(candidates) => {
-                self.usb_candidates = candidates
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, candidate)| DescriptorCandidate {
-                        alias: format!("usb-{}", index + 1),
-                        vendor_id: candidate.vendor_id,
-                        product_id: candidate.product_id,
-                        bus_number: candidate.bus_number,
-                        device_address: candidate.device_address,
-                        interface_number: candidate.interface_number,
-                        alternate_setting: candidate.alternate_setting,
-                        model_hints: self.state.model_hints_for_usb_candidate(
-                            candidate.vendor_id,
-                            candidate.product_id,
-                        ),
-                    })
-                    .collect();
+                self.usb_candidates = candidates;
                 self.selected_usb_candidate = None;
                 self.selected_usb_model = None;
                 self.usb_scan_status = UsbScanStatus::Ready;
@@ -537,18 +523,27 @@ impl ReinkGui {
                     .concat(),
                 });
             }
-            Ok(UsbOperationSuccess::Dump { image, output_file }) => {
-                self.loaded_eeprom = Some(LoadedEeprom {
-                    path: output_file.display().to_string(),
-                    bytes: image.bytes,
-                    start_address: usize::from(image.start_address),
-                    selected_offset: 0,
-                    model: Some(image.model),
-                });
-                self.selected_fixture = None;
-                self.file_error = None;
-                self.show_validation_report = false;
-                self.state.navigate_to(Page::Eeprom);
+            Ok(UsbOperationSuccess::Dump {
+                image,
+                output_file,
+                load_for_display,
+            }) => {
+                let image_byte_count = image.bytes.len();
+                let image_start_address = usize::from(image.start_address);
+                let image_end_address = image_start_address + image_byte_count.saturating_sub(1);
+                if load_for_display {
+                    self.loaded_eeprom = Some(LoadedEeprom {
+                        path: output_file.display().to_string(),
+                        bytes: image.bytes,
+                        start_address: image_start_address,
+                        selected_offset: 0,
+                        model: Some(image.model),
+                    });
+                    self.selected_fixture = None;
+                    self.file_error = None;
+                    self.show_validation_report = false;
+                    self.state.navigate_to(Page::Eeprom);
+                }
                 self.usb_operation_result = Some(UsbOperationResultReport {
                     success: cleanup_is_successful(&cleanup),
                     headline: if cleanup_is_successful(&cleanup) {
@@ -562,13 +557,16 @@ impl ReinkGui {
                                 .to_owned(),
                             format!(
                                 "Saved a complete {}-byte model-bounded image (0x{:04X}..=0x{:04X}) to {}.",
-                                self.loaded_eeprom.as_ref().map_or(0, |file| file.bytes.len()),
-                                self.loaded_eeprom.as_ref().map_or(0, |file| file.start_address),
-                                self.loaded_eeprom.as_ref().map_or(0, |file| {
-                                    file.start_address + file.bytes.len().saturating_sub(1)
-                                }),
+                                image_byte_count,
+                                image_start_address,
+                                image_end_address,
                                 output_file.display(),
                             ),
+                            if load_for_display {
+                                "The saved image is available in the EEPROM pane.".to_owned()
+                            } else {
+                                "Native dumps are not loaded into the UI and their traffic is not captured, preventing device serial bytes from entering the UI or debug pane.".to_owned()
+                            },
                         ],
                         cleanup_lines,
                     ]
@@ -649,6 +647,23 @@ impl ReinkGui {
         let Some(candidate) = self.selected_usb_candidate().cloned() else {
             return;
         };
+        if matches!(
+            &request,
+            UsbOperationRequest::Write { .. }
+                | UsbOperationRequest::Restore { .. }
+                | UsbOperationRequest::Reset { .. }
+        ) && !candidate.permits_persistent_mutation()
+        {
+            self.usb_operation_result = Some(UsbOperationResultReport {
+                success: false,
+                headline: "Selected-printer operation blocked".to_owned(),
+                lines: vec![
+                    "The Windows stock-driver backend is application-level read-only; write, restore, and reset are rejected before the device is opened."
+                        .to_owned(),
+                ],
+            });
+            return;
+        }
         let Some(expected_model) = self.selected_usb_model().map(str::to_owned) else {
             self.usb_operation_result = Some(UsbOperationResultReport {
                 success: false,
@@ -663,7 +678,14 @@ impl ReinkGui {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         self.usb_operation_receiver = Some(receiver);
         self.usb_operation_result = None;
-        let record_traffic = self.debug_traffic.capture_enabled();
+        #[cfg(target_os = "windows")]
+        let native_dump = matches!(
+            &candidate.backend,
+            DescriptorCandidateBackend::WindowsNative(_)
+        ) && matches!(&request, UsbOperationRequest::Dump { .. });
+        #[cfg(not(target_os = "windows"))]
+        let native_dump = false;
+        let record_traffic = self.debug_traffic.capture_enabled() && !native_dump;
         if record_traffic {
             self.debug_traffic.begin_operation();
         }
@@ -735,15 +757,24 @@ impl ReinkGui {
                                     ui.label("No USB descriptor candidates");
                                 }
                                 for (index, candidate) in self.usb_candidates.iter().enumerate() {
+                                    let selector = match (candidate.bus_number, candidate.device_address) {
+                                        (Some(bus), Some(address)) => format!(
+                                            "bus {bus}, address {address}, interface {} alt {}",
+                                            candidate.interface_number.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
+                                            candidate.alternate_setting.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
+                                        ),
+                                        _ => format!(
+                                            "interface {}",
+                                            candidate.interface_number.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
+                                        ),
+                                    };
                                     let label = format!(
-                                        "{} — {:04X}:{:04X}, bus {}, address {}, interface {} alt {}",
+                                        "{} — {}, {:04X}:{:04X}, {}",
                                         candidate.alias,
+                                        candidate.backend.label(),
                                         candidate.vendor_id,
                                         candidate.product_id,
-                                        candidate.bus_number,
-                                        candidate.device_address,
-                                        candidate.interface_number,
-                                        candidate.alternate_setting,
+                                        selector,
                                     );
                                     if ui
                                         .selectable_label(selected_usb_candidate == Some(index), label)
@@ -911,7 +942,7 @@ impl ReinkGui {
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("Source");
-                    ui.label("Descriptor-only candidate");
+                    ui.label(candidate.backend.label());
                     ui.end_row();
                     ui.label("Selected alias");
                     ui.monospace(&candidate.alias);
@@ -923,15 +954,20 @@ impl ReinkGui {
                     ));
                     ui.end_row();
                     ui.label("Bus/address");
-                    ui.label(format!(
-                        "{} / {}",
-                        candidate.bus_number, candidate.device_address
-                    ));
+                    ui.label(match (candidate.bus_number, candidate.device_address) {
+                        (Some(bus), Some(address)) => format!("{bus} / {address}"),
+                        _ => "Not applicable to this backend".to_owned(),
+                    });
                     ui.end_row();
                     ui.label("Interface/alternate setting");
                     ui.label(format!(
                         "{} / {}",
-                        candidate.interface_number, candidate.alternate_setting
+                        candidate
+                            .interface_number
+                            .map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
+                        candidate
+                            .alternate_setting
+                            .map_or_else(|| "not applicable".to_owned(), |value| value.to_string())
                     ));
                     ui.end_row();
                     ui.label("Bundled model hints");
@@ -1289,8 +1325,10 @@ impl ReinkGui {
                         });
                     ui.add_space(16.0);
                     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                    if self.selected_usb_candidate().is_some() {
-                        let enabled = self.selected_usb_model().is_some()
+                    if let Some(candidate) = self.selected_usb_candidate() {
+                        let permits_mutation = candidate.permits_persistent_mutation();
+                        let enabled = permits_mutation
+                            && self.selected_usb_model().is_some()
                             && !self.usb_operation_in_progress();
                         if ui
                             .add_enabled(
@@ -1306,9 +1344,15 @@ impl ReinkGui {
                                 confirmation: String::new(),
                             });
                         }
-                        ui.label(format!(
-                            "Selected cached field: {selected_label} at 0x{selected_address:04X}. The worker reads a complete fresh backup and reports the current value before writing."
-                        ));
+                        if permits_mutation {
+                            ui.label(format!(
+                                "Selected cached field: {selected_label} at 0x{selected_address:04X}. The worker reads a complete fresh backup and reports the current value before writing."
+                            ));
+                        } else {
+                            ui.label(
+                                "The Windows stock-driver backend is read-only: write, restore, and reset controls are unavailable. Use status, dump, read, or debug capture.",
+                            );
+                        }
                     } else {
                         ui.add_enabled(
                             false,
@@ -1398,6 +1442,10 @@ impl ReinkGui {
             {
                 let enabled =
                     self.selected_usb_model().is_some() && !self.usb_operation_in_progress();
+                let mutation_enabled = enabled
+                    && self
+                        .selected_usb_candidate()
+                        .is_some_and(DescriptorCandidate::permits_persistent_mutation);
                 if self.selected_usb_model().is_none() {
                     ui.colored_label(
                         Color32::from_rgb(174, 112, 0),
@@ -1435,7 +1483,10 @@ impl ReinkGui {
                         "The confirmation dialog validates one model-bounded address/value, requires a create-new full backup, then uses read-back verification and rollback-on-failure.",
                     );
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Prepare guarded EEPROM write..."))
+                        .add_enabled(
+                            mutation_enabled,
+                            egui::Button::new("Prepare guarded EEPROM write..."),
+                        )
                         .clicked()
                     {
                         self.pending_usb_operation = Some(PendingUsbOperation::Write {
@@ -1453,7 +1504,10 @@ impl ReinkGui {
                         "Select a complete image and a separate new rollback backup. The model range and image length are validated before USB opens.",
                     );
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Choose image and prepare restore..."))
+                        .add_enabled(
+                            mutation_enabled,
+                            egui::Button::new("Choose image and prepare restore..."),
+                        )
                         .clicked()
                     {
                         self.pending_usb_operation = Some(PendingUsbOperation::Restore {
@@ -1471,7 +1525,10 @@ impl ReinkGui {
                     );
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(enabled, egui::Button::new("Prepare waste reset..."))
+                            .add_enabled(
+                                mutation_enabled,
+                                egui::Button::new("Prepare waste reset..."),
+                            )
                             .clicked()
                         {
                             self.pending_usb_operation = Some(PendingUsbOperation::Reset {
@@ -1482,7 +1539,7 @@ impl ReinkGui {
                         }
                         if ui
                             .add_enabled(
-                                enabled,
+                                mutation_enabled,
                                 egui::Button::new("Prepare platen-pad reset..."),
                             )
                             .clicked()
@@ -1495,6 +1552,16 @@ impl ReinkGui {
                         }
                     });
                 });
+                if !mutation_enabled
+                    && self
+                        .selected_usb_candidate()
+                        .is_some_and(|candidate| !candidate.permits_persistent_mutation())
+                {
+                    ui.colored_label(
+                        Color32::from_rgb(174, 112, 0),
+                        "This Windows stock-driver candidate is application-level read-only. Generic EEPROM write, restore, and reset are disabled.",
+                    );
+                }
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             {
@@ -1984,6 +2051,59 @@ impl ReinkGui {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn scan_descriptor_candidates() -> Result<Vec<DescriptorCandidate>, String> {
+    let state = GuiState::new().map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "windows"))]
+    let libusb = reink_usb::list_printer_candidates().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    let (libusb, libusb_error) = match reink_usb::list_printer_candidates() {
+        Ok(candidates) => (candidates, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let mut candidates = libusb
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| DescriptorCandidate {
+            alias: format!("usb-{}", index + 1),
+            backend: DescriptorCandidateBackend::LibUsb,
+            vendor_id: candidate.vendor_id,
+            product_id: candidate.product_id,
+            bus_number: Some(candidate.bus_number),
+            device_address: Some(candidate.device_address),
+            interface_number: Some(candidate.interface_number),
+            alternate_setting: Some(candidate.alternate_setting),
+            model_hints: state
+                .model_hints_for_usb_candidate(candidate.vendor_id, candidate.product_id),
+        })
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "windows")]
+    {
+        let native = reink_usb::list_windows_native_printer_candidates()
+            .map_err(|error| error.to_string())?;
+        candidates.extend(native.into_iter().enumerate().map(|(index, candidate)| {
+            DescriptorCandidate {
+                alias: format!("windows-native-{}", index + 1),
+                backend: DescriptorCandidateBackend::WindowsNative(candidate.clone()),
+                vendor_id: candidate.vendor_id,
+                product_id: candidate.product_id,
+                bus_number: None,
+                device_address: None,
+                interface_number: candidate.interface_number,
+                alternate_setting: None,
+                model_hints: state
+                    .model_hints_for_usb_candidate(candidate.vendor_id, candidate.product_id),
+            }
+        }));
+        if candidates.is_empty()
+            && let Some(error) = libusb_error
+        {
+            return Err(error);
+        }
+    }
+    Ok(candidates)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn selected_model_for_usb_candidate<'a>(
     state: &GuiState,
     candidate: Option<&DescriptorCandidate>,
@@ -2151,85 +2271,160 @@ fn run_selected_usb_operation(
             }
         },
     };
-    let device = reink_usb::UsbDeviceSelector::at_location(
-        candidate.vendor_id,
-        candidate.product_id,
-        candidate.bus_number,
-        candidate.device_address,
-    );
-    let interface = reink_platform::UsbInterfaceSelector {
-        number: candidate.interface_number,
-        alternate_setting: candidate.alternate_setting,
-    };
-    let outcome = with_selected_usb_epson_session(
-        device,
-        interface,
-        spec,
-        record_traffic,
-        move |session| {
-            let identity = session.read_identity().map_err(|error| error.to_string())?;
-            verify_exact_model(&identity, &expected_model)?;
-            match request {
-                PreparedRequest::Status => {
-                    let response = session.read_status().map_err(|error| error.to_string())?;
-                    Ok(UsbOperationSuccess::Status {
-                        model: expected_model,
-                        response_bytes: response.len(),
-                        display: display_status_response(&response),
-                    })
-                }
-                PreparedRequest::Dump(output_file) => {
-                    let image = session.dump_eeprom().map_err(|error| error.to_string())?;
-                    write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
-                    Ok(UsbOperationSuccess::Dump { image, output_file })
-                }
-                PreparedRequest::Mutation {
-                    action,
-                    updates,
-                    backup_file,
-                } => {
-                    let plan = session
-                        .prepare_eeprom_write(&updates)
-                        .map_err(|error| format!("could not prepare EEPROM {action}: {error}"))?;
-                    let current_values = plan
-                        .updates
-                        .iter()
-                        .map(|&(address, _)| {
-                            plan.backup
-                                .value_at(address)
-                                .map(|value| (address, value))
-                                .ok_or_else(|| {
-                                    format!("complete backup did not contain {address:#06x}")
+    match candidate.backend {
+        DescriptorCandidateBackend::LibUsb => {
+            let (
+                Some(bus_number),
+                Some(device_address),
+                Some(interface_number),
+                Some(alternate_setting),
+            ) = (
+                candidate.bus_number,
+                candidate.device_address,
+                candidate.interface_number,
+                candidate.alternate_setting,
+            )
+            else {
+                return UsbOperationOutcome {
+                    operation: Err(
+                        "libusb candidate is missing its required explicit selector".to_owned()
+                    ),
+                    cleanup: UsbSessionCleanup::not_attempted(),
+                    events: Vec::new(),
+                };
+            };
+            let outcome = with_selected_usb_epson_session(
+                reink_usb::UsbDeviceSelector::at_location(
+                    candidate.vendor_id,
+                    candidate.product_id,
+                    bus_number,
+                    device_address,
+                ),
+                reink_platform::UsbInterfaceSelector {
+                    number: interface_number,
+                    alternate_setting,
+                },
+                spec,
+                record_traffic,
+                move |session| {
+                    let identity = session.read_identity().map_err(|error| error.to_string())?;
+                    verify_exact_model(&identity, &expected_model)?;
+                    match request {
+                        PreparedRequest::Status => {
+                            let response =
+                                session.read_status().map_err(|error| error.to_string())?;
+                            Ok(UsbOperationSuccess::Status {
+                                model: expected_model,
+                                response_bytes: response.len(),
+                                display: display_status_response(&response),
+                            })
+                        }
+                        PreparedRequest::Dump(output_file) => {
+                            let image = session.dump_eeprom().map_err(|error| error.to_string())?;
+                            write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
+                            Ok(UsbOperationSuccess::Dump {
+                                image,
+                                output_file,
+                                load_for_display: true,
+                            })
+                        }
+                        PreparedRequest::Mutation {
+                            action,
+                            updates,
+                            backup_file,
+                        } => {
+                            let plan = session.prepare_eeprom_write(&updates).map_err(|error| {
+                                format!("could not prepare EEPROM {action}: {error}")
+                            })?;
+                            let current_values = plan
+                                .updates
+                                .iter()
+                                .map(|&(address, _)| {
+                                    plan.backup
+                                        .value_at(address)
+                                        .map(|value| (address, value))
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "complete backup did not contain {address:#06x}"
+                                            )
+                                        })
                                 })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let current_description = format_current_values(&current_values);
-                    write_new_binary_file(&backup_file, &plan.backup.bytes, "EEPROM backup")
-                        .map_err(|error| {
-                            format!(
-                                "{error}; pre-write current values captured from the complete backup: {current_description}"
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let current_description = format_current_values(&current_values);
+                            write_new_binary_file(
+                                &backup_file,
+                                &plan.backup.bytes,
+                                "EEPROM backup",
                             )
-                        })?;
-                    session.apply_eeprom_write(&plan).map_err(|error| {
-                        format!(
-                            "EEPROM {action} failed after capturing pre-write current values ({current_description}): {error}"
-                        )
-                    })?;
-                    Ok(UsbOperationSuccess::Mutation {
-                        action,
-                        model: expected_model,
-                        backup_file,
-                        current_values,
-                        update_count: plan.updates.len(),
-                    })
-                }
+                            .map_err(|error| {
+                                format!(
+                                    "{error}; pre-write current values captured from the complete backup: {current_description}"
+                                )
+                            })?;
+                            session.apply_eeprom_write(&plan).map_err(|error| {
+                                format!(
+                                    "EEPROM {action} failed after capturing pre-write current values ({current_description}): {error}"
+                                )
+                            })?;
+                            Ok(UsbOperationSuccess::Mutation {
+                                action,
+                                model: expected_model,
+                                backup_file,
+                                current_values,
+                                update_count: plan.updates.len(),
+                            })
+                        }
+                    }
+                },
+            );
+            UsbOperationOutcome {
+                operation: outcome.operation,
+                cleanup: outcome.cleanup,
+                events: outcome.events,
             }
-        },
-    );
-    UsbOperationOutcome {
-        operation: outcome.operation,
-        cleanup: outcome.cleanup,
-        events: outcome.events,
+        }
+        #[cfg(target_os = "windows")]
+        DescriptorCandidateBackend::WindowsNative(native) => {
+            let outcome = reink_app::with_selected_windows_native_epson_session(
+                &native,
+                spec,
+                record_traffic,
+                move |session| {
+                    let identity = session.read_identity().map_err(|error| error.to_string())?;
+                    verify_exact_model(&identity, &expected_model)?;
+                    match request {
+                        PreparedRequest::Status => {
+                            let mut response =
+                                session.read_status().map_err(|error| error.to_string())?;
+                            reink_usb::redact_identity_serial_fields(&mut response);
+                            Ok(UsbOperationSuccess::Status {
+                                model: expected_model,
+                                response_bytes: response.len(),
+                                display: display_status_response(&response),
+                            })
+                        }
+                        PreparedRequest::Dump(output_file) => {
+                            let image = session.dump_eeprom().map_err(|error| error.to_string())?;
+                            write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
+                            Ok(UsbOperationSuccess::Dump {
+                                image,
+                                output_file,
+                                load_for_display: false,
+                            })
+                        }
+                        PreparedRequest::Mutation { .. } => Err(
+                            "Windows stock-driver mutation was rejected before opening the device"
+                                .to_owned(),
+                        ),
+                    }
+                },
+            );
+            UsbOperationOutcome {
+                operation: outcome.operation,
+                cleanup: outcome.cleanup,
+                events: redact_native_identity_serials(outcome.events),
+            }
+        }
     }
 }
 
@@ -2363,10 +2558,50 @@ fn display_status_response(bytes: &[u8]) -> String {
             if trimmed.chars().count() > MAX_STATUS_CHARACTERS {
                 display.push_str("… (truncated)");
             }
+
             display
         }
         Err(_) => "Binary status response is not shown.".to_owned(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn redact_native_identity_serials(mut events: Vec<TransportEvent>) -> Vec<TransportEvent> {
+    let mut stream = Vec::new();
+    let mut positions = Vec::new();
+    for (event_index, event) in events.iter().enumerate() {
+        if let TransportEvent::Rx(bytes) = event {
+            for (byte_index, byte) in bytes.iter().copied().enumerate() {
+                stream.push(byte);
+                positions.push((event_index, byte_index));
+            }
+        }
+    }
+    for marker in [b"SN:".as_slice(), b"SERIALNUMBER:".as_slice()] {
+        let mut offset = 0;
+        while let Some(relative) = stream[offset..]
+            .windows(marker.len())
+            .position(|window| window.eq_ignore_ascii_case(marker))
+        {
+            let value_start = offset + relative + marker.len();
+            let value_end = stream[value_start..]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map_or(stream.len(), |relative_end| value_start + relative_end);
+            for position in value_start..value_end {
+                stream[position] = b'X';
+                let (event_index, byte_index) = positions[position];
+                if let TransportEvent::Rx(bytes) = &mut events[event_index] {
+                    bytes[byte_index] = b'X';
+                }
+            }
+            offset = value_end.saturating_add(1);
+            if offset >= stream.len() {
+                break;
+            }
+        }
+    }
+    events
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2742,6 +2977,8 @@ mod tests {
     use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
     use reink_gui::SourceMode;
 
+    #[cfg(target_os = "windows")]
+    use super::redact_native_identity_serials;
     use super::{
         EepromFileField, eeprom_field_address_label, eeprom_field_tooltip, eeprom_field_value,
         eeprom_image_offset, source_mode_from_args,
@@ -2752,7 +2989,9 @@ mod tests {
         parse_u16_input, selected_model_for_usb_candidate, validate_restore_image_size,
     };
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    use reink_gui::{DescriptorCandidate, GuiState};
+    use reink_gui::{DescriptorCandidate, DescriptorCandidateBackend, GuiState};
+    #[cfg(target_os = "windows")]
+    use reink_platform::TransportEvent;
 
     #[test]
     fn fixtures_require_an_explicit_flag_and_unknown_arguments_are_ignored() {
@@ -2844,12 +3083,13 @@ mod tests {
         let state = GuiState::new().unwrap();
         let candidate = DescriptorCandidate {
             alias: "usb-1".to_owned(),
+            backend: DescriptorCandidateBackend::LibUsb,
             vendor_id: 0x04b8,
             product_id: 0x0001,
-            bus_number: 1,
-            device_address: 1,
-            interface_number: 0,
-            alternate_setting: 0,
+            bus_number: Some(1),
+            device_address: Some(1),
+            interface_number: Some(0),
+            alternate_setting: Some(0),
             model_hints: Vec::new(),
         };
 
@@ -2860,6 +3100,30 @@ mod tests {
         assert_eq!(
             selected_model_for_usb_candidate(&state, Some(&candidate), Some("not-a-model")),
             None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_debug_capture_redacts_serials_across_read_boundaries() {
+        let events = vec![
+            TransportEvent::Tx(vec![1, 2]),
+            TransportEvent::Rx(b"MFG:EPSON;SN:PRI".to_vec()),
+            TransportEvent::Rx(b"VATE;MDL:C90;".to_vec()),
+        ];
+        let redacted = redact_native_identity_serials(events);
+        let received = redacted
+            .iter()
+            .filter_map(|event| match event {
+                TransportEvent::Rx(bytes) => Some(bytes.as_slice()),
+                TransportEvent::Tx(_) => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf8(received).unwrap(),
+            "MFG:EPSON;SN:XXXXXXX;MDL:C90;"
         );
     }
 
