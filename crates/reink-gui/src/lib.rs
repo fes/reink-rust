@@ -78,6 +78,15 @@ impl DebugTrafficEntry {
     pub fn hex_bytes(&self) -> &str {
         &self.hex_bytes
     }
+
+    pub fn clipboard_text(&self) -> String {
+        let bytes = if self.hex_bytes.is_empty() {
+            "<empty>"
+        } else {
+            &self.hex_bytes
+        };
+        format!("{}\nbytes={bytes}", self.summary)
+    }
 }
 
 #[derive(Debug)]
@@ -568,6 +577,14 @@ impl DebugTrafficTrace {
 
     pub fn count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn clipboard_text(&self) -> String {
+        self.entries
+            .iter()
+            .map(DebugTrafficEntry::clipboard_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn entries(
@@ -1083,6 +1100,14 @@ mod tests {
         assert_eq!(
             entries[2].summary(),
             "RX usb_bulk_in=empty observation=timeout_like"
+        );
+        assert_eq!(
+            entries[2].clipboard_text(),
+            "RX usb_bulk_in=empty observation=timeout_like\nbytes=<empty>"
+        );
+        assert_eq!(
+            trace.clipboard_text(),
+            "TX transfer=raw framing=unrecognized bytes=2\nbytes=1B 40\nRX transfer=raw framing=unrecognized bytes=1\nbytes=06\nRX usb_bulk_in=empty observation=timeout_like\nbytes=<empty>"
         );
         assert!(entries[0].id() < entries[1].id());
     }

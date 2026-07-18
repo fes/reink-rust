@@ -1843,8 +1843,13 @@ impl ReinkGui {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Debug traffic");
-                    if self.debug_traffic.count() > 0 && ui.button("Clear").clicked() {
-                        self.debug_traffic.clear();
+                    if self.debug_traffic.count() > 0 {
+                        if ui.button("Copy all").clicked() {
+                            ui.copy_text(self.debug_traffic.clipboard_text());
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.debug_traffic.clear();
+                        }
                     }
                 });
                 let mut capture_enabled = self.debug_traffic.capture_enabled();
@@ -1858,7 +1863,7 @@ impl ReinkGui {
                     self.debug_traffic.set_capture_enabled(capture_enabled);
                 }
                 ui.label(
-                    "Selecting a candidate alone produces no traffic. Transfers are recorded only for an explicit selected-printer operation that starts while this opt-in is enabled; the GUI never exports them.",
+                    "Selecting a candidate alone produces no traffic. Transfers are recorded only for an explicit selected-printer operation that starts while this opt-in is enabled; the GUI exports them only through an explicit copy action.",
                 );
                 ui.add_space(6.0);
                 if self.debug_traffic.count() == 0 {
@@ -1866,7 +1871,7 @@ impl ReinkGui {
                 } else {
                     ui.strong("Recorded requests and responses");
                     for entry in self.debug_traffic.entries() {
-                        egui::CollapsingHeader::new(entry.summary())
+                        let response = egui::CollapsingHeader::new(entry.summary())
                             .id_salt(("debug-traffic-entry", entry.id()))
                             .default_open(false)
                             .show(ui, |ui| {
@@ -1879,6 +1884,15 @@ impl ReinkGui {
                                     ui.monospace(format!("bytes={bytes}"));
                                 });
                             });
+                        response
+                            .header_response
+                            .on_hover_text("Right-click to copy this entry")
+                            .context_menu(|ui| {
+                            if ui.button("Copy entry").clicked() {
+                                ui.copy_text(entry.clipboard_text());
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
