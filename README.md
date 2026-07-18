@@ -628,9 +628,11 @@ Its persistent shell and tab-specific sub-pane rules are documented in
 [UI design](docs/UI_DESIGN.md).
 
 The GUI also has a bottom **Debug traffic** panel: a live, bounded in-memory,
-session-only sink for future recorded-session TX/RX events. Capture is disabled
-until explicitly enabled. Selecting a descriptor candidate alone produces no
-traffic, and no current GUI operation emits events or exports them.
+session-only, protocol-aware view of opt-in recorded TX/RX traffic. It
+reassembles Epson D4 entry exchanges and IEEE 1284.4 packets, and summarizes
+each logical request or response as `field=value` details. Expand a row to
+inspect its bytes. Capture is disabled until explicitly enabled; selecting a
+descriptor candidate alone produces no traffic, and the GUI never exports it.
 
 The GUI is excluded from the workspace default members, so base CLI builds do
 not require it. Build and run it explicitly on Windows, Linux, or macOS:

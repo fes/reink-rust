@@ -57,6 +57,13 @@ has separate Field and Hex dump sub-panes. Sub-panes should preserve the same
 single-line outline and spacing vocabulary, but must not alter the global
 three-pane layout.
 
+For a loaded model-bounded image, the Fields sub-pane uses only read-only field
+metadata. Multi-byte fields show their decoded little-endian value and expose
+encoding, confidence, and reviewed-evidence notes on hover. Sensitive fields
+hide their decoded value by default, while the existing raw private hex dump
+remains unchanged. Selecting a field selects and highlights its start byte, so
+guarded byte editing continues to operate on one explicit byte.
+
 ## Descriptor-only USB candidates
 
 On Linux, macOS, and Windows, startup and **Refresh USB candidates**
@@ -91,14 +98,26 @@ Linux restores only a driver the selected transport detached. Windows and macOS
 only claim and release an already libusb-accessible interface; they never
 install, detach, rebind, or change a driver.
 
+Reviewed level-C L1300 results markdown (`reink-results` commit `6459092`,
+`wic_analysis/L1300_WIC_ANALYSIS.md`) records WIC traffic routed through
+Winspool, `spoolsv`, and the Epson driver to USB D4. The exact public versus
+proprietary API boundary remains unknown; do not guess a `WritePrinter`,
+`ReadPrinter`, `ExtEscape`, IOCTL, or other stock-driver backend. This finding
+does not add a Windows stock backend.
+
 ## Safety and diagnostics
 
 Fixtures remain transport-free. Debug traffic is a live, opt-in, bounded
-in-memory session-only pane for `RecordingTransport` TX/RX events. Selecting a
-descriptor candidate alone produces no traffic. An operation records events
-only when the user enabled capture before starting it; no GUI operation exports
-them. Default result panes do not retain raw identity fields, and no private
-image, path, or traffic data is emitted to default logs.
+in-memory session-only pane for `RecordingTransport` TX/RX events. It
+reassembles Epson D4 entry exchanges and IEEE 1284.4 packets across USB reads,
+then presents one concise `field=value` request or response per collapsible
+row. Collapsed rows use a horizontal chevron; expanding a row reveals the
+indented hexadecimal bytes. Empty bulk-IN observations remain visible and do
+not reset packet reassembly. Selecting a descriptor candidate alone produces
+no traffic. An operation records events only when the user enabled capture
+before starting it; no GUI operation exports them. Default result panes do not
+retain raw identity fields, and no private image, path, or traffic data is
+emitted to default logs.
 
 Physical GUI writes and resets are available only through the explicit guarded
 dialogs above. They never run by default, on candidate selection, after file

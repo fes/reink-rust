@@ -195,6 +195,27 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_sanitized_l1300_factory_read_request_and_reply_regression() {
+        // Level-C reviewed evidence: reink-results commit 6459092,
+        // wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md. This uses a sanitized
+        // fixture value, not a private EEPROM value.
+        let database = ModelDatabase::builtin().unwrap();
+        let spec = database.get("L1300").unwrap();
+
+        assert_eq!(
+            encode_eeprom_read(spec, 0x26).unwrap(),
+            b"||\x07\x002\x08A\xbe\xa0\x26\x00"
+        );
+        assert_eq!(
+            parse_eeprom_read_reply(b"@BDC PS EE:002600;", AddressWidth::Two).unwrap(),
+            EepromReadReply {
+                address: 0x26,
+                value: 0,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_one_byte_addresses_outside_range() {
         let database = ModelDatabase::builtin().unwrap();
         let spec = database.get("C90").unwrap();

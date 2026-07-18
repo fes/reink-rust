@@ -40,12 +40,12 @@ reviewed sanitized provenance evidence or an authoritative source.
 | Transaction messages, revision `0x20` | `reink-d4/src/transaction.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `protocol_0x20.cmd_by_name` | IEEE 1284.4 transaction-channel definition | Reviewed; covered by unit tests |
 | Transaction messages, revision `0x10` | `reink-d4/src/transaction.rs` | C: ReInkPy says this layout is “undocumented ? taken from d4lib.c” | IEEE 1284.4 revision-1 material and/or validated capture | Source-compatible layouts covered by unit tests; authoritative review pending |
 | D4 init, service lookup, channel open, credits | `reink-d4/src/link.rs` | A: licensed IEEE Std 1284.4-2000 review; C: ReInkPy `D4Link`, `TXChannel`, and `Channel` | IEEE 1284.4 state-machine rules | Reviewed; service-to-socket and socket-to-service lookups, peer transactions, open/close/Exit covered by unit tests |
-| Epson D4 entry sequence, reply recognition, and `EPSON-CTRL` service | `reink-app/src/lib.rs` | C: `reinkpy/epson.py` (`EpsonD4._init_link`) | Epson documentation or sanitized capture | Scripted read-only session and app-owned entry probe implemented; hardware evidence required |
+| Epson D4 entry sequence, reply recognition, and `EPSON-CTRL` service | `reink-app/src/lib.rs` | C: `reinkpy/epson.py` (`EpsonD4._init_link`); reviewed sanitized L1300 transcript in `reink-results` commit `6459092`, `wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md` | Epson documentation or broader reviewed sanitized captures | Reviewed level-C L1300 evidence validates the entry request/reply and control-service setup; other model and authoritative conformance remain pending |
 | IEEE 1284 device ID | `reink-core/src/identity.rs` | C: `reinkpy/__init__.py` parser | IEEE 1284 device-ID definition | Pending review |
 | Epson printer status (`st`) | `reink-core/src/controller.rs`, `reink-app/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/epson.py` `do_status()` | Epson documentation or sanitized capture | Scripted core, D4-session, and SNMP-control composition tests; hardware evidence required |
 | USB printer interface selection, standard device ID, and generic bounded bulk exchange | `reink-usb/src/descriptor.rs`, `adapter.rs` | C: `reinkpy/usb.py`; private observed Linux preflight run (not committed provenance evidence) | USB-IF Printer Device Class 1.1 | Linux interface selection and a no-protocol-session device-ID read succeeded on one selected printer; selected Linux operations now automatically hand off and reattach an active driver; reviewed sanitized provenance evidence and clause-level review remain pending |
 | SNMP printer identification and read-only Epson control composition | `reink-snmp/src/lib.rs`, `reink-cli/src/main.rs` | C: `reinkpy/snmp.py`; RFC 3805 for standard MIB context | RFC 3805 where applicable; Epson enterprise MIB for private OIDs | Identity-validated status and model-bounded EEPROM CLI surfaces use GET only; deterministic composition tests implemented; private OID evidence still required |
-| Epson EEPROM factory commands and semantic counter plans | `reink-core/src/command.rs`, `controller.rs`, `epson.rs` | C: `reinkpy/epson.py`, model TOML | Epson documentation or sanitized capture | Scripted execution and declared-reset plan selection implemented; hardware evidence still required |
+| Epson EEPROM factory commands and semantic counter plans | `reink-core/src/command.rs`, `controller.rs`, `epson.rs` | C: `reinkpy/epson.py`, model TOML; reviewed sanitized L1300 results in `reink-results` commit `6459092`, `EEPROM_MAP_STATIC_ANALYSIS.md` and `wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md` | Epson documentation or broader reviewed sanitized captures | Reviewed level-C L1300 evidence validates the USB endpoints and factory-read key/command/reply form. It does not validate resets, writes, write order, checksums, or other models |
 | Offline factory-request binary analysis | `reink-cli/src/main.rs` | C: ReInkPy `epson.py` `search_bin()` | No device protocol authority required; input remains local | Deterministic bounded parser tests implemented |
 
 ## Authoritative references
@@ -63,6 +63,22 @@ reviewed sanitized provenance evidence or an authoritative source.
 - [Gutenprint remote-mode reference](https://gimp-print.sourceforge.io/reference-html/x952.html)
   — level-D research material only; it is not authority for EEPROM factory
   commands.
+
+## Reviewed sanitized L1300 Windows finding
+
+Level-C reviewed results markdown in `reink-results` commit `6459092`
+(`wic_analysis/L1300_WIC_ANALYSIS.md` and
+`wic_analysis2/L1300_WIC_D4_TRANSCRIPT.md`) records an L1300 WIC route through
+Winspool, `spoolsv`, and the Epson driver to USB D4. The exact public versus
+proprietary API boundary remains unknown. In particular, this evidence does not
+identify `WritePrinter`, `ReadPrinter`, `ExtEscape`, an IOCTL, or any other
+backend, so ReInk must not guess one or implement a Windows stock-driver
+transport from this finding.
+
+The L1300 read-only map represents `0x0026..0x0027` as a little-endian
+counter. The reviewed result's observed WIC denominator of 11,809 is retained
+as an evidence note only; ReInk does not apply or validate display scaling.
+`0x0058` is retained only as related with an unknown role.
 
 ## Initial cross-reference findings
 

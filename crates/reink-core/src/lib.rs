@@ -14,7 +14,7 @@ pub use command::{
 };
 pub use controller::{EepromWriteOptions, EpsonController, EpsonError};
 pub use epson::{
-    AddressWidth, BUILTIN_EPSON_TOML, CounterResetTarget, EpsonSpec, MemoryOperation,
-    ModelDatabase, SpecError,
+    AddressWidth, BUILTIN_EPSON_TOML, CounterResetTarget, EepromField, EepromFieldConfidence,
+    EepromFieldEncoding, EpsonSpec, MemoryOperation, ModelDatabase, SpecError,
 };
 pub use identity::{IdentityParseError, PrinterIdentity};

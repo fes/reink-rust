@@ -54,6 +54,106 @@ impl MemoryOperation {
     }
 }
 
+/// A read-only interpretation for one contiguous EEPROM field.
+///
+/// This metadata is deliberately separate from [`MemoryOperation`]: it does
+/// not authorize writes, define reset values, or imply a write ordering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EepromField {
+    /// First EEPROM address in the field's inclusive range.
+    pub address: u16,
+    /// Last EEPROM address in the field's inclusive range.
+    pub end_address: u16,
+    pub label: String,
+    pub encoding: EepromFieldEncoding,
+    pub confidence: EepromFieldConfidence,
+    /// Human-readable provenance and limitations for this interpretation.
+    pub evidence_note: String,
+    /// Whether a UI must hide the decoded value by default.
+    pub sensitive: bool,
+}
+
+impl EepromField {
+    pub const fn byte_len(&self) -> usize {
+        self.end_address as usize - self.address as usize + 1
+    }
+}
+
+/// Encoding used only to display a read-only EEPROM field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EepromFieldEncoding {
+    U8,
+    U16Le,
+    U32Le,
+    Ascii,
+    RawBytes,
+}
+
+impl EepromFieldEncoding {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::U16Le => "little-endian u16",
+            Self::U32Le => "little-endian u32",
+            Self::Ascii => "ASCII",
+            Self::RawBytes => "raw bytes",
+        }
+    }
+
+    const fn fixed_byte_len(self) -> Option<usize> {
+        match self {
+            Self::U8 => Some(1),
+            Self::U16Le => Some(2),
+            Self::U32Le => Some(4),
+            Self::Ascii | Self::RawBytes => None,
+        }
+    }
+
+    fn from_raw(label: &str, value: &str) -> Result<Self, SpecError> {
+        match value {
+            "u8" => Ok(Self::U8),
+            "u16le" => Ok(Self::U16Le),
+            "u32le" => Ok(Self::U32Le),
+            "ascii" => Ok(Self::Ascii),
+            "raw" => Ok(Self::RawBytes),
+            _ => Err(SpecError::InvalidReadOnlyFieldEncoding {
+                label: label.to_owned(),
+                encoding: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Strength of the reviewed evidence behind a read-only EEPROM interpretation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EepromFieldConfidence {
+    Confirmed,
+    StronglyRelated,
+    RelatedUnknown,
+}
+
+impl EepromFieldConfidence {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Confirmed => "Confirmed",
+            Self::StronglyRelated => "Strongly related",
+            Self::RelatedUnknown => "Related; role unknown",
+        }
+    }
+
+    fn from_raw(label: &str, value: &str) -> Result<Self, SpecError> {
+        match value {
+            "confirmed" => Ok(Self::Confirmed),
+            "strongly-related" => Ok(Self::StronglyRelated),
+            "related-unknown" => Ok(Self::RelatedUnknown),
+            _ => Err(SpecError::InvalidReadOnlyFieldConfidence {
+                label: label.to_owned(),
+                confidence: value.to_owned(),
+            }),
+        }
+    }
+}
+
 /// A counter family with separately declared Epson reset semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CounterResetTarget {
@@ -92,6 +192,8 @@ pub struct EpsonSpec {
     pub memory_low: u16,
     pub memory_high: u16,
     pub memory_operations: Vec<MemoryOperation>,
+    /// Read-only EEPROM display metadata. This has no reset or write semantics.
+    pub read_only_fields: Vec<EepromField>,
 }
 
 impl EpsonSpec {
@@ -193,6 +295,12 @@ impl ModelDatabase {
                 .into_iter()
                 .map(MemoryOperation::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
+            let read_only_fields = raw_spec
+                .read_only_fields
+                .into_iter()
+                .map(|field| field.into_eeprom_field(raw_spec.memory_low, raw_spec.memory_high))
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_read_only_fields(&read_only_fields)?;
 
             for model in raw_spec.models {
                 let spec = EpsonSpec {
@@ -208,6 +316,7 @@ impl ModelDatabase {
                     memory_low: raw_spec.memory_low,
                     memory_high: raw_spec.memory_high,
                     memory_operations: memory_operations.clone(),
+                    read_only_fields: read_only_fields.clone(),
                 };
 
                 // ReInkPy loads groups in order and lets a later duplicate
@@ -264,6 +373,8 @@ struct RawSpec {
     #[serde(default)]
     mem: Vec<RawMemoryOperation>,
     #[serde(default)]
+    read_only_fields: Vec<RawEepromField>,
+    #[serde(default)]
     models: Vec<String>,
 }
 
@@ -313,6 +424,92 @@ impl TryFrom<RawMemoryOperation> for MemoryOperation {
     }
 }
 
+#[derive(Deserialize)]
+struct RawEepromField {
+    #[serde(default)]
+    address: Option<u16>,
+    #[serde(default)]
+    range: Option<[u16; 2]>,
+    label: String,
+    encoding: String,
+    confidence: String,
+    evidence: String,
+    #[serde(default)]
+    sensitive: bool,
+}
+
+impl RawEepromField {
+    fn into_eeprom_field(
+        self,
+        memory_low: u16,
+        memory_high: u16,
+    ) -> Result<EepromField, SpecError> {
+        let (address, end_address) = match (self.address, self.range) {
+            (Some(address), None) => (address, address),
+            (None, Some([address, end_address])) if address <= end_address => {
+                (address, end_address)
+            }
+            (None, Some([address, end_address])) => {
+                return Err(SpecError::InvalidReadOnlyFieldRange {
+                    label: self.label,
+                    address,
+                    end_address,
+                });
+            }
+            _ => {
+                return Err(SpecError::InvalidReadOnlyFieldLocation { label: self.label });
+            }
+        };
+        if address < memory_low || end_address > memory_high {
+            return Err(SpecError::ReadOnlyFieldOutsideMemoryRange {
+                label: self.label,
+                address,
+                end_address,
+                memory_low,
+                memory_high,
+            });
+        }
+
+        let encoding = EepromFieldEncoding::from_raw(&self.label, &self.encoding)?;
+        let byte_len = usize::from(end_address) - usize::from(address) + 1;
+        if let Some(expected_len) = encoding.fixed_byte_len()
+            && byte_len != expected_len
+        {
+            return Err(SpecError::ReadOnlyFieldLengthMismatch {
+                label: self.label,
+                encoding,
+                byte_len,
+            });
+        }
+        let confidence = EepromFieldConfidence::from_raw(&self.label, &self.confidence)?;
+
+        Ok(EepromField {
+            address,
+            end_address,
+            label: self.label,
+            encoding,
+            confidence,
+            evidence_note: self.evidence,
+            sensitive: self.sensitive,
+        })
+    }
+}
+
+fn validate_read_only_fields(fields: &[EepromField]) -> Result<(), SpecError> {
+    for (index, field) in fields.iter().enumerate() {
+        if let Some(overlap) = fields[..index]
+            .iter()
+            .find(|other| field.address <= other.end_address && other.address <= field.end_address)
+        {
+            return Err(SpecError::OverlappingReadOnlyFields {
+                first: overlap.label.clone(),
+                second: field.label.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn latin1_bytes(value: &str) -> Result<Vec<u8>, SpecError> {
     value
         .chars()
@@ -344,6 +541,38 @@ pub enum SpecError {
         addresses: usize,
         reset_values: usize,
     },
+    InvalidReadOnlyFieldLocation {
+        label: String,
+    },
+    InvalidReadOnlyFieldRange {
+        label: String,
+        address: u16,
+        end_address: u16,
+    },
+    ReadOnlyFieldOutsideMemoryRange {
+        label: String,
+        address: u16,
+        end_address: u16,
+        memory_low: u16,
+        memory_high: u16,
+    },
+    InvalidReadOnlyFieldEncoding {
+        label: String,
+        encoding: String,
+    },
+    InvalidReadOnlyFieldConfidence {
+        label: String,
+        confidence: String,
+    },
+    ReadOnlyFieldLengthMismatch {
+        label: String,
+        encoding: EepromFieldEncoding,
+        byte_len: usize,
+    },
+    OverlappingReadOnlyFields {
+        first: String,
+        second: String,
+    },
 }
 
 impl fmt::Display for SpecError {
@@ -374,6 +603,50 @@ impl fmt::Display for SpecError {
                 formatter,
                 "memory operation {description:?} has {addresses} addresses but {reset_values} reset values"
             ),
+            Self::InvalidReadOnlyFieldLocation { label } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} must declare exactly one address or range"
+            ),
+            Self::InvalidReadOnlyFieldRange {
+                label,
+                address,
+                end_address,
+            } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} has invalid range {address:#06x}..={end_address:#06x}"
+            ),
+            Self::ReadOnlyFieldOutsideMemoryRange {
+                label,
+                address,
+                end_address,
+                memory_low,
+                memory_high,
+            } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} range {address:#06x}..={end_address:#06x} is outside {memory_low:#06x}..={memory_high:#06x}"
+            ),
+            Self::InvalidReadOnlyFieldEncoding { label, encoding } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} has unsupported encoding {encoding:?}"
+            ),
+            Self::InvalidReadOnlyFieldConfidence { label, confidence } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} has unsupported confidence {confidence:?}"
+            ),
+            Self::ReadOnlyFieldLengthMismatch {
+                label,
+                encoding,
+                byte_len,
+            } => write!(
+                formatter,
+                "read-only EEPROM field {label:?} has {byte_len} byte(s), but {} requires {}",
+                encoding.label(),
+                encoding.fixed_byte_len().unwrap_or_default()
+            ),
+            Self::OverlappingReadOnlyFields { first, second } => write!(
+                formatter,
+                "read-only EEPROM fields {first:?} and {second:?} overlap"
+            ),
         }
     }
 }
@@ -389,7 +662,10 @@ impl Error for SpecError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddressWidth, CounterResetTarget, ModelDatabase, SpecError};
+    use super::{
+        AddressWidth, CounterResetTarget, EepromFieldConfidence, EepromFieldEncoding,
+        ModelDatabase, SpecError,
+    };
 
     #[test]
     fn builtin_database_loads_known_model() {
@@ -448,6 +724,156 @@ mod tests {
                 .waste_counter_reset()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn l1300_has_read_only_capture_metadata_without_changing_reset_semantics() {
+        let database = ModelDatabase::builtin().unwrap();
+        let l1300 = database.get("L1300").unwrap();
+        let et_14000 = database.get("ET-14000").unwrap();
+
+        assert!(et_14000.read_only_fields.is_empty());
+        assert_eq!(l1300.read_only_fields.len(), 11);
+        assert_eq!(
+            l1300
+                .read_only_fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.address,
+                        field.end_address,
+                        field.encoding,
+                        field.confidence,
+                        field.sensitive,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0x26,
+                    0x27,
+                    EepromFieldEncoding::U16Le,
+                    EepromFieldConfidence::Confirmed,
+                    false,
+                ),
+                (
+                    0x58,
+                    0x58,
+                    EepromFieldEncoding::RawBytes,
+                    EepromFieldConfidence::RelatedUnknown,
+                    false,
+                ),
+                (
+                    0x16a,
+                    0x16a,
+                    EepromFieldEncoding::U8,
+                    EepromFieldConfidence::StronglyRelated,
+                    false,
+                ),
+                (
+                    0x16e,
+                    0x16e,
+                    EepromFieldEncoding::U8,
+                    EepromFieldConfidence::StronglyRelated,
+                    false,
+                ),
+                (
+                    0xb0,
+                    0xb3,
+                    EepromFieldEncoding::U32Le,
+                    EepromFieldConfidence::Confirmed,
+                    false,
+                ),
+                (
+                    0xb4,
+                    0xb7,
+                    EepromFieldEncoding::U32Le,
+                    EepromFieldConfidence::Confirmed,
+                    false,
+                ),
+                (
+                    0x4a,
+                    0x4a,
+                    EepromFieldEncoding::RawBytes,
+                    EepromFieldConfidence::Confirmed,
+                    false,
+                ),
+                (
+                    0x5c,
+                    0x5f,
+                    EepromFieldEncoding::RawBytes,
+                    EepromFieldConfidence::Confirmed,
+                    false,
+                ),
+                (
+                    0xc2,
+                    0xcb,
+                    EepromFieldEncoding::Ascii,
+                    EepromFieldConfidence::Confirmed,
+                    true,
+                ),
+                (
+                    0x82,
+                    0x85,
+                    EepromFieldEncoding::RawBytes,
+                    EepromFieldConfidence::StronglyRelated,
+                    false,
+                ),
+                (
+                    0x98,
+                    0x98,
+                    EepromFieldEncoding::RawBytes,
+                    EepromFieldConfidence::StronglyRelated,
+                    false,
+                ),
+            ]
+        );
+
+        let waste = l1300
+            .read_only_fields
+            .iter()
+            .find(|field| field.address == 0x26)
+            .unwrap();
+        assert_eq!(waste.end_address, 0x27);
+        assert_eq!(waste.byte_len(), 2);
+        assert_eq!(waste.encoding, EepromFieldEncoding::U16Le);
+        assert_eq!(waste.confidence, EepromFieldConfidence::Confirmed);
+
+        let serial = l1300
+            .read_only_fields
+            .iter()
+            .find(|field| field.address == 0xc2)
+            .unwrap();
+        assert_eq!(serial.end_address, 0xcb);
+        assert_eq!(serial.encoding, EepromFieldEncoding::Ascii);
+        assert!(serial.sensitive);
+
+        let related_unknown = l1300
+            .read_only_fields
+            .iter()
+            .find(|field| field.address == 0x58)
+            .unwrap();
+        assert_eq!(
+            related_unknown.confidence,
+            EepromFieldConfidence::RelatedUnknown
+        );
+        assert_eq!(related_unknown.encoding, EepromFieldEncoding::RawBytes);
+    }
+
+    #[test]
+    fn rejects_read_only_field_with_encoding_length_mismatch() {
+        let source = r#"
+            [[EPSON]]
+            models = ["Bad"]
+            read_only_fields = [
+              { range = [0x10, 0x12], label = "Bad counter", encoding = "u16le", confidence = "confirmed", evidence = "test" },
+            ]
+        "#;
+
+        assert!(matches!(
+            ModelDatabase::from_toml(source),
+            Err(SpecError::ReadOnlyFieldLengthMismatch { .. })
+        ));
     }
 
     #[test]

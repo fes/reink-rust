@@ -8,10 +8,14 @@
 use std::collections::VecDeque;
 
 use reink_core::{EpsonSpec, ModelDatabase, PrinterIdentity};
+use reink_d4::{PacketHeader, ProtocolRevision, TransactionMessage};
 use reink_platform::TransportEvent;
 
 /// Maximum number of transport events retained for one GUI session.
 pub const DEBUG_TRAFFIC_MAX_ENTRIES: usize = 1_000;
+const D4_HEADER_LENGTH: usize = 6;
+const EPSON_D4_ENTRY_COMMAND: &[u8] = b"\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL\n@EJL\n";
+const EPSON_D4_ENTRY_REPLY: &[u8] = b"\x00\x00\x00\x08\x01\x00\xc5\x00";
 
 /// Launch mode controlling whether bundled fixtures can be selected.
 ///
@@ -47,22 +51,166 @@ impl DebugTrafficDirection {
 
 /// One display-safe, session-only transport record.
 ///
-/// The byte string is uppercase hexadecimal separated by single spaces. It has
-/// no timestamp, transport description, or device identifier.
+/// The byte string is uppercase hexadecimal separated by single spaces. It is
+/// retained only for the current opt-in session and has no timestamp or device
+/// identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebugTrafficEntry {
+    id: u64,
     direction: DebugTrafficDirection,
+    summary: String,
     hex_bytes: String,
 }
 
 impl DebugTrafficEntry {
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
     pub const fn direction(&self) -> DebugTrafficDirection {
         self.direction
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
     }
 
     pub fn hex_bytes(&self) -> &str {
         &self.hex_bytes
     }
+}
+
+#[derive(Debug)]
+struct ReassembledTransfer {
+    direction: DebugTrafficDirection,
+    bytes: Vec<u8>,
+    kind: ReassembledTransferKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReassembledTransferKind {
+    EmptyRead,
+    Raw,
+    EntryCommand,
+    EntryReply,
+    D4Packet,
+}
+
+/// Reassembles one unidirectional USB byte stream without assigning meaning to
+/// incomplete frames until their protocol boundary is available.
+#[derive(Debug, Default)]
+struct DebugTrafficDecoder {
+    bytes: Vec<u8>,
+    d4_active: bool,
+}
+
+impl DebugTrafficDecoder {
+    fn push(&mut self, direction: DebugTrafficDirection, bytes: &[u8]) -> Vec<ReassembledTransfer> {
+        if bytes.is_empty() {
+            return match direction {
+                DebugTrafficDirection::Rx => vec![ReassembledTransfer {
+                    direction,
+                    bytes: Vec::new(),
+                    kind: ReassembledTransferKind::EmptyRead,
+                }],
+                DebugTrafficDirection::Tx => vec![ReassembledTransfer {
+                    direction,
+                    bytes: Vec::new(),
+                    kind: ReassembledTransferKind::Raw,
+                }],
+            };
+        }
+
+        if !self.d4_active && !self.bytes.is_empty() {
+            let entry = match direction {
+                DebugTrafficDirection::Tx => EPSON_D4_ENTRY_COMMAND,
+                DebugTrafficDirection::Rx => EPSON_D4_ENTRY_REPLY,
+            };
+            let mut candidate = self.bytes.clone();
+            candidate.extend_from_slice(bytes);
+            if !candidate.starts_with(entry) && !is_prefix_of(&candidate, entry) {
+                let pending = std::mem::take(&mut self.bytes);
+                let mut transfers = vec![ReassembledTransfer {
+                    direction,
+                    bytes: pending,
+                    kind: ReassembledTransferKind::Raw,
+                }];
+                transfers.extend(self.push(direction, bytes));
+                return transfers;
+            }
+        }
+
+        self.bytes.extend_from_slice(bytes);
+        let entry = match direction {
+            DebugTrafficDirection::Tx => EPSON_D4_ENTRY_COMMAND,
+            DebugTrafficDirection::Rx => EPSON_D4_ENTRY_REPLY,
+        };
+        let mut transfers = Vec::new();
+
+        loop {
+            if !self.d4_active {
+                if self.bytes.starts_with(entry) {
+                    let bytes = self.bytes.drain(..entry.len()).collect();
+                    self.d4_active = true;
+                    transfers.push(ReassembledTransfer {
+                        direction,
+                        bytes,
+                        kind: match direction {
+                            DebugTrafficDirection::Tx => ReassembledTransferKind::EntryCommand,
+                            DebugTrafficDirection::Rx => ReassembledTransferKind::EntryReply,
+                        },
+                    });
+                    continue;
+                }
+                if is_prefix_of(&self.bytes, entry) {
+                    break;
+                }
+
+                transfers.push(ReassembledTransfer {
+                    direction,
+                    bytes: std::mem::take(&mut self.bytes),
+                    kind: ReassembledTransferKind::Raw,
+                });
+                break;
+            }
+
+            if self.bytes.len() < D4_HEADER_LENGTH {
+                break;
+            }
+
+            let header = PacketHeader::decode(&self.bytes[..D4_HEADER_LENGTH]);
+            let Ok(header) = header else {
+                let split_at = self.next_packet_start().unwrap_or(self.bytes.len());
+                transfers.push(ReassembledTransfer {
+                    direction,
+                    bytes: self.bytes.drain(..split_at).collect(),
+                    kind: ReassembledTransferKind::Raw,
+                });
+                continue;
+            };
+            let total_length = usize::from(header.length);
+            if self.bytes.len() < total_length {
+                break;
+            }
+            transfers.push(ReassembledTransfer {
+                direction,
+                bytes: self.bytes.drain(..total_length).collect(),
+                kind: ReassembledTransferKind::D4Packet,
+            });
+        }
+
+        transfers
+    }
+
+    fn next_packet_start(&self) -> Option<usize> {
+        (1..self.bytes.len().saturating_sub(D4_HEADER_LENGTH - 1)).find(|start| {
+            PacketHeader::decode(&self.bytes[*start..*start + D4_HEADER_LENGTH]).is_ok()
+        })
+    }
+}
+
+fn is_prefix_of(bytes: &[u8], whole: &[u8]) -> bool {
+    bytes.len() <= whole.len() && bytes.iter().zip(whole).all(|(left, right)| left == right)
 }
 
 /// Bounded, in-memory debug traffic for the current GUI session.
@@ -74,6 +222,10 @@ impl DebugTrafficEntry {
 pub struct DebugTrafficTrace {
     capture_enabled: bool,
     entries: VecDeque<DebugTrafficEntry>,
+    tx_decoder: DebugTrafficDecoder,
+    rx_decoder: DebugTrafficDecoder,
+    transaction_revision: ProtocolRevision,
+    next_entry_id: u64,
 }
 
 impl Default for DebugTrafficTrace {
@@ -87,6 +239,10 @@ impl DebugTrafficTrace {
         Self {
             capture_enabled: false,
             entries: VecDeque::new(),
+            tx_decoder: DebugTrafficDecoder::default(),
+            rx_decoder: DebugTrafficDecoder::default(),
+            transaction_revision: ProtocolRevision::V20,
+            next_entry_id: 0,
         }
     }
 
@@ -109,8 +265,8 @@ impl DebugTrafficTrace {
 
     /// Appends ordered `RecordingTransport` events when capture is enabled.
     ///
-    /// Read events are appended independently, including empty reads, so their
-    /// original boundaries remain visible in the trace.
+    /// Transfers are incrementally reassembled into D4 entry and packet records.
+    /// Empty reads remain visible without changing reassembly state.
     pub fn append_events(&mut self, events: Vec<TransportEvent>) -> usize {
         events.iter().filter(|event| self.append(event)).count()
     }
@@ -133,17 +289,281 @@ impl DebugTrafficTrace {
             TransportEvent::Tx(bytes) => (DebugTrafficDirection::Tx, bytes),
             TransportEvent::Rx(bytes) => (DebugTrafficDirection::Rx, bytes),
         };
+        let transfers = match direction {
+            DebugTrafficDirection::Tx => self.tx_decoder.push(direction, bytes),
+            DebugTrafficDirection::Rx => self.rx_decoder.push(direction, bytes),
+        };
+        for transfer in transfers {
+            self.append_transfer(transfer);
+        }
+    }
+
+    fn append_transfer(&mut self, transfer: ReassembledTransfer) {
+        let summary = self.summary_for(&transfer);
         if self.entries.len() == DEBUG_TRAFFIC_MAX_ENTRIES {
             self.entries.pop_front();
         }
         self.entries.push_back(DebugTrafficEntry {
-            direction,
-            hex_bytes: format_hex_bytes(bytes),
+            id: self.next_entry_id,
+            direction: transfer.direction,
+            summary,
+            hex_bytes: format_hex_bytes(&transfer.bytes),
         });
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+    }
+
+    fn summary_for(&mut self, transfer: &ReassembledTransfer) -> String {
+        let direction = transfer.direction.label();
+        match transfer.kind {
+            ReassembledTransferKind::EmptyRead => {
+                format!("{direction} usb_bulk_in=empty observation=timeout_like")
+            }
+            ReassembledTransferKind::Raw if transfer.bytes.is_empty() => {
+                format!("{direction} usb_bulk_out=empty")
+            }
+            ReassembledTransferKind::Raw => {
+                format!(
+                    "{direction} transfer=raw framing=unrecognized bytes={}",
+                    transfer.bytes.len()
+                )
+            }
+            ReassembledTransferKind::EntryCommand => {
+                format!(
+                    "{direction} epson_d4_entry=command bytes={}",
+                    transfer.bytes.len()
+                )
+            }
+            ReassembledTransferKind::EntryReply => {
+                format!(
+                    "{direction} epson_d4_entry=reply result=recognized bytes={}",
+                    transfer.bytes.len()
+                )
+            }
+            ReassembledTransferKind::D4Packet => self.d4_packet_summary(direction, &transfer.bytes),
+        }
+    }
+
+    fn d4_packet_summary(&mut self, direction: &str, bytes: &[u8]) -> String {
+        let Ok(header) = PacketHeader::decode(bytes) else {
+            return format!(
+                "{direction} transfer=raw framing=unrecognized bytes={}",
+                bytes.len()
+            );
+        };
+        let payload = bytes.get(D4_HEADER_LENGTH..).unwrap_or_default();
+        let request_response = if direction == "TX" {
+            "request"
+        } else {
+            "response"
+        };
+        let mut fields = vec![
+            format!("{direction} d4=packet"),
+            format!("request_response={request_response}"),
+            format!("peer_socket={}", header.peer_socket),
+            format!("source_socket={}", header.source_socket),
+            format!("total_length={}", header.length),
+            format!("payload_length={}", header.payload_length()),
+            format!("credit={}", header.credit),
+            format!("control=0x{:02X}", header.control),
+            format!("control_bits=0b{:02b}", header.control),
+        ];
+        if header.channel_id() == (0, 0) {
+            fields.extend(self.transaction_fields(payload));
+        } else {
+            fields.extend(control_payload_fields(payload));
+        }
+        fields.join(" ")
+    }
+
+    fn transaction_fields(&mut self, payload: &[u8]) -> Vec<String> {
+        let mut parsed = None;
+        for revision in [
+            self.transaction_revision,
+            alternate_revision(self.transaction_revision),
+        ] {
+            if let Ok(message) = TransactionMessage::decode(payload, revision) {
+                parsed = Some((message, revision));
+                break;
+            }
+        }
+        let Some((message, revision)) = parsed else {
+            return vec![format!(
+                "transaction=unknown revision_tried={}",
+                revision_label(self.transaction_revision)
+            )];
+        };
+
+        let mut fields = vec![format!("revision={}", revision_label(revision))];
+        match &message {
+            TransactionMessage::Init { revision } => {
+                fields.push("transaction=init".to_owned());
+                fields.push(format!("requested_revision={}", revision_label(*revision)));
+                self.transaction_revision = *revision;
+            }
+            TransactionMessage::InitReply { result, revision } => {
+                fields.push("transaction=init_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("negotiated_revision={}", revision_label(*revision)));
+                self.transaction_revision = *revision;
+            }
+            TransactionMessage::OpenChannel {
+                peer_socket,
+                source_socket,
+                max_packet_size,
+                max_service_size,
+                max_credit,
+                initial_credit,
+            } => {
+                fields.push("transaction=open_channel".to_owned());
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("max_packet_size={max_packet_size}"));
+                fields.push(format!("max_service_size={max_service_size}"));
+                fields.push(format!("max_credit={max_credit}"));
+                if let Some(initial_credit) = initial_credit {
+                    fields.push(format!("initial_credit={initial_credit}"));
+                }
+            }
+            TransactionMessage::OpenChannelReply {
+                result,
+                peer_socket,
+                source_socket,
+                max_packet_size,
+                max_service_size,
+                max_credit,
+                granted_credit,
+            } => {
+                fields.push("transaction=open_channel_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("max_packet_size={max_packet_size}"));
+                fields.push(format!("max_service_size={max_service_size}"));
+                fields.push(format!("max_credit={max_credit}"));
+                fields.push(format!("granted_credit={granted_credit}"));
+            }
+            TransactionMessage::CloseChannel {
+                peer_socket,
+                source_socket,
+            } => {
+                fields.push("transaction=close_channel".to_owned());
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+            }
+            TransactionMessage::CloseChannelReply {
+                result,
+                peer_socket,
+                source_socket,
+            } => {
+                fields.push("transaction=close_channel_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+            }
+            TransactionMessage::Credit {
+                peer_socket,
+                source_socket,
+                added_credit,
+            } => {
+                fields.push("transaction=credit".to_owned());
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("added_credit={added_credit}"));
+            }
+            TransactionMessage::CreditReply {
+                result,
+                peer_socket,
+                source_socket,
+            } => {
+                fields.push("transaction=credit_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+            }
+            TransactionMessage::CreditRequest {
+                peer_socket,
+                source_socket,
+                max_credit,
+            } => {
+                fields.push("transaction=credit_request".to_owned());
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("max_credit={max_credit}"));
+            }
+            TransactionMessage::CreditRequestReply {
+                result,
+                peer_socket,
+                source_socket,
+                added_credit,
+            } => {
+                fields.push("transaction=credit_request_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("added_credit={added_credit}"));
+            }
+            TransactionMessage::Exit => fields.push("transaction=exit".to_owned()),
+            TransactionMessage::ExitReply { result } => {
+                fields.push("transaction=exit_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+            }
+            TransactionMessage::GetSocketId { service_name } => {
+                fields.push("transaction=get_socket_id".to_owned());
+                fields.push(format!("service_name={service_name}"));
+            }
+            TransactionMessage::GetSocketIdReply {
+                result,
+                socket_id,
+                service_name,
+            } => {
+                fields.push("transaction=get_socket_id_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("socket_id={socket_id}"));
+                if !service_name.is_empty() {
+                    fields.push(format!("service_name={service_name}"));
+                }
+            }
+            TransactionMessage::GetServiceName { socket_id } => {
+                fields.push("transaction=get_service_name".to_owned());
+                fields.push(format!("socket_id={socket_id}"));
+            }
+            TransactionMessage::GetServiceNameReply {
+                result,
+                socket_id,
+                service_name,
+            } => {
+                fields.push("transaction=get_service_name_reply".to_owned());
+                fields.push(format!("result=0x{result:02X}"));
+                fields.push(format!("socket_id={socket_id}"));
+                if !service_name.is_empty() {
+                    fields.push(format!("service_name={service_name}"));
+                }
+            }
+            TransactionMessage::Error {
+                peer_socket,
+                source_socket,
+                error_code,
+            } => {
+                fields.push("transaction=error".to_owned());
+                fields.push(format!("transaction_peer_socket={peer_socket}"));
+                fields.push(format!("transaction_source_socket={source_socket}"));
+                fields.push(format!("error_code=0x{error_code:02X}"));
+            }
+        }
+        fields
+    }
+
+    /// Begins a newly captured operation without removing already displayed traffic.
+    ///
+    /// Reassembly and transaction decoding are scoped to a single selected-printer
+    /// operation, so incomplete transfers from an earlier operation cannot affect it.
+    pub fn begin_operation(&mut self) {
+        self.reset_decoder_state();
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.reset_decoder_state();
     }
 
     pub fn count(&self) -> usize {
@@ -155,6 +575,12 @@ impl DebugTrafficTrace {
     ) -> impl ExactSizeIterator<Item = &DebugTrafficEntry> + DoubleEndedIterator {
         self.entries.iter()
     }
+
+    fn reset_decoder_state(&mut self) {
+        self.tx_decoder = DebugTrafficDecoder::default();
+        self.rx_decoder = DebugTrafficDecoder::default();
+        self.transaction_revision = ProtocolRevision::V20;
+    }
 }
 
 fn format_hex_bytes(bytes: &[u8]) -> String {
@@ -163,6 +589,170 @@ fn format_hex_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn alternate_revision(revision: ProtocolRevision) -> ProtocolRevision {
+    match revision {
+        ProtocolRevision::V10 => ProtocolRevision::V20,
+        ProtocolRevision::V20 => ProtocolRevision::V10,
+    }
+}
+
+fn revision_label(revision: ProtocolRevision) -> &'static str {
+    match revision {
+        ProtocolRevision::V10 => "V10",
+        ProtocolRevision::V20 => "V20",
+    }
+}
+
+fn control_payload_fields(payload: &[u8]) -> Vec<String> {
+    if payload.is_ascii() && (payload.starts_with(b"@") || payload.starts_with(b"EE:")) {
+        return ascii_response_fields(payload);
+    }
+    let Some(command) = payload.get(..2) else {
+        return vec![format!("payload=raw payload_bytes={}", payload.len())];
+    };
+    let Some(length_bytes) = payload.get(2..4) else {
+        return vec![format!(
+            "command={} payload=truncated payload_bytes={}",
+            command_label(command),
+            payload.len()
+        )];
+    };
+    let declared_length = usize::from(u16::from_le_bytes([length_bytes[0], length_bytes[1]]));
+    let body = &payload[4..];
+    let mut fields = vec![
+        format!("command={}", command_label(command)),
+        format!("payload_length={declared_length}"),
+    ];
+    if body.len() != declared_length {
+        fields.push(format!("payload_actual_length={}", body.len()));
+    }
+
+    if command == b"||" {
+        fields.extend(factory_command_fields(
+            &body[..body.len().min(declared_length)],
+        ));
+    } else if body.is_ascii() {
+        fields.push(format!("payload_ascii={}", ascii_summary(body)));
+    }
+    fields
+}
+
+fn command_label(command: &[u8]) -> String {
+    if command.len() == 2 && command.iter().all(u8::is_ascii_graphic) {
+        String::from_utf8_lossy(command).into_owned()
+    } else {
+        format_hex_bytes(command)
+    }
+}
+
+fn factory_command_fields(factory: &[u8]) -> Vec<String> {
+    let mut fields = Vec::new();
+    let Some(key) = factory.get(..2) else {
+        fields.push(format!("factory=truncated factory_bytes={}", factory.len()));
+        return fields;
+    };
+    fields.push(format!(
+        "factory_key=0x{:04X}",
+        u16::from_le_bytes([key[0], key[1]])
+    ));
+    let Some(operation) = factory.get(2).copied() else {
+        fields.push(format!("factory=truncated factory_bytes={}", factory.len()));
+        return fields;
+    };
+    let complement = factory.get(3).copied();
+    let check = factory.get(4).copied();
+    fields.push(format!(
+        "operation={}",
+        char::from(operation).escape_default()
+    ));
+    if let Some(complement) = complement {
+        fields.push(format!("operation_complement=0x{complement:02X}"));
+        fields.push(format!("complement_valid={}", complement == !operation));
+    }
+    if let Some(check) = check {
+        let expected = ((operation >> 1) & 0x7f) | ((operation << 7) & 0x80);
+        fields.push(format!("check=0x{check:02X}"));
+        fields.push(format!("check_valid={}", check == expected));
+    }
+
+    let body = factory.get(5..).unwrap_or_default();
+    match operation {
+        b'A' => {
+            fields.push(format!("address_bytes={}", format_hex_bytes(body)));
+            if body.len() == 2 {
+                fields.push(format!(
+                    "address=0x{:04X}",
+                    u16::from_le_bytes([body[0], body[1]])
+                ));
+            }
+        }
+        b'B' if body.len() >= 3 => {
+            let address = &body[..2];
+            fields.push(format!("address_bytes={}", format_hex_bytes(address)));
+            fields.push(format!(
+                "address=0x{:04X}",
+                u16::from_le_bytes([address[0], address[1]])
+            ));
+            fields.push(format!("value=0x{:02X}", body[2]));
+            fields.push(format!("write_key_length={}", body.len() - 3));
+        }
+        b'B' => fields.push(format!("factory_write=truncated body_bytes={}", body.len())),
+        _ => fields.push(format!("factory_body_length={}", body.len())),
+    }
+    fields
+}
+
+fn ascii_summary(bytes: &[u8]) -> String {
+    let mut value = String::new();
+    for byte in bytes.iter().take(80) {
+        match byte {
+            b' '..=b'~' => value.push(char::from(*byte)),
+            b'\r' => value.push_str("\\r"),
+            b'\n' => value.push_str("\\n"),
+            b'\t' => value.push_str("\\t"),
+            _ => value.push('.'),
+        }
+    }
+    if bytes.len() > 80 {
+        value.push('…');
+    }
+    value
+}
+
+fn ascii_response_fields(payload: &[u8]) -> Vec<String> {
+    let mut fields = vec![
+        "response=ascii".to_owned(),
+        format!("ascii={}", ascii_summary(payload)),
+    ];
+    let Some(marker) = payload.windows(3).position(|window| window == b"EE:") else {
+        return fields;
+    };
+    let Some(hex) = payload.get(marker + 3..marker + 9) else {
+        return fields;
+    };
+    if payload.get(marker + 9) != Some(&b';') || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return fields;
+    }
+    let parse_byte = |pair: &[u8]| {
+        std::str::from_utf8(pair)
+            .ok()
+            .and_then(|value| u8::from_str_radix(value, 16).ok())
+    };
+    let (Some(high), Some(low), Some(value)) = (
+        parse_byte(&hex[..2]),
+        parse_byte(&hex[2..4]),
+        parse_byte(&hex[4..]),
+    ) else {
+        return fields;
+    };
+    fields.push(format!(
+        "eeprom_address=0x{:04X}",
+        u16::from_be_bytes([high, low])
+    ));
+    fields.push(format!("eeprom_value=0x{value:02X}"));
+    fields
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -460,11 +1050,13 @@ impl GuiState {
 #[cfg(test)]
 mod tests {
     use reink_core::ModelDatabase;
+    use reink_d4::{Packet, ProtocolRevision, TransactionMessage};
     use reink_platform::TransportEvent;
 
     use super::{
-        DEBUG_TRAFFIC_MAX_ENTRIES, DebugTrafficDirection, DebugTrafficTrace, FIXTURE_DEVICES,
-        GuiState, Page, SourceMode, ValidationStatus, model_hints_for_usb_candidate,
+        DEBUG_TRAFFIC_MAX_ENTRIES, DebugTrafficDirection, DebugTrafficTrace,
+        EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, FIXTURE_DEVICES, GuiState, Page, SourceMode,
+        ValidationStatus, format_hex_bytes, model_hints_for_usb_candidate,
     };
 
     #[test]
@@ -488,6 +1080,235 @@ mod tests {
         assert_eq!(entries[1].hex_bytes(), "06");
         assert_eq!(entries[2].direction(), DebugTrafficDirection::Rx);
         assert_eq!(entries[2].hex_bytes(), "");
+        assert_eq!(
+            entries[2].summary(),
+            "RX usb_bulk_in=empty observation=timeout_like"
+        );
+        assert!(entries[0].id() < entries[1].id());
+    }
+
+    #[test]
+    fn debug_trace_reassembles_a_fragmented_epson_d4_entry_reply() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+
+        trace.append(&TransportEvent::Rx(EPSON_D4_ENTRY_REPLY[..4].to_vec()));
+        assert_eq!(trace.count(), 0);
+        trace.append(&TransportEvent::Rx(EPSON_D4_ENTRY_REPLY[4..].to_vec()));
+
+        let entry = trace.entries().next().unwrap();
+        assert_eq!(entry.direction(), DebugTrafficDirection::Rx);
+        assert_eq!(entry.hex_bytes(), "00 00 00 08 01 00 C5 00");
+        assert_eq!(
+            entry.summary(),
+            "RX epson_d4_entry=reply result=recognized bytes=8"
+        );
+    }
+
+    #[test]
+    fn debug_trace_reassembles_fragmented_and_multiple_d4_packets() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+
+        let first = Packet::new(2, 2, b"di\x01\x00\x01".to_vec(), 1, 0)
+            .unwrap()
+            .encode();
+        let second = Packet::new(2, 2, b"st\x01\x00\x01".to_vec(), 3, 1)
+            .unwrap()
+            .encode();
+        trace.append(&TransportEvent::Tx(first[..4].to_vec()));
+        assert_eq!(trace.count(), 1);
+        let mut tail = first[4..].to_vec();
+        tail.extend(&second);
+        trace.append(&TransportEvent::Tx(tail));
+
+        let entries = trace.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].hex_bytes(), format_hex_bytes(&first));
+        assert!(entries[1].summary().contains("command=di"));
+        assert!(entries[1].summary().contains("payload_length=1"));
+        assert!(entries[2].summary().contains("command=st"));
+        assert!(entries[2].summary().contains("credit=3"));
+        assert!(entries[2].summary().contains("control_bits=0b01"));
+    }
+
+    #[test]
+    fn debug_trace_tracks_v20_and_v10_transaction_layouts() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+
+        let init_v20 = Packet::new(
+            0,
+            0,
+            TransactionMessage::Init {
+                revision: ProtocolRevision::V20,
+            }
+            .encode(ProtocolRevision::V20)
+            .unwrap(),
+            1,
+            0,
+        )
+        .unwrap()
+        .encode();
+        let open_v20 = Packet::new(
+            0,
+            0,
+            TransactionMessage::OpenChannel {
+                peer_socket: 2,
+                source_socket: 3,
+                max_packet_size: 0x100,
+                max_service_size: 0x200,
+                max_credit: 4,
+                initial_credit: None,
+            }
+            .encode(ProtocolRevision::V20)
+            .unwrap(),
+            1,
+            0,
+        )
+        .unwrap()
+        .encode();
+        let init_v10 = Packet::new(
+            0,
+            0,
+            TransactionMessage::Init {
+                revision: ProtocolRevision::V10,
+            }
+            .encode(ProtocolRevision::V10)
+            .unwrap(),
+            1,
+            0,
+        )
+        .unwrap()
+        .encode();
+        let open_v10 = Packet::new(
+            0,
+            0,
+            TransactionMessage::OpenChannel {
+                peer_socket: 4,
+                source_socket: 5,
+                max_packet_size: 0x40,
+                max_service_size: 0x80,
+                max_credit: 6,
+                initial_credit: Some(7),
+            }
+            .encode(ProtocolRevision::V10)
+            .unwrap(),
+            1,
+            0,
+        )
+        .unwrap()
+        .encode();
+        let mut transfer = init_v20;
+        transfer.extend(open_v20);
+        transfer.extend(init_v10);
+        transfer.extend(open_v10);
+        trace.append(&TransportEvent::Tx(transfer));
+
+        let summaries = trace
+            .entries()
+            .map(|entry| entry.summary())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 5);
+        assert!(summaries[1].contains("transaction=init"));
+        assert!(summaries[1].contains("requested_revision=V20"));
+        assert!(summaries[2].contains("revision=V20"));
+        assert!(summaries[2].contains("max_packet_size=256"));
+        assert!(summaries[3].contains("requested_revision=V10"));
+        assert!(summaries[4].contains("revision=V10"));
+        assert!(summaries[4].contains("initial_credit=7"));
+    }
+
+    #[test]
+    fn debug_trace_decodes_l1300_factory_read_and_ascii_eeprom_reply() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+        let read = Packet::new(2, 2, b"||\x07\x002\x08A\xbe\xa0\x26\x00".to_vec(), 1, 0)
+            .unwrap()
+            .encode();
+        trace.append(&TransportEvent::Tx(read));
+
+        let read_summary = trace.entries().next_back().unwrap().summary();
+        assert!(read_summary.contains("command=||"));
+        assert!(read_summary.contains("factory_key=0x0832"));
+        assert!(read_summary.contains("operation=A"));
+        assert!(read_summary.contains("operation_complement=0xBE"));
+        assert!(read_summary.contains("check=0xA0"));
+        assert!(read_summary.contains("address_bytes=26 00"));
+        assert!(read_summary.contains("address=0x0026"));
+
+        let mut reply_trace = DebugTrafficTrace::new();
+        reply_trace.set_capture_enabled(true);
+        reply_trace.append(&TransportEvent::Rx(EPSON_D4_ENTRY_REPLY.to_vec()));
+        let reply = Packet::new(2, 2, b"@BDC PS EE:002600;".to_vec(), 1, 0)
+            .unwrap()
+            .encode();
+        reply_trace.append(&TransportEvent::Rx(reply));
+
+        let reply_summary = reply_trace.entries().next_back().unwrap().summary();
+        assert!(reply_summary.contains("request_response=response"));
+        assert!(reply_summary.contains("response=ascii"));
+        assert!(reply_summary.contains("eeprom_address=0x0026"));
+        assert!(reply_summary.contains("eeprom_value=0x00"));
+    }
+
+    #[test]
+    fn debug_trace_reports_factory_write_key_length_without_decoding_the_key() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+        let payload = b"||\x11\x002\x08B\xbd!\x26\x00\xAASENSITIVE";
+        let packet = Packet::new(2, 2, payload.to_vec(), 1, 0).unwrap().encode();
+        trace.append(&TransportEvent::Tx(packet));
+
+        let summary = trace.entries().next_back().unwrap().summary();
+        assert!(summary.contains("operation=B"));
+        assert!(summary.contains("address_bytes=26 00"));
+        assert!(summary.contains("value=0xAA"));
+        assert!(summary.contains("write_key_length=9"));
+        assert!(!summary.contains("SENSITIVE"));
+    }
+
+    #[test]
+    fn debug_trace_keeps_malformed_and_unknown_transfers_as_raw() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+
+        trace.append(&TransportEvent::Tx(vec![0, 0, 0, 5, 0, 0]));
+        let unknown = Packet::new(2, 2, [0xff], 1, 0).unwrap().encode();
+        trace.append(&TransportEvent::Tx(unknown));
+
+        let entries = trace.entries().collect::<Vec<_>>();
+        assert_eq!(entries[1].hex_bytes(), "00 00 00 05 00 00");
+        assert!(entries[1].summary().contains("transfer=raw"));
+        assert!(entries[1].summary().contains("framing=unrecognized"));
+        assert!(entries[2].summary().contains("payload=raw"));
+    }
+
+    #[test]
+    fn empty_read_does_not_break_pending_packet_reassembly() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Rx(EPSON_D4_ENTRY_REPLY.to_vec()));
+        let packet = Packet::new(2, 2, b"st\x01\x00\x01".to_vec(), 1, 0)
+            .unwrap()
+            .encode();
+
+        trace.append(&TransportEvent::Rx(packet[..3].to_vec()));
+        trace.append(&TransportEvent::Rx(Vec::new()));
+        trace.append(&TransportEvent::Rx(packet[3..].to_vec()));
+
+        let entries = trace.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[1].summary(),
+            "RX usb_bulk_in=empty observation=timeout_like"
+        );
+        assert_eq!(entries[2].hex_bytes(), format_hex_bytes(&packet));
     }
 
     #[test]
@@ -517,15 +1338,65 @@ mod tests {
     }
 
     #[test]
-    fn debug_trace_clears_session_entries() {
+    fn debug_trace_begins_each_operation_with_fresh_decoder_state() {
         let mut trace = DebugTrafficTrace::new();
         trace.set_capture_enabled(true);
-        trace.append(&TransportEvent::Rx(vec![0x06]));
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+        trace.append(&TransportEvent::Rx(EPSON_D4_ENTRY_REPLY[..4].to_vec()));
+        trace.transaction_revision = ProtocolRevision::V10;
+
+        trace.begin_operation();
+
+        assert_eq!(trace.count(), 1);
+        assert!(trace.tx_decoder.bytes.is_empty());
+        assert!(!trace.tx_decoder.d4_active);
+        assert!(trace.rx_decoder.bytes.is_empty());
+        assert!(!trace.rx_decoder.d4_active);
+        assert_eq!(trace.transaction_revision, ProtocolRevision::V20);
+
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+
+        let entries = trace.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].summary(),
+            format!(
+                "TX epson_d4_entry=command bytes={}",
+                EPSON_D4_ENTRY_COMMAND.len()
+            )
+        );
+        assert_eq!(
+            entries[1].summary(),
+            format!(
+                "TX epson_d4_entry=command bytes={}",
+                EPSON_D4_ENTRY_COMMAND.len()
+            )
+        );
+    }
+
+    #[test]
+    fn debug_trace_clear_discards_partial_packets() {
+        let mut trace = DebugTrafficTrace::new();
+        trace.set_capture_enabled(true);
+        trace.append(&TransportEvent::Tx(EPSON_D4_ENTRY_COMMAND.to_vec()));
+        let packet = Packet::new(2, 2, b"st\x07\x00PRIVATE".to_vec(), 1, 0)
+            .unwrap()
+            .encode();
+        trace.append(&TransportEvent::Tx(packet[..12].to_vec()));
 
         trace.clear();
+        trace.append(&TransportEvent::Tx(packet[12..].to_vec()));
 
-        assert_eq!(trace.count(), 0);
-        assert!(trace.entries().next().is_none());
+        let entries = trace.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hex_bytes(), format_hex_bytes(&packet[12..]));
+        assert!(entries[0].summary().contains("transfer=raw"));
+        assert_ne!(entries[0].hex_bytes(), format_hex_bytes(&packet));
+        assert!(
+            !entries[0]
+                .hex_bytes()
+                .contains(&format_hex_bytes(&packet[..12]))
+        );
     }
 
     #[test]

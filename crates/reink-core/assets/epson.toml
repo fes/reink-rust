@@ -1497,11 +1497,38 @@ mem_high = 0x7FF
 rkey = 0x0832
 wkey = "LpubHfef"
 wkey1 = "KotaGede"
-models = ["ET-14000", "L1300"]
+models = ["ET-14000"]
 mem = [
   { addr = [0x24,0x25,0x5A] , desc = "Waste counters (?)" , reset = [0x00,0x00,0x5E] },
   { addr = [0x26,0x27] , desc = "Waste counter" },
   { addr = [0x58] , desc = "Waste counter" },
+]
+rlen = 2
+wlen = 2
+mem_high = 0x1FF
+
+[[EPSON]]
+rkey = 0x0832
+wkey = "LpubHfef"
+wkey1 = "KotaGede"
+models = ["L1300"]
+mem = [
+  { addr = [0x24,0x25,0x5A] , desc = "Waste counters (?)" , reset = [0x00,0x00,0x5E] },
+  { addr = [0x26,0x27] , desc = "Waste counter" },
+  { addr = [0x58] , desc = "Waste counter" },
+]
+read_only_fields = [
+  { range = [0x26,0x27], label = "Waste counter", encoding = "u16le", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. The observed WIC display used denominator 11,809; no scaling semantics are applied." },
+  { address = 0x58, label = "Related byte (role unknown)", encoding = "raw", confidence = "related-unknown", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. Read alongside the waste-counter pair; its role is unknown." },
+  { address = 0x16A, label = "Manual-cleaning count", encoding = "u8", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { address = 0x16E, label = "Timer-cleaning count", encoding = "u8", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { range = [0xB0,0xB3], label = "Total print-page count", encoding = "u32le", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { range = [0xB4,0xB7], label = "Total print-pass count", encoding = "u32le", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { address = 0x4A, label = "Fatal-error history byte 1", encoding = "raw", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { range = [0x5C,0x5F], label = "Fatal-error history bytes 2-5", encoding = "raw", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
+  { range = [0xC2,0xCB], label = "Serial number", encoding = "ascii", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. Device-specific value is sensitive.", sensitive = true },
+  { range = [0x82,0x85], label = "Print-head ID data (packing unknown)", encoding = "raw", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. Packing is unknown." },
+  { address = 0x98, label = "Print-head ID data (packing unknown)", encoding = "raw", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. Packing is unknown." },
 ]
 rlen = 2
 wlen = 2

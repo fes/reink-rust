@@ -3317,6 +3317,7 @@ dependencies = [
  "regex",
  "reink-app",
  "reink-core",
+ "reink-d4",
  "reink-platform",
  "reink-usb",
  "rfd",

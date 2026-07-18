@@ -10,6 +10,7 @@ use reink_app::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_core::{CounterResetTarget, EpsonSpec, ModelDatabase};
+use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
 use reink_gui::{
     DebugTrafficTrace, DescriptorCandidate, GuiState, Page, SourceMode, ValidationStatus,
 };
@@ -73,7 +74,12 @@ struct LoadedEeprom {
 
 struct EepromFileField {
     address: usize,
+    end_address: usize,
     label: String,
+    encoding: EepromFieldEncoding,
+    confidence: Option<EepromFieldConfidence>,
+    evidence_note: Option<String>,
+    sensitive: bool,
 }
 
 enum UsbScanStatus {
@@ -322,15 +328,35 @@ impl ReinkGui {
             return Vec::new();
         };
 
-        spec.memory_operations
-            .iter()
-            .flat_map(|operation| {
-                operation.addresses.iter().map(|address| EepromFileField {
-                    address: *address as usize,
-                    label: operation.description.clone(),
+        if spec.read_only_fields.is_empty() {
+            spec.memory_operations
+                .iter()
+                .flat_map(|operation| {
+                    operation.addresses.iter().map(|address| EepromFileField {
+                        address: *address as usize,
+                        end_address: *address as usize,
+                        label: operation.description.clone(),
+                        encoding: EepromFieldEncoding::RawBytes,
+                        confidence: None,
+                        evidence_note: None,
+                        sensitive: false,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        } else {
+            spec.read_only_fields
+                .iter()
+                .map(|field| EepromFileField {
+                    address: usize::from(field.address),
+                    end_address: usize::from(field.end_address),
+                    label: field.label.clone(),
+                    encoding: field.encoding,
+                    confidence: Some(field.confidence),
+                    evidence_note: Some(field.evidence_note.clone()),
+                    sensitive: field.sensitive,
+                })
+                .collect()
+        }
     }
 
     fn select_eeprom_address(&mut self, address: usize) {
@@ -638,6 +664,9 @@ impl ReinkGui {
         self.usb_operation_receiver = Some(receiver);
         self.usb_operation_result = None;
         let record_traffic = self.debug_traffic.capture_enabled();
+        if record_traffic {
+            self.debug_traffic.begin_operation();
+        }
         std::thread::spawn(move || {
             let outcome =
                 run_selected_usb_operation(candidate, expected_model, request, record_traffic);
@@ -1159,7 +1188,7 @@ impl ReinkGui {
             selected_label.as_str(),
         );
         let address_width = 84.0;
-        let value_width = 60.0;
+        let value_width = 160.0;
         let field_panel_width = address_width + field_column_width + value_width + 32.0;
         let dump_panel_width = 600.0;
         let dump_panel_height = 48.0
@@ -1203,27 +1232,35 @@ impl ReinkGui {
                                 );
                             } else if selected_is_file {
                                 for field in &file_fields {
-                                    let Some(offset) = eeprom_image_offset(
+                                    if eeprom_image_offset(
                                         file_start_address,
                                         bytes.len(),
                                         field.address,
-                                    ) else {
+                                    )
+                                    .is_none()
+                                    {
                                         continue;
-                                    };
+                                    }
                                     ui.separator();
+                                    let value = eeprom_field_value(
+                                        field,
+                                        file_start_address,
+                                        &bytes,
+                                    );
                                     let response = eeprom_table_row(
                                         ui,
                                         address_width,
                                         field_column_width,
                                         value_width,
-                                        &format!("0x{:04X}", field.address),
+                                        &eeprom_field_address_label(field),
                                         &field.label,
-                                        &format!("0x{:02X}", bytes[offset]),
+                                        &value,
                                         field.address == selected_address,
                                         false,
                                         42.0,
-                                    );
-                                    if response {
+                                    )
+                                    .on_hover_text(eeprom_field_tooltip(field));
+                                    if response.clicked() {
                                         selected_address_from_dump = Some(field.address);
                                     }
                                 }
@@ -1244,7 +1281,7 @@ impl ReinkGui {
                                         false,
                                         42.0,
                                     );
-                                    if response {
+                                    if response.clicked() {
                                         self.state.select_eeprom_row(index);
                                     }
                                 }
@@ -1827,13 +1864,21 @@ impl ReinkGui {
                 if self.debug_traffic.count() == 0 {
                     ui.label("No traffic captured in this session.");
                 } else {
-                    ui.strong("Recorded transfers");
+                    ui.strong("Recorded requests and responses");
                     for entry in self.debug_traffic.entries() {
-                        ui.monospace(format!(
-                            "{}  {}",
-                            entry.direction().label(),
-                            entry.hex_bytes()
-                        ));
+                        egui::CollapsingHeader::new(entry.summary())
+                            .id_salt(("debug-traffic-entry", entry.id()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.indent(("debug-traffic-entry-bytes", entry.id()), |ui| {
+                                    let bytes = if entry.hex_bytes().is_empty() {
+                                        "<empty>"
+                                    } else {
+                                        entry.hex_bytes()
+                                    };
+                                    ui.monospace(format!("bytes={bytes}"));
+                                });
+                            });
                     }
                 }
             });
@@ -2365,6 +2410,88 @@ fn eeprom_image_offset(start_address: usize, byte_count: usize, address: usize) 
         .filter(|offset| *offset < byte_count)
 }
 
+fn eeprom_field_address_label(field: &EepromFileField) -> String {
+    if field.address == field.end_address {
+        format!("0x{:04X}", field.address)
+    } else {
+        format!("0x{:04X}..0x{:04X}", field.address, field.end_address)
+    }
+}
+
+fn eeprom_field_value(field: &EepromFileField, image_start_address: usize, bytes: &[u8]) -> String {
+    if field.sensitive {
+        return "Hidden (sensitive)".to_owned();
+    }
+    let Some(field_bytes) = eeprom_field_bytes(field, image_start_address, bytes) else {
+        return "Unavailable".to_owned();
+    };
+
+    match field.encoding {
+        EepromFieldEncoding::U8 => {
+            let value = field_bytes[0];
+            format!("{value} (0x{value:02X})")
+        }
+        EepromFieldEncoding::U16Le => {
+            let value = u16::from_le_bytes([field_bytes[0], field_bytes[1]]);
+            format!("{value} (0x{value:04X})")
+        }
+        EepromFieldEncoding::U32Le => {
+            let value = u32::from_le_bytes([
+                field_bytes[0],
+                field_bytes[1],
+                field_bytes[2],
+                field_bytes[3],
+            ]);
+            format!("{value} (0x{value:08X})")
+        }
+        EepromFieldEncoding::Ascii => {
+            let value = field_bytes
+                .iter()
+                .map(|byte| match byte {
+                    b' '..=b'~' => char::from(*byte),
+                    _ => '.',
+                })
+                .collect::<String>();
+            format!("{value:?}")
+        }
+        EepromFieldEncoding::RawBytes => field_bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn eeprom_field_bytes<'a>(
+    field: &EepromFileField,
+    image_start_address: usize,
+    bytes: &'a [u8],
+) -> Option<&'a [u8]> {
+    let offset = eeprom_image_offset(image_start_address, bytes.len(), field.address)?;
+    let byte_len = field
+        .end_address
+        .checked_sub(field.address)?
+        .checked_add(1)?;
+    bytes.get(offset..offset.checked_add(byte_len)?)
+}
+
+fn eeprom_field_tooltip(field: &EepromFileField) -> String {
+    let mut lines = vec![
+        format!("Read-only field: {}", eeprom_field_address_label(field)),
+        format!("Encoding: {}", field.encoding.label()),
+    ];
+    if let Some(confidence) = field.confidence {
+        lines.push(format!("Confidence: {}", confidence.label()));
+    }
+    if let Some(note) = &field.evidence_note {
+        lines.push(format!("Evidence: {note}"));
+    }
+    if field.sensitive {
+        lines.push("Decoded value is hidden by default because it is sensitive.".to_owned());
+    }
+    lines.join("\n")
+}
+
 fn eeprom_table_row(
     ui: &mut egui::Ui,
     address_width: f32,
@@ -2376,7 +2503,7 @@ fn eeprom_table_row(
     selected: bool,
     header: bool,
     height: f32,
-) -> bool {
+) -> egui::Response {
     let (address_alignment, field_alignment, value_alignment) = if header {
         (
             egui::Align::Center,
@@ -2419,7 +2546,7 @@ fn eeprom_table_row(
     );
     paint_eeprom_cell(ui, field_rect, field, selected, field_alignment, header);
     paint_eeprom_cell(ui, value_rect, value, selected, value_alignment, header);
-    response.clicked()
+    response
 }
 
 fn paint_eeprom_cell(
@@ -2598,14 +2725,18 @@ fn status_color(status: ValidationStatus) -> Color32 {
 
 #[cfg(test)]
 mod tests {
+    use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
     use reink_gui::SourceMode;
 
+    use super::{
+        EepromFileField, eeprom_field_address_label, eeprom_field_tooltip, eeprom_field_value,
+        eeprom_image_offset, source_mode_from_args,
+    };
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use super::{
         confirmation_matches, display_status_response, format_current_values, parse_u8_input,
         parse_u16_input, selected_model_for_usb_candidate, validate_restore_image_size,
     };
-    use super::{eeprom_image_offset, source_mode_from_args};
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use reink_gui::{DescriptorCandidate, GuiState};
 
@@ -2626,6 +2757,53 @@ mod tests {
         assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0214), Some(0x14));
         assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x01ff), None);
         assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0220), None);
+    }
+
+    #[test]
+    fn loaded_field_values_decode_multi_byte_data_and_hide_sensitive_values() {
+        let counter = EepromFileField {
+            address: 0x26,
+            end_address: 0x27,
+            label: "Waste counter".to_owned(),
+            encoding: EepromFieldEncoding::U16Le,
+            confidence: Some(EepromFieldConfidence::Confirmed),
+            evidence_note: Some("Reviewed sanitized evidence.".to_owned()),
+            sensitive: false,
+        };
+        let pages = EepromFileField {
+            address: 0xb0,
+            end_address: 0xb3,
+            label: "Total print-page count".to_owned(),
+            encoding: EepromFieldEncoding::U32Le,
+            confidence: Some(EepromFieldConfidence::Confirmed),
+            evidence_note: Some("Reviewed sanitized evidence.".to_owned()),
+            sensitive: false,
+        };
+        let serial = EepromFileField {
+            address: 0xc2,
+            end_address: 0xcb,
+            label: "Serial number".to_owned(),
+            encoding: EepromFieldEncoding::Ascii,
+            confidence: Some(EepromFieldConfidence::Confirmed),
+            evidence_note: Some("Sensitive device-specific field.".to_owned()),
+            sensitive: true,
+        };
+        let mut image = vec![0; 0xcc];
+        image[0x26..0x28].copy_from_slice(&[0x34, 0x12]);
+        image[0xb0..0xb4].copy_from_slice(&[0x78, 0x56, 0x34, 0x12]);
+        image[0xc2..0xcc].copy_from_slice(b"PRIVATE-01");
+
+        assert_eq!(eeprom_field_address_label(&counter), "0x0026..0x0027");
+        assert_eq!(eeprom_field_value(&counter, 0, &image), "4660 (0x1234)");
+        assert_eq!(
+            eeprom_field_value(&pages, 0, &image),
+            "305419896 (0x12345678)"
+        );
+        assert_eq!(eeprom_field_value(&serial, 0, &image), "Hidden (sensitive)");
+        let tooltip = eeprom_field_tooltip(&serial);
+        assert!(tooltip.contains("Confidence: Confirmed"));
+        assert!(tooltip.contains("Sensitive device-specific field."));
+        assert!(!tooltip.contains("PRIVATE-01"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

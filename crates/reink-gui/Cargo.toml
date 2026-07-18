@@ -11,6 +11,7 @@ eframe = "0.35"
 regex = "1.11"
 reink-app = { path = "../reink-app" }
 reink-core = { path = "../reink-core" }
+reink-d4 = { path = "../reink-d4" }
 reink-platform = { path = "../reink-platform" }
 rfd = "0.15"
 
