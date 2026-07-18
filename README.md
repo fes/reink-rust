@@ -41,9 +41,10 @@ specific gate.
 | Epson D4 application service with status and write plans | Implemented; used by explicit read workflows, confirmed CLI mutations, and gated hardware write evidence |
 | Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; used by explicit read workflows and gated write evidence |
 | SNMP control adapter, safe Epson status/EEPROM inspection, and mDNS discovery | Implemented with deterministic tests |
-| Windows native USB sessions | Implemented through libusb; no automatic write path |
+| Windows native USB sessions | Implemented through libusb for explicit reads, guarded GUI mutations, and reversible write evidence; no stock-driver backend |
 | CLI inspection, offline binary analysis, selected USB status, SNMP EEPROM inspection, and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
 | Read-only terminal UI model browser | Implemented |
+| Guarded native GUI with protocol-aware traffic tracing | Implemented on Linux, macOS, and Windows; direct operations require an accessible selected USB interface |
 
 ## Porting approach
 
@@ -89,7 +90,7 @@ Epson domain commands ---- IEEE 1284.4 protocol
             USB | device file | SNMP | mDNS adapters
 ```
 
-Current and planned workspace crates:
+Current workspace crates:
 
 | Crate | Responsibility |
 | --- | --- |
@@ -220,12 +221,13 @@ compatible Epson D4 entry exchange, initializes D4, opens `EPSON-CTRL`, and
 exposes identity, raw status, EEPROM, and validated write-plan operations. It also closes
 the service channel and terminates D4 through `shutdown()`.
 
-On Linux, macOS, and Windows, `probe_epson_d4_entry` is the separate safe entry-probe API used by
-the CLI and hardware-test driver. It owns the Epson request and reply
-semantics while delegating bounded USB I/O to `reink-usb`; it stops before D4
-Init or service setup. The D4 entry exchange is tested only with scripted
-transports. Do not use it against hardware until the evidence requirements in
-the protocol provenance plan have been met for the selected printer family.
+On Linux, macOS, and Windows, `probe_epson_d4_entry` is the separate safe
+entry-probe API used by the CLI and hardware-test driver. It owns the Epson
+request and reply semantics while delegating bounded USB I/O to `reink-usb`; it
+stops before D4 Init or service setup. The D4 entry exchange has deterministic
+scripted coverage and reviewed sanitized L1300 evidence. Use it against hardware
+only for an explicitly selected printer family whose evidence requirements in
+the protocol provenance plan have been met.
 
 Build and test the service independently with:
 
@@ -486,9 +488,11 @@ cargo run -p reink-hardware-test -- d4-eeprom-read --vendor-id 0x04b8 --product-
 
 All successful reports use schema version 3 with `mode: "read_only"` and
 ordered step objects (`name`, `status`, and `result`). Preserve those reports as
-hardware evidence. Read-only commands never write. Physical writes and semantic resets are supported only by the explicit, gated
-write-evidence command or confirmed CLI commands; no default workflow,
-read-evidence runner, or GUI action writes printer state. Read-only failure reports are also schema version 3, include
+hardware evidence. Read-only commands never write. Physical writes and semantic
+resets are supported only by the explicit gated write-evidence command,
+confirmed CLI commands, or guarded GUI actions; no default workflow or
+read-evidence runner writes printer state. Read-only failure reports are also
+schema version 3, include
 reconnect/power-cycle/reboot remediation, and record the failing stage without
 raw trace bytes or invented successful EEPROM values.
 
@@ -607,11 +611,11 @@ does not open or claim a device, detach or hand off a driver, send control, D4,
 or EEPROM traffic, or enable writes. Candidates use a session-only alias and
 show only VID/PID, bus/address, interface/alternate setting, and exact bundled
 VID/PID model hints; hints are not identity confirmation. The GUI has no
-driver-handoff control. Its explicit read-only EEPROM operation automatically
-hands off only a selected Linux interface driver when necessary; on Windows
-and macOS it only claims an already libusb-accessible selected interface and
-never changes a driver. Default mode never opens or claims a device,
-hands off a driver, or sends traffic.
+driver-handoff control. Its explicit selected-printer operations automatically
+hand off only a selected Linux interface driver when necessary; on Windows and
+macOS they only claim an already libusb-accessible selected interface and never
+change a driver. Default mode never opens or claims a device, hands off a
+driver, or sends traffic.
 
 Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
 `Tools` tabs. Bundled fixtures are hidden unless explicitly enabled with
@@ -665,13 +669,14 @@ These instructions assume a stock operating system and a new checkout. Linux
 diagnostics and repair automatically hand off only an explicitly selected Linux
 printer interface; ordinary development does not modify USB drivers.
 
-### Windows: build, test, and read-only USB evidence
+### Windows: build, test, and guarded USB access
 
 Windows supports the workspace's pure crates, CLI, terminal UI, descriptor/real
 GUI (with explicit fixture opt-in), mDNS, SNMP, selected read-only evidence,
-and explicitly gated write-evidence libusb USB sessions. Windows USB access claims only an already libusb-accessible
-selected interface. It never installs, detaches, rebinds, changes, or restores
-a driver; an access failure is a safe stop.
+guarded GUI mutations, and explicitly gated write-evidence libusb USB sessions.
+Windows USB access claims only an already libusb-accessible selected interface.
+It never installs, detaches, rebinds, changes, or restores a driver; an access
+failure is a safe stop.
 
 1. Install [Git for Windows](https://git-scm.com/download/win).
 2. Install the current stable Rust MSVC toolchain from
@@ -804,7 +809,8 @@ validation and counter merging, Epson command encoding, EEPROM reply parsing,
 D4 state transitions, strict malformed transaction rejection, deterministic
 packet-fragmentation matrices, transcript-replayed read-only sessions, the
 read-only D4 application session, SNMP OID mapping, mDNS result conversion,
-CLI argument parsing, and platform test doubles.
+CLI argument parsing, guarded write/restore/reset paths, protocol-aware GUI
+traffic decoding and clipboard serialization, and platform test doubles.
 There is no automated CI workflow in this repository. The
 `reink-hardware-test` commands and sibling evidence runners are manual,
 opt-in hardware validation tools, not automated CI smoke tests; each requires
@@ -829,9 +835,9 @@ session.shutdown()?;
 ```
 
 `transport` must come from an explicitly selected adapter such as the libusb
-USB backend. The example is read-only; validated write plans are exposed only
-to the dedicated write-evidence workflow and confirmed CLI commands, never as
-an automatic application action.
+USB backend. The example is read-only; validated write plans are used only by
+the dedicated write-evidence workflow, confirmed CLI commands, and guarded GUI
+actions, never as an automatic application action.
 
 ## Compatibility and safety
 

@@ -202,8 +202,7 @@ automated runner passes `--skip-d4-entry-probe` and lets each later D4 command
 start and close its own session.
 
 After every evidence command succeeds, the automated Linux and Windows runners
-invoke the
-durable `reink-cli usb-eeprom-dump` workflow and saves a new private
+invoke the durable `reink-cli usb-eeprom-dump` workflow and save a new private
 `eeprom-image.bin` beside the reports. It is a model-bounded read-only image,
 not a hardware-test report or write authorization. These runners never invoke
 write evidence; use only the separate explicit write-evidence runner when a

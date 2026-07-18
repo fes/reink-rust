@@ -114,7 +114,8 @@ following remaining items:
 
 1. Exact transaction-message layouts for revision `0x10`.
 2. Randomized backoff behavior when both peers initiate Init simultaneously.
-3. Hardware behavior for the D4 entry sequence and Epson control service.
+3. Hardware behavior for the D4 entry sequence and Epson control service beyond
+   the reviewed sanitized L1300 evidence.
 
 Convert each verified item into a fixture and a unit test named after the
 behavior, not the standard text. Use

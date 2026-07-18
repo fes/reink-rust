@@ -112,11 +112,12 @@ in-memory session-only pane for `RecordingTransport` TX/RX events. It
 reassembles Epson D4 entry exchanges and IEEE 1284.4 packets across USB reads,
 then presents one concise `field=value` request or response per collapsible
 row. Collapsed rows use a horizontal chevron; expanding a row reveals the
-indented hexadecimal bytes. Copying the pane or an individual row always
-places both the `field=value` line and its hexadecimal `bytes=` line on the
-clipboard, independent of chevron state. Empty bulk-IN observations remain
-visible and do not reset packet reassembly. Selecting a descriptor candidate
-alone produces no traffic. An operation records events only when the user
+indented hexadecimal bytes. **Copy all** and the row context menu's **Copy
+entry** action always place both the `field=value` line and its hexadecimal
+`bytes=` line on the clipboard, independent of chevron state. Empty bulk-IN
+observations remain visible and do not reset packet reassembly. Selecting a
+descriptor candidate alone produces no traffic. An operation records events
+only when the user
 enabled capture before starting it; only an explicit copy action exports
 captured traffic to the clipboard. Default result panes do not retain raw
 identity fields, and no private image, path, or traffic data is
