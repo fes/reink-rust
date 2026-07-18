@@ -99,13 +99,15 @@ values and D4/USB cleanup; selecting a candidate never starts any of them.
 Linux restores only a driver the selected transport detached. Windows and macOS libusb candidates only claim and release an already
 libusb-accessible interface. A Windows native stock-driver candidate instead
 shows status, private-file dump, and serial-redacted status-debug controls with
-a clear read-only explanation. Native dump bytes are not loaded into the UI or
-retained in Debug traffic because EEPROM may contain a serial. Generic write,
-restore, and reset controls are disabled and dispatch is rejected before opening
-it.
+an experimental-mutation warning. Native dump bytes are not loaded into the UI
+or retained in Debug traffic because EEPROM may contain a serial. Native write,
+restore, and reset require both the action-specific confirmation and a separate
+exact experimental acknowledgement for each operation. The worker revalidates
+that acknowledgement before opening USBPRINT.
 
-Reviewed level-C L1300 API-boundary evidence now validates an observed WIC read
-route from an opaque direct USB interface handle through `WriteFile`/`ReadFile`.
+Reviewed level-C L1300 API-boundary evidence validates an observed vendor-utility
+read route from an opaque direct USB interface handle through
+`WriteFile`/`ReadFile`.
 It explicitly did not use `WritePrinter`, `ReadPrinter`, `ExtEscape`, or a named
 pipe at the D4 boundary. The GUI uses SetupAPI enumeration and the opaque
 process-local token only; Microsoft USBPRINT-specific documentation still does

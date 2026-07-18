@@ -1518,7 +1518,7 @@ mem = [
   { addr = [0x58] , desc = "Waste counter" },
 ]
 read_only_fields = [
-  { range = [0x26,0x27], label = "Waste counter", encoding = "u16le", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. The observed WIC display used denominator 11,809; no scaling semantics are applied." },
+  { range = [0x26,0x27], label = "Waste counter", encoding = "u16le", confidence = "confirmed", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. The observed vendor-utility display used denominator 11,809; no scaling semantics are applied." },
   { address = 0x58, label = "Related byte (role unknown)", encoding = "raw", confidence = "related-unknown", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092. Read alongside the waste-counter pair; its role is unknown." },
   { address = 0x16A, label = "Manual-cleaning count", encoding = "u8", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },
   { address = 0x16E, label = "Timer-cleaning count", encoding = "u8", confidence = "strongly-related", evidence = "Level C: reviewed sanitized reink-results/EEPROM_MAP_STATIC_ANALYSIS.md at 6459092." },

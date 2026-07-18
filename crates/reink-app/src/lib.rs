@@ -300,7 +300,7 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     OpenOptions::new()
-        .read(true)
+        .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(parent)?
         .sync_all()
@@ -443,6 +443,34 @@ pub fn with_selected_windows_native_epson_session<T>(
         >,
     ) -> Result<T, String>,
 ) -> SelectedUsbSessionOutcome<T> {
+    with_opened_windows_native_epson_session(candidate, spec, record_traffic, |session| {
+        operation(&mut ReadOnlyEpsonD4Session { session })
+    })
+}
+
+/// Runs an explicitly authorized experimental mutation operation through a
+/// selected Windows USBPRINT token. `WriteFile` D4 mutation remains unvalidated
+/// on physical hardware; callers must require a separate acknowledgement.
+#[cfg(target_os = "windows")]
+pub fn with_selected_windows_native_experimental_mutation_session<T>(
+    candidate: &reink_usb::WindowsNativePrinterCandidate,
+    spec: EpsonSpec,
+    operation: impl FnOnce(
+        &mut EpsonD4Session<RecordingTransport<reink_usb::WindowsNativeReadOnlyTransport>>,
+    ) -> Result<T, String>,
+) -> SelectedUsbSessionOutcome<T> {
+    with_opened_windows_native_epson_session(candidate, spec, false, operation)
+}
+
+#[cfg(target_os = "windows")]
+fn with_opened_windows_native_epson_session<T>(
+    candidate: &reink_usb::WindowsNativePrinterCandidate,
+    spec: EpsonSpec,
+    record_traffic: bool,
+    operation: impl FnOnce(
+        &mut EpsonD4Session<RecordingTransport<reink_usb::WindowsNativeReadOnlyTransport>>,
+    ) -> Result<T, String>,
+) -> SelectedUsbSessionOutcome<T> {
     let transport = match reink_usb::WindowsNativeReadOnlyTransport::open(candidate) {
         Ok(transport) => transport,
         Err(error) => {
@@ -481,10 +509,7 @@ pub fn with_selected_windows_native_epson_session<T>(
             };
         }
     };
-
-    let operation = operation(&mut ReadOnlyEpsonD4Session {
-        session: &mut session,
-    });
+    let operation = operation(&mut session);
     let d4_shutdown = match session.shutdown() {
         Ok(()) => UsbCleanupStatus::Succeeded,
         Err(error) => UsbCleanupStatus::Failed(error.to_string()),
@@ -504,7 +529,6 @@ pub fn with_selected_windows_native_epson_session<T>(
         events,
     }
 }
-
 impl<T: ByteTransport> EpsonD4Session<T> {
     /// Enters Epson D4 mode, initializes the link, and opens `EPSON-CTRL`.
     pub fn connect(target: T, spec: EpsonSpec) -> Result<Self, ApplicationError> {
@@ -861,7 +885,8 @@ mod tests {
     use super::{
         ApplicationError, EPSON_D4_ENTRY_COMMAND, EPSON_D4_ENTRY_REPLY, EpsonD4Session,
         FirstWriteBackupGate, declared_counter_reset_updates, restore_eeprom_updates,
-        validate_eeprom_updates, verify_exact_model, write_new_binary_file_with_parent_sync,
+        validate_eeprom_updates, verify_exact_model, write_new_binary_file,
+        write_new_binary_file_with_parent_sync,
     };
 
     #[test]
@@ -911,6 +936,29 @@ mod tests {
                 .unwrap_err()
                 .contains("could not durably persist test file")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn binary_file_write_uses_the_platform_parent_sync() {
+        let directory = std::env::temp_dir().join(format!(
+            "reink-parent-sync-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("test directory is created");
+        let path = directory.join("backup.bin");
+
+        write_new_binary_file(&path, b"durable", "test backup")
+            .expect("the platform can synchronize a new file and its parent directory");
+        assert_eq!(fs::read(&path).unwrap(), b"durable");
+        assert!(write_new_binary_file(&path, b"replacement", "test backup").is_err());
+
+        fs::remove_file(path).expect("test file is cleaned up");
+        fs::remove_dir(directory).expect("test directory is cleaned up");
     }
 
     #[test]

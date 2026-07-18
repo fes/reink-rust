@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,8 +11,9 @@ use reink_app::{EpsonD4EntryProbeResult, EpsonD4Session, probe_epson_d4_entry};
 #[cfg(target_os = "windows")]
 use reink_app::{
     ReadOnlyEpsonD4Session, SelectedUsbSessionOutcome, with_selected_windows_native_epson_session,
+    with_selected_windows_native_experimental_mutation_session,
 };
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use reink_core::CounterResetTarget;
 use reink_core::{EepromReadReply, EpsonController, EpsonSpec, ModelDatabase, PrinterIdentity};
 #[cfg(target_os = "linux")]
@@ -27,12 +27,15 @@ use reink_snmp::{SnmpConfig, SnmpControlChannel};
 use reink_usb::read_printer_device_id;
 use serde_json::json;
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const EEPROM_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const EEPROM_RESTORE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESTORE_EEPROM";
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const EEPROM_COUNTER_RESET_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS";
+#[cfg(target_os = "windows")]
+const WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT: &str =
+    "I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL";
 const MAX_OFFLINE_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -41,7 +44,7 @@ enum CounterResetSelection {
     PlatenPad,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl CounterResetSelection {
     const fn target(self) -> CounterResetTarget {
         match self {
@@ -188,6 +191,66 @@ enum Command {
         /// New private binary image path. Existing files are never overwritten.
         #[arg(long)]
         output_file: PathBuf,
+    },
+    /// Experimental/unvalidated Windows USBPRINT EEPROM byte write.
+    #[cfg(target_os = "windows")]
+    WindowsNativeExperimentalEepromWrite {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, required = true, value_parser = parse_eeprom_update)]
+        update: Vec<(u16, u8)>,
+        #[arg(long)]
+        backup_file: PathBuf,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long)]
+        native_experimental_acknowledgement: Option<String>,
+    },
+    /// Experimental/unvalidated Windows USBPRINT complete EEPROM restore.
+    #[cfg(target_os = "windows")]
+    WindowsNativeExperimentalEepromRestore {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        input_file: PathBuf,
+        #[arg(long)]
+        rollback_backup_file: PathBuf,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long)]
+        native_experimental_acknowledgement: Option<String>,
+    },
+    /// Experimental/unvalidated Windows USBPRINT declared counter reset.
+    #[cfg(target_os = "windows")]
+    WindowsNativeExperimentalEepromReset {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, value_enum)]
+        target: CounterResetSelection,
+        #[arg(long)]
+        backup_file: PathBuf,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long)]
+        native_experimental_acknowledgement: Option<String>,
     },
     /// Read Epson printer status over an explicitly selected USB D4 session.
     UsbStatus {
@@ -463,6 +526,86 @@ fn run(cli: Cli) -> Result<(), String> {
             &output_file,
             cli.json,
         )?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeExperimentalEepromWrite {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            update,
+            backup_file,
+            confirmation,
+            native_experimental_acknowledgement,
+        } => windows_native_experimental_mutation_output(
+            vendor_id,
+            product_id,
+            interface,
+            &model,
+            update,
+            &backup_file,
+            confirmation.as_deref(),
+            native_experimental_acknowledgement.as_deref(),
+            EEPROM_WRITE_CONFIRMATION,
+            "write",
+            "EEPROM backup",
+            cli.json,
+        )?,
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeExperimentalEepromRestore {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            input_file,
+            rollback_backup_file,
+            confirmation,
+            native_experimental_acknowledgement,
+        } => {
+            let spec = selected_model(&model)?;
+            let updates = read_restore_image(&input_file, &spec)?;
+            windows_native_experimental_mutation_output(
+                vendor_id,
+                product_id,
+                interface,
+                &model,
+                updates,
+                &rollback_backup_file,
+                confirmation.as_deref(),
+                native_experimental_acknowledgement.as_deref(),
+                EEPROM_RESTORE_CONFIRMATION,
+                "restore",
+                "EEPROM rollback backup",
+                cli.json,
+            )?
+        }
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeExperimentalEepromReset {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            target,
+            backup_file,
+            confirmation,
+            native_experimental_acknowledgement,
+        } => {
+            let spec = selected_model(&model)?;
+            let updates = reink_app::declared_counter_reset_updates(&spec, target.target())?;
+            windows_native_experimental_mutation_output(
+                vendor_id,
+                product_id,
+                interface,
+                &model,
+                updates,
+                &backup_file,
+                confirmation.as_deref(),
+                native_experimental_acknowledgement.as_deref(),
+                EEPROM_COUNTER_RESET_CONFIRMATION,
+                "declared counter reset",
+                "EEPROM reset backup",
+                cli.json,
+            )?
+        }
         Command::UsbStatus {
             vendor_id,
             product_id,
@@ -1057,7 +1200,7 @@ fn validate_eeprom_read_addresses(spec: &EpsonSpec, addresses: &[u16]) -> Result
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_eeprom_updates(spec: &EpsonSpec, updates: &[(u16, u8)]) -> Result<(), String> {
     if updates.is_empty() {
         return Err("at least one --update ADDRESS=VALUE is required".to_owned());
@@ -1079,7 +1222,7 @@ fn validate_eeprom_updates(spec: &EpsonSpec, updates: &[(u16, u8)]) -> Result<()
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn validate_confirmation(
     confirmation: Option<&str>,
     expected: &str,
@@ -1113,7 +1256,7 @@ fn validate_new_file_path(path: &Path, kind: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn read_restore_image(path: &Path, spec: &EpsonSpec) -> Result<Vec<(u16, u8)>, String> {
     let bytes = std::fs::read(path).map_err(|error| {
         format!(
@@ -1121,24 +1264,7 @@ fn read_restore_image(path: &Path, spec: &EpsonSpec) -> Result<Vec<(u16, u8)>, S
             path.display()
         )
     })?;
-    let expected_len =
-        usize::from(spec.memory_high).saturating_sub(usize::from(spec.memory_low)) + 1;
-    if bytes.len() != expected_len {
-        return Err(format!(
-            "EEPROM restore image {} has {} bytes; model {} requires exactly {} bytes for {:#06x}..={:#06x}",
-            path.display(),
-            bytes.len(),
-            spec.model,
-            expected_len,
-            spec.memory_low,
-            spec.memory_high
-        ));
-    }
-    Ok(bytes
-        .into_iter()
-        .enumerate()
-        .map(|(offset, value)| (spec.memory_low + offset as u16, value))
-        .collect())
+    reink_app::restore_eeprom_updates(spec, &bytes)
 }
 
 #[cfg(target_os = "windows")]
@@ -1202,6 +1328,90 @@ fn with_windows_native_read_session<T>(
 }
 
 #[cfg(target_os = "windows")]
+fn with_windows_native_experimental_mutation_session<T>(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    operation: impl FnOnce(
+        &mut EpsonD4Session<RecordingTransport<reink_usb::WindowsNativeReadOnlyTransport>>,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    let candidate = windows_native_candidate(vendor_id, product_id, interface)?;
+    let spec = selected_model(model)?;
+    finish_windows_native_operation(with_selected_windows_native_experimental_mutation_session(
+        &candidate, spec, operation,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn windows_native_experimental_mutation_output(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    updates: Vec<(u16, u8)>,
+    backup_file: &Path,
+    confirmation: Option<&str>,
+    native_acknowledgement: Option<&str>,
+    expected_confirmation: &str,
+    operation: &str,
+    backup_kind: &str,
+    as_json: bool,
+) -> Result<String, String> {
+    validate_confirmation(
+        confirmation,
+        expected_confirmation,
+        &format!("windows-native-experimental-eeprom-{operation}"),
+    )?;
+    if native_acknowledgement != Some(WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT) {
+        return Err(format!(
+            "experimental Windows native USBPRINT mutation requires --native-experimental-acknowledgement {WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT} exactly"
+        ));
+    }
+    validate_new_file_path(backup_file, backup_kind)?;
+    let spec = selected_model(model)?;
+    validate_eeprom_updates(&spec, &updates)?;
+    let update_count = updates.len();
+    with_windows_native_experimental_mutation_session(
+        vendor_id,
+        product_id,
+        interface,
+        model,
+        |session| {
+            reink_app::verify_exact_model(
+                &session.read_identity().map_err(|error| error.to_string())?,
+                model,
+            )?;
+            let plan = session.prepare_eeprom_write(&updates).map_err(|error| {
+                format!("could not prepare experimental Windows native EEPROM {operation}: {error}")
+            })?;
+            write_new_binary_file(backup_file, &plan.backup.bytes, backup_kind)?;
+            session.apply_eeprom_write(&plan).map_err(|error| {
+                format!("experimental Windows native USBPRINT EEPROM {operation} failed: {error}")
+            })
+        },
+    )?;
+    if as_json {
+        Ok(json!({
+            "backend": "windows_native_usbprint",
+            "experimental_unvalidated": true,
+            "operation": operation,
+            "model": model,
+            "byte_count": update_count,
+            "backup_file": backup_file,
+        })
+        .to_string())
+    } else {
+        Ok(format!(
+            "Experimental/unvalidated Windows native USBPRINT EEPROM {operation} completed for {model}: {update_count} byte(s); backup_file: {}",
+            backup_file.display()
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn windows_native_candidates_output(as_json: bool) -> Result<String, String> {
     let database = ModelDatabase::builtin().map_err(|error| error.to_string())?;
     let candidates =
@@ -1210,6 +1420,7 @@ fn windows_native_candidates_output(as_json: bool) -> Result<String, String> {
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
+            let capabilities = candidate.capabilities();
             let model_hints = database
                 .models()
                 .filter(|model| {
@@ -1227,9 +1438,10 @@ fn windows_native_candidates_output(as_json: bool) -> Result<String, String> {
                 "interface": candidate.interface_number,
                 "model_hints": model_hints,
                 "capabilities": {
-                    "d4_read": true,
-                    "usb_device_id": false,
-                    "persistent_mutation": false,
+                    "d4_read": capabilities.d4_read,
+                    "usb_device_id": capabilities.usb_device_id,
+                    "persistent_mutation": capabilities.persistent_mutation,
+                    "experimental_mutation": capabilities.experimental_mutation,
                 },
             })
         })
@@ -1243,7 +1455,7 @@ fn windows_native_candidates_output(as_json: bool) -> Result<String, String> {
             .iter()
             .map(|candidate| {
                 format!(
-                    "{} — {}:{}, interface {}, read-only D4 (no USB device-ID or mutation)",
+                    "{} — {}:{}, interface {}, D4 reads plus explicitly gated experimental mutation (no USB device-ID)",
                     candidate["alias"].as_str().unwrap_or("windows-native"),
                     candidate["vendor_id"].as_str().unwrap_or("unknown"),
                     candidate["product_id"].as_str().unwrap_or("unknown"),
@@ -1639,7 +1851,7 @@ fn usb_eeprom_reset_output(
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn declared_counter_reset_updates(
     spec: &EpsonSpec,
     target: CounterResetSelection,
@@ -1775,14 +1987,7 @@ fn verify_requested_model(identity: &PrinterIdentity, model: &str) -> Result<(),
 }
 
 fn write_new_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("could not create {kind} {}: {error}", path.display()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not persist {kind} {}: {error}", path.display()))
+    reink_app::write_new_binary_file(path, bytes, kind)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2087,6 +2292,8 @@ mod tests {
 
     use reink_core::{EepromReadReply, ModelDatabase};
 
+    #[cfg(target_os = "windows")]
+    use super::WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT;
     use super::{
         BinaryFinding, Cli, Command, CounterResetSelection, EEPROM_COUNTER_RESET_CONFIRMATION,
         EEPROM_RESTORE_CONFIRMATION, EEPROM_WRITE_CONFIRMATION, analyze_binary_bytes,
@@ -2305,6 +2512,49 @@ mod tests {
                 address,
             } if model == "C90" && address == [0x000c]
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_experimental_native_write_with_distinct_acknowledgement() {
+        let cli = Cli::try_parse_from([
+            "reink",
+            "windows-native-experimental-eeprom-write",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "0x1234",
+            "--model",
+            "C90",
+            "--update",
+            "0x000c=0xff",
+            "--backup-file",
+            "new.bin",
+            "--confirmation",
+            EEPROM_WRITE_CONFIRMATION,
+            "--native-experimental-acknowledgement",
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::WindowsNativeExperimentalEepromWrite {
+                native_experimental_acknowledgement: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            validate_confirmation(
+                Some(EEPROM_WRITE_CONFIRMATION),
+                EEPROM_WRITE_CONFIRMATION,
+                "test"
+            )
+            .is_ok()
+        );
+        assert_ne!(
+            EEPROM_WRITE_CONFIRMATION,
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
+        );
     }
 
     #[test]

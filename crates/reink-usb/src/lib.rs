@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
-//! USB printer interface selection, libusb transport, and read-only Windows
-//! stock-driver transport.
+//! USB printer interface selection, libusb transport, and Windows stock-driver
+//! transport.
 //!
 //! On Linux, operations on an explicitly selected interface temporarily detach
 //! and restore only the active kernel driver that they detached. Its concrete
@@ -94,7 +94,12 @@ pub type LinuxUsbTransport = ReadOnlyUsbTransport;
 pub type MacOsUsbTransport = ReadOnlyUsbTransport;
 
 #[cfg(target_os = "windows")]
-pub use windows_native::{WindowsNativeReadOnlyTransport, list_windows_native_printer_candidates};
+pub use windows_native::{WindowsNativeTransport, list_windows_native_printer_candidates};
+
+/// Compatibility alias for callers that expose only the type-restricted
+/// read-only application session.
+#[cfg(target_os = "windows")]
+pub type WindowsNativeReadOnlyTransport = WindowsNativeTransport;
 
 #[cfg(target_os = "windows")]
 pub type WindowsUsbTransport = ReadOnlyUsbTransport;

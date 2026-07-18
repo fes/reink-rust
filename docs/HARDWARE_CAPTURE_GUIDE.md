@@ -113,6 +113,20 @@ do not issue another write. Retain the private backup/report, reconnect or
 power-cycle if needed, and verify the original byte with a separately confirmed
 read before further action.
 
+## Experimental native Windows USBPRINT evidence
+
+Native USBPRINT mutation is speculative/experimental: it is inferred from
+observed `WriteFile` D4 read traffic and has not been physically validated.
+After repeated stable native reads, complete dumps, and a durable backup, the
+separate `windows-native-d4-eeprom-write-evidence` command may run one
+reversible byte test. It requires the normal write and restoration
+confirmations plus
+`I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL`, writes a private
+report only after cleanup, restores the test byte, and independently verifies
+the restoration. Its selector reports only VID, PID, and optional interface;
+it does not invent bus, address, or alternate setting. Restore is a separate
+later stage. Never add reset to this progressive evidence sequence.
+
 ## Confirmed semantic counter reset
 
 `reink-cli usb-eeprom-reset` is a separate, explicit maintenance operation; it
@@ -156,8 +170,9 @@ private and out of default logs and this repository.
 A Windows native USBPRINT candidate is different: status, a private-file dump,
 and serial-redacted status debug capture are available, but native dump bytes
 are not loaded/captured in the GUI because EEPROM may contain a serial. Write,
-restore, and reset are disabled and rejected before the native device is
-opened. Selecting the native candidate cannot authorize the separate libusb
+restore, and reset are experimental/unvalidated and require the second exact
+native acknowledgement before the native device is opened. Selecting the native
+candidate cannot authorize the separate libusb
 mutation workflow.
 
 ```powershell
@@ -201,7 +216,9 @@ cargo run -p reink-hardware-test -- windows-native-d4-eeprom-read --vendor-id 0x
 cargo run -p reink-hardware-test -- windows-native-d4-eeprom-dump --vendor-id 0x04b8 --product-id <product-id> --model <model>
 ```
 
-These commands expose no native write/reset/write-evidence surface. The
+These read commands remain type-restricted. The separately named native
+write-evidence command is experimental/unvalidated and requires its third
+exact acknowledgement. The
 existing `d4-eeprom-write-evidence` command remains an explicit, fully located
 libusb workflow and is never a fallback from native access. The hardware-test
 native dump reports range/count only and deliberately omits EEPROM bytes; use

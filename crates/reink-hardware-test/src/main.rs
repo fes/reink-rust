@@ -15,6 +15,7 @@ use reink_app::{EpsonD4EntryProbeResult, probe_epson_d4_entry};
 #[cfg(target_os = "windows")]
 use reink_app::{
     ReadOnlyEpsonD4Session, SelectedUsbSessionOutcome, with_selected_windows_native_epson_session,
+    with_selected_windows_native_experimental_mutation_session,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_core::PrinterIdentity;
@@ -32,6 +33,9 @@ const TRACE_SANITIZATION_CONFIRMATION: &str = "I_CONFIRM_TRACE_IS_SANITIZED";
 const WRITE_EVIDENCE_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
 const WRITE_EVIDENCE_RESTORATION_CONFIRMATION: &str =
     "I_CONFIRM_THIS_WILL_RESTORE_EEPROM_AND_RETAIN_PRIVATE_EVIDENCE";
+#[cfg(target_os = "windows")]
+const WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT: &str =
+    "I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL";
 const WRITE_EVIDENCE_REMEDIATION: &str = "Do not repeat this test or issue another write. Treat restoration as unverified, retain the private report and durable backup, reconnect or power-cycle the printer if needed, then verify the original byte with a separately confirmed read before further action.";
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
@@ -182,6 +186,33 @@ enum Command {
         /// Exact acknowledgement that restoration and private evidence are required.
         #[arg(long)]
         confirm_restoration_evidence: Option<String>,
+    },
+    /// Experimental Windows USBPRINT single-byte reversible mutation evidence.
+    #[cfg(target_os = "windows")]
+    WindowsNativeD4EepromWriteEvidence {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        /// Optional documented USB interface number; VID/PID-only ambiguity is rejected.
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, value_parser = parse_u16)]
+        address: u16,
+        #[arg(long, value_parser = parse_u8)]
+        value: u8,
+        #[arg(long)]
+        backup_file: PathBuf,
+        #[arg(long)]
+        report_file: PathBuf,
+        #[arg(long)]
+        confirm_write: Option<String>,
+        #[arg(long)]
+        confirm_restoration_evidence: Option<String>,
+        #[arg(long)]
+        confirm_native_experimental_mutation: Option<String>,
     },
     /// Run D4 Init, EPSON-CTRL identity read, orderly close, and Exit.
     D4Identity {
@@ -393,6 +424,32 @@ fn run(cli: Cli) -> Result<String, String> {
             &report_file,
             confirm_write.as_deref(),
             confirm_restoration_evidence.as_deref(),
+        ),
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeD4EepromWriteEvidence {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            address,
+            value,
+            backup_file,
+            report_file,
+            confirm_write,
+            confirm_restoration_evidence,
+            confirm_native_experimental_mutation,
+        } => windows_native_d4_eeprom_write_evidence(
+            vendor_id,
+            product_id,
+            interface,
+            &model,
+            address,
+            value,
+            &backup_file,
+            &report_file,
+            confirm_write.as_deref(),
+            confirm_restoration_evidence.as_deref(),
+            confirm_native_experimental_mutation.as_deref(),
         ),
         Command::D4Identity {
             vendor_id,
@@ -1019,24 +1076,7 @@ fn write_report_file(path: &Path, report: &str) -> Result<(), String> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn write_new_private_binary_file(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "could not create private {kind} {}: {error}",
-                path.display()
-            )
-        })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
-            format!(
-                "could not persist private {kind} {}: {error}",
-                path.display()
-            )
-        })
+    reink_app::write_new_binary_file(path, bytes, &format!("private {kind}"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -1263,6 +1303,7 @@ fn windows_native_candidates() -> Result<String, String> {
         .iter()
         .enumerate()
         .map(|(index, candidate)| {
+            let capabilities = candidate.capabilities();
             let hints = database
                 .models()
                 .filter(|model| {
@@ -1282,9 +1323,10 @@ fn windows_native_candidates() -> Result<String, String> {
                 },
                 "model_hints": hints,
                 "capabilities": {
-                    "d4_read": true,
-                    "usb_device_id": false,
-                    "persistent_mutation": false,
+                    "d4_read": capabilities.d4_read,
+                    "usb_device_id": capabilities.usb_device_id,
+                    "persistent_mutation": capabilities.persistent_mutation,
+                    "experimental_mutation": capabilities.experimental_mutation,
                 },
             })
         })
@@ -1774,6 +1816,191 @@ fn d4_eeprom_write_evidence(
             finish_write_evidence_report(report_file, report, false)
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn native_write_evidence_cleanup(cleanup: &reink_app::UsbSessionCleanup) -> WriteEvidenceCleanup {
+    let stage =
+        |succeeded: &str, not_attempted: &str, status: &reink_app::UsbCleanupStatus| match status {
+            reink_app::UsbCleanupStatus::Succeeded => {
+                WriteEvidenceStage::completed(succeeded, None)
+            }
+            reink_app::UsbCleanupStatus::Failed(error) => {
+                WriteEvidenceStage::failed(format!("{succeeded}: {error}"))
+            }
+            reink_app::UsbCleanupStatus::NotAttempted => WriteEvidenceStage::skipped(not_attempted),
+        };
+    WriteEvidenceCleanup {
+        d4_shutdown: stage(
+            "D4 service closed and Exit completed",
+            "D4 shutdown was not attempted",
+            &cleanup.d4_shutdown,
+        ),
+        usb_close: stage(
+            "Windows native USBPRINT interface closed",
+            "Windows native USBPRINT close was not attempted",
+            &cleanup.usb_close,
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn windows_native_write_evidence_report(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    address: u16,
+    requested_value: u8,
+    backup_file: &Path,
+    connection: &WriteEvidenceStage,
+    outcome: Option<&WriteEvidenceOutcome>,
+    cleanup: &WriteEvidenceCleanup,
+) -> String {
+    let mut stages = vec![write_evidence_stage_json("d4-session-connect", connection)];
+    if let Some(outcome) = outcome {
+        stages.extend([
+            write_evidence_stage_json("identity-confirmation", &outcome.identity),
+            write_evidence_stage_json("original-byte-pre-read", &outcome.pre_read),
+            write_evidence_stage_json("complete-backup", &outcome.backup),
+            write_evidence_stage_json("test-write", &outcome.test_write),
+            write_evidence_stage_json("test-write-readback", &outcome.test_readback),
+            write_evidence_stage_json("restoration", &outcome.restoration),
+            write_evidence_stage_json("restoration-readback", &outcome.restoration_readback),
+        ]);
+    }
+    stages.extend([
+        write_evidence_stage_json("d4-session-shutdown", &cleanup.d4_shutdown),
+        write_evidence_stage_json("windows-native-usbprint-close", &cleanup.usb_close),
+    ]);
+    let completed_safely = connection.succeeded()
+        && outcome.is_some_and(WriteEvidenceOutcome::completed_safely)
+        && cleanup.succeeded();
+    json!({
+        "schema_version": 1,
+        "mode": "write_evidence",
+        "command": "windows-native-d4-eeprom-write-evidence",
+        "backend": "windows_native_usbprint",
+        "experimental_unvalidated": true,
+        "status": if completed_safely { "completed" } else { "failed" },
+        "selector": {
+            "vendor_id": format!("{vendor_id:04X}"),
+            "product_id": format!("{product_id:04X}"),
+            "interface": interface,
+        },
+        "model": model,
+        "test": {
+            "address": format!("{address:04X}"),
+            "requested_value": format!("{requested_value:02X}"),
+            "original_value": outcome.and_then(|outcome| outcome.original_value).map(|value| format!("{value:02X}")),
+        },
+        "backup_file": backup_file,
+        "stages": stages,
+        "remediation": (!completed_safely).then_some(WRITE_EVIDENCE_REMEDIATION),
+        "next_step": "The test byte must be restored and independently verified; native USBPRINT mutation remains experimental.",
+    })
+    .to_string()
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn windows_native_d4_eeprom_write_evidence(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    address: u16,
+    requested_value: u8,
+    backup_file: &Path,
+    report_file: &Path,
+    write_confirmation: Option<&str>,
+    restoration_confirmation: Option<&str>,
+    native_acknowledgement: Option<&str>,
+) -> Result<String, String> {
+    let spec = ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .cloned()
+        .ok_or_else(|| format!("unknown model: {model}"))?;
+    validate_write_evidence_gates(
+        &spec,
+        address,
+        backup_file,
+        report_file,
+        write_confirmation,
+        restoration_confirmation,
+    )?;
+    if native_acknowledgement != Some(WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT) {
+        return Err(format!(
+            "windows-native-d4-eeprom-write-evidence requires --confirm-native-experimental-mutation {WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT} exactly"
+        ));
+    }
+    let candidate = match selected_windows_native_candidate(vendor_id, product_id, interface) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            let connection = WriteEvidenceStage::failed(format!(
+                "Windows native USBPRINT candidate selection failed: {error}"
+            ));
+            let cleanup = WriteEvidenceCleanup::not_started();
+            let outcome = WriteEvidenceOutcome::new();
+            let report = windows_native_write_evidence_report(
+                vendor_id,
+                product_id,
+                interface,
+                model,
+                address,
+                requested_value,
+                backup_file,
+                &connection,
+                Some(&outcome),
+                &cleanup,
+            );
+            return finish_write_evidence_report(report_file, report, false);
+        }
+    };
+    let outcome =
+        with_selected_windows_native_experimental_mutation_session(&candidate, spec, |session| {
+            Ok(execute_write_evidence(
+                session,
+                model,
+                address,
+                requested_value,
+                |bytes| write_new_private_binary_file(backup_file, bytes, "complete EEPROM backup"),
+            ))
+        });
+    let cleanup = native_write_evidence_cleanup(&outcome.cleanup);
+    let connection = if outcome.operation.is_ok() {
+        WriteEvidenceStage::completed("experimental Windows native USBPRINT D4 initialized", None)
+    } else {
+        WriteEvidenceStage::failed(
+            outcome
+                .operation
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| "Windows native D4 operation failed".to_owned()),
+        )
+    };
+    let evidence = outcome.operation.ok();
+    let completed_safely = evidence
+        .as_ref()
+        .is_some_and(WriteEvidenceOutcome::completed_safely)
+        && cleanup.succeeded()
+        && connection.succeeded();
+    let report = windows_native_write_evidence_report(
+        vendor_id,
+        product_id,
+        interface,
+        model,
+        address,
+        requested_value,
+        backup_file,
+        &connection,
+        evidence.as_ref(),
+        &cleanup,
+    );
+    finish_write_evidence_report(report_file, report, completed_safely)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2754,6 +2981,10 @@ mod tests {
     use reink_platform::TransportEvent;
     use serde_json::{Value, json};
 
+    #[cfg(target_os = "windows")]
+    use super::WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT;
+    #[cfg(target_os = "windows")]
+    use super::native_write_evidence_cleanup;
     use super::{
         Cli, Command, DriverHandoffReport, OUT_OF_RANGE_READ_CONFIRMATION, ReadOnlyFailureKind,
         TRACE_SANITIZATION_CONFIRMATION, WRITE_EVIDENCE_RESTORATION_CONFIRMATION,
@@ -2869,6 +3100,62 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("d4-identity")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_native_write_evidence_with_the_third_acknowledgement() {
+        let cli = Cli::try_parse_from([
+            "reink-hardware-test",
+            "windows-native-d4-eeprom-write-evidence",
+            "--vendor-id",
+            "0x04b8",
+            "--product-id",
+            "0x1234",
+            "--model",
+            "C90",
+            "--address",
+            "0x000c",
+            "--value",
+            "0x42",
+            "--backup-file",
+            "new.bin",
+            "--report-file",
+            "report.json",
+            "--confirm-write",
+            WRITE_EVIDENCE_WRITE_CONFIRMATION,
+            "--confirm-restoration-evidence",
+            WRITE_EVIDENCE_RESTORATION_CONFIRMATION,
+            "--confirm-native-experimental-mutation",
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::WindowsNativeD4EepromWriteEvidence {
+                confirm_native_experimental_mutation: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_evidence_cleanup_reports_success_as_completed() {
+        let cleanup = native_write_evidence_cleanup(&reink_app::UsbSessionCleanup {
+            d4_shutdown: reink_app::UsbCleanupStatus::Succeeded,
+            usb_close: reink_app::UsbCleanupStatus::Succeeded,
+        });
+        assert_eq!(cleanup.d4_shutdown.status, "completed");
+        assert_eq!(
+            cleanup.d4_shutdown.detail,
+            "D4 service closed and Exit completed"
+        );
+        assert_eq!(cleanup.usb_close.status, "completed");
+        assert_eq!(
+            cleanup.usb_close.detail,
+            "Windows native USBPRINT interface closed"
         );
     }
 

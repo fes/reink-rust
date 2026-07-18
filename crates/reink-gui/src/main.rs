@@ -130,14 +130,17 @@ enum UsbOperationRequest {
     Write {
         updates: Vec<(u16, u8)>,
         backup_file: PathBuf,
+        native_experimental_acknowledged: bool,
     },
     Restore {
         image: Vec<u8>,
         backup_file: PathBuf,
+        native_experimental_acknowledged: bool,
     },
     Reset {
         target: CounterResetTarget,
         backup_file: PathBuf,
+        native_experimental_acknowledged: bool,
     },
 }
 
@@ -148,16 +151,19 @@ enum PendingUsbOperation {
         value: String,
         backup_file: Option<PathBuf>,
         confirmation: String,
+        native_experimental_acknowledgement: String,
     },
     Restore {
         restore_image: Option<RestoreImagePreflight>,
         backup_file: Option<PathBuf>,
         confirmation: String,
+        native_experimental_acknowledgement: String,
     },
     Reset {
         target: CounterResetTarget,
         backup_file: Option<PathBuf>,
         confirmation: String,
+        native_experimental_acknowledgement: String,
     },
 }
 
@@ -186,6 +192,8 @@ const EEPROM_WRITE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_WRITE_EEPROM";
 const EEPROM_RESTORE_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESTORE_EEPROM";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const EEPROM_COUNTER_RESET_CONFIRMATION: &str = "I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS";
+const WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT: &str =
+    "I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL";
 
 fn source_mode_from_args(arguments: impl IntoIterator<Item = String>) -> SourceMode {
     if arguments
@@ -657,10 +665,7 @@ impl ReinkGui {
             self.usb_operation_result = Some(UsbOperationResultReport {
                 success: false,
                 headline: "Selected-printer operation blocked".to_owned(),
-                lines: vec![
-                    "The Windows stock-driver backend is application-level read-only; write, restore, and reset are rejected before the device is opened."
-                        .to_owned(),
-                ],
+                lines: vec!["The selected backend does not permit persistent mutation.".to_owned()],
             });
             return;
         }
@@ -1342,6 +1347,7 @@ impl ReinkGui {
                                 value: format!("0x{selected_value:02X}"),
                                 backup_file: None,
                                 confirmation: String::new(),
+                                native_experimental_acknowledgement: String::new(),
                             });
                         }
                         if permits_mutation {
@@ -1350,7 +1356,7 @@ impl ReinkGui {
                             ));
                         } else {
                             ui.label(
-                                "The Windows stock-driver backend is read-only: write, restore, and reset controls are unavailable. Use status, dump, read, or debug capture.",
+                                "Windows native USBPRINT mutation is experimental/unvalidated and requires a second exact acknowledgement in the confirmation dialog.",
                             );
                         }
                     } else {
@@ -1494,6 +1500,7 @@ impl ReinkGui {
                             value: String::new(),
                             backup_file: None,
                             confirmation: String::new(),
+                            native_experimental_acknowledgement: String::new(),
                         });
                     }
                 });
@@ -1514,6 +1521,7 @@ impl ReinkGui {
                             restore_image: None,
                             backup_file: None,
                             confirmation: String::new(),
+                            native_experimental_acknowledgement: String::new(),
                         });
                     }
                 });
@@ -1535,6 +1543,7 @@ impl ReinkGui {
                                 target: CounterResetTarget::Waste,
                                 backup_file: None,
                                 confirmation: String::new(),
+                                native_experimental_acknowledgement: String::new(),
                             });
                         }
                         if ui
@@ -1548,6 +1557,7 @@ impl ReinkGui {
                                 target: CounterResetTarget::PlatenPad,
                                 backup_file: None,
                                 confirmation: String::new(),
+                                native_experimental_acknowledgement: String::new(),
                             });
                         }
                     });
@@ -1559,7 +1569,7 @@ impl ReinkGui {
                 {
                     ui.colored_label(
                         Color32::from_rgb(174, 112, 0),
-                        "This Windows stock-driver candidate is application-level read-only. Generic EEPROM write, restore, and reset are disabled.",
+                        "This candidate does not permit persistent mutation.",
                     );
                 }
             }
@@ -1667,6 +1677,12 @@ impl ReinkGui {
             .as_deref()
             .and_then(|model| self.state.model_spec(model))
             .cloned();
+        #[cfg(target_os = "windows")]
+        let native_mutation_selected = self
+            .selected_usb_candidate()
+            .is_some_and(DescriptorCandidate::experimental_mutation);
+        #[cfg(not(target_os = "windows"))]
+        let native_mutation_selected = false;
         let mut open = true;
         let mut close_dialog = false;
         let mut dispatch = None;
@@ -1709,6 +1725,7 @@ impl ReinkGui {
                         value,
                         backup_file,
                         confirmation,
+                        native_experimental_acknowledgement,
                     } => {
                         ui.heading("Preflight");
                         ui.horizontal(|ui| {
@@ -1755,9 +1772,27 @@ impl ReinkGui {
                             EEPROM_WRITE_CONFIRMATION,
                             "EEPROM write",
                         );
+                        #[cfg(target_os = "windows")]
+                        if native_mutation_selected {
+                            ui.colored_label(
+                                Color32::from_rgb(181, 47, 47),
+                                "Windows native USBPRINT mutation is experimental and unvalidated on physical hardware.",
+                            );
+                            typed_confirmation(
+                                ui,
+                                native_experimental_acknowledgement,
+                                WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                "experimental Windows native mutation",
+                            );
+                        }
                         let run = update.is_ok()
                             && backup_file.is_some()
-                            && confirmation_matches(confirmation, EEPROM_WRITE_CONFIRMATION);
+                            && confirmation_matches(confirmation, EEPROM_WRITE_CONFIRMATION)
+                            && (!native_mutation_selected
+                                || confirmation_matches(
+                                    native_experimental_acknowledgement,
+                                    WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                ));
                         dialog_actions(
                             ui,
                             &mut close_dialog,
@@ -1771,6 +1806,11 @@ impl ReinkGui {
                                 backup_file: backup_file
                                     .clone()
                                     .expect("enabled only after backup selection"),
+                                native_experimental_acknowledged: !native_mutation_selected
+                                    || confirmation_matches(
+                                        native_experimental_acknowledgement,
+                                        WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                    ),
                             });
                             },
                         );
@@ -1779,6 +1819,7 @@ impl ReinkGui {
                         restore_image,
                         backup_file,
                         confirmation,
+                        native_experimental_acknowledgement,
                     } => {
                         ui.heading("Preflight");
                         if ui.button("Choose complete EEPROM image...").clicked() {
@@ -1813,11 +1854,25 @@ impl ReinkGui {
                             EEPROM_RESTORE_CONFIRMATION,
                             "EEPROM restore",
                         );
+                        #[cfg(target_os = "windows")]
+                        if native_mutation_selected {
+                            typed_confirmation(
+                                ui,
+                                native_experimental_acknowledgement,
+                                WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                "experimental Windows native mutation",
+                            );
+                        }
                         let run = restore_image
                             .as_ref()
                             .is_some_and(|preflight| preflight.result.is_ok())
                             && backup_file.is_some()
-                            && confirmation_matches(confirmation, EEPROM_RESTORE_CONFIRMATION);
+                            && confirmation_matches(confirmation, EEPROM_RESTORE_CONFIRMATION)
+                            && (!native_mutation_selected
+                                || confirmation_matches(
+                                    native_experimental_acknowledgement,
+                                    WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                ));
                         dialog_actions(
                             ui,
                             &mut close_dialog,
@@ -1835,6 +1890,11 @@ impl ReinkGui {
                                 backup_file: backup_file
                                     .clone()
                                     .expect("enabled only after backup selection"),
+                                native_experimental_acknowledged: !native_mutation_selected
+                                    || confirmation_matches(
+                                        native_experimental_acknowledgement,
+                                        WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                    ),
                             });
                             },
                         );
@@ -1843,6 +1903,7 @@ impl ReinkGui {
                         target,
                         backup_file,
                         confirmation,
+                        native_experimental_acknowledgement,
                     } => {
                         ui.heading("Preflight");
                         let updates = declared_counter_reset_updates(spec, *target);
@@ -1868,12 +1929,26 @@ impl ReinkGui {
                             EEPROM_COUNTER_RESET_CONFIRMATION,
                             "declared counter reset",
                         );
+                        #[cfg(target_os = "windows")]
+                        if native_mutation_selected {
+                            typed_confirmation(
+                                ui,
+                                native_experimental_acknowledgement,
+                                WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                "experimental Windows native mutation",
+                            );
+                        }
                         let run = updates.is_ok()
                             && backup_file.is_some()
                             && confirmation_matches(
                                 confirmation,
                                 EEPROM_COUNTER_RESET_CONFIRMATION,
-                            );
+                            )
+                            && (!native_mutation_selected
+                                || confirmation_matches(
+                                    native_experimental_acknowledgement,
+                                    WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                ));
                         let action_label = target.display_name();
                         dialog_actions(
                             ui,
@@ -1886,6 +1961,11 @@ impl ReinkGui {
                                     backup_file: backup_file
                                         .clone()
                                         .expect("enabled only after backup selection"),
+                                    native_experimental_acknowledged: !native_mutation_selected
+                                        || confirmation_matches(
+                                            native_experimental_acknowledgement,
+                                            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+                                        ),
                                 });
                             },
                         );
@@ -2224,6 +2304,7 @@ fn run_selected_usb_operation(
             action: &'static str,
             updates: Vec<(u16, u8)>,
             backup_file: PathBuf,
+            native_experimental_acknowledged: bool,
         },
     }
     let request = match request {
@@ -2232,35 +2313,42 @@ fn run_selected_usb_operation(
         UsbOperationRequest::Write {
             updates,
             backup_file,
+            native_experimental_acknowledged,
         } => PreparedRequest::Mutation {
             action: "write",
             updates,
             backup_file,
+            native_experimental_acknowledged,
         },
-        UsbOperationRequest::Restore { image, backup_file } => {
-            match restore_eeprom_updates(&spec, &image) {
-                Ok(updates) => PreparedRequest::Mutation {
-                    action: "restore",
-                    updates,
-                    backup_file,
-                },
-                Err(error) => {
-                    return UsbOperationOutcome {
-                        operation: Err(error),
-                        cleanup: UsbSessionCleanup::not_attempted(),
-                        events: Vec::new(),
-                    };
-                }
+        UsbOperationRequest::Restore {
+            image,
+            backup_file,
+            native_experimental_acknowledged,
+        } => match restore_eeprom_updates(&spec, &image) {
+            Ok(updates) => PreparedRequest::Mutation {
+                action: "restore",
+                updates,
+                backup_file,
+                native_experimental_acknowledged,
+            },
+            Err(error) => {
+                return UsbOperationOutcome {
+                    operation: Err(error),
+                    cleanup: UsbSessionCleanup::not_attempted(),
+                    events: Vec::new(),
+                };
             }
-        }
+        },
         UsbOperationRequest::Reset {
             target,
             backup_file,
+            native_experimental_acknowledged,
         } => match declared_counter_reset_updates(&spec, target) {
             Ok(updates) => PreparedRequest::Mutation {
                 action: target.display_name(),
                 updates,
                 backup_file,
+                native_experimental_acknowledged,
             },
             Err(error) => {
                 return UsbOperationOutcome {
@@ -2332,6 +2420,7 @@ fn run_selected_usb_operation(
                             action,
                             updates,
                             backup_file,
+                            ..
                         } => {
                             let plan = session.prepare_eeprom_write(&updates).map_err(|error| {
                                 format!("could not prepare EEPROM {action}: {error}")
@@ -2384,47 +2473,108 @@ fn run_selected_usb_operation(
             }
         }
         #[cfg(target_os = "windows")]
-        DescriptorCandidateBackend::WindowsNative(native) => {
-            let outcome = reink_app::with_selected_windows_native_epson_session(
-                &native,
-                spec,
-                record_traffic,
-                move |session| {
-                    let identity = session.read_identity().map_err(|error| error.to_string())?;
-                    verify_exact_model(&identity, &expected_model)?;
-                    match request {
-                        PreparedRequest::Status => {
-                            let mut response =
-                                session.read_status().map_err(|error| error.to_string())?;
-                            reink_usb::redact_identity_serial_fields(&mut response);
-                            Ok(UsbOperationSuccess::Status {
-                                model: expected_model,
-                                response_bytes: response.len(),
-                                display: display_status_response(&response),
+        DescriptorCandidateBackend::WindowsNative(native) => match request {
+            PreparedRequest::Mutation {
+                action,
+                updates,
+                backup_file,
+                native_experimental_acknowledged,
+            } => {
+                if let Err(error) = require_native_experimental_mutation_acknowledgement(
+                    native_experimental_acknowledged,
+                ) {
+                    return UsbOperationOutcome {
+                        operation: Err(error),
+                        cleanup: UsbSessionCleanup::not_attempted(),
+                        events: Vec::new(),
+                    };
+                }
+                let outcome = reink_app::with_selected_windows_native_experimental_mutation_session(
+                    &native,
+                    spec,
+                    move |session| {
+                        let identity =
+                            session.read_identity().map_err(|error| error.to_string())?;
+                        verify_exact_model(&identity, &expected_model)?;
+                        let plan = session.prepare_eeprom_write(&updates).map_err(|error| {
+                            format!("could not prepare experimental EEPROM {action}: {error}")
+                        })?;
+                        let current_values = plan
+                            .updates
+                            .iter()
+                            .map(|&(address, _)| {
+                                plan.backup
+                                    .value_at(address)
+                                    .map(|value| (address, value))
+                                    .ok_or_else(|| {
+                                        format!("complete backup did not contain {address:#06x}")
+                                    })
                             })
-                        }
-                        PreparedRequest::Dump(output_file) => {
-                            let image = session.dump_eeprom().map_err(|error| error.to_string())?;
-                            write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
-                            Ok(UsbOperationSuccess::Dump {
-                                image,
-                                output_file,
-                                load_for_display: false,
-                            })
-                        }
-                        PreparedRequest::Mutation { .. } => Err(
-                            "Windows stock-driver mutation was rejected before opening the device"
-                                .to_owned(),
-                        ),
-                    }
-                },
-            );
-            UsbOperationOutcome {
-                operation: outcome.operation,
-                cleanup: outcome.cleanup,
-                events: redact_native_identity_serials(outcome.events),
+                            .collect::<Result<Vec<_>, _>>()?;
+                        write_new_binary_file(
+                            &backup_file,
+                            &plan.backup.bytes,
+                            "experimental Windows native EEPROM backup",
+                        )?;
+                        session.apply_eeprom_write(&plan).map_err(|error| {
+                            format!("experimental Windows native EEPROM {action} failed: {error}")
+                        })?;
+                        Ok(UsbOperationSuccess::Mutation {
+                            action,
+                            model: expected_model,
+                            backup_file,
+                            current_values,
+                            update_count: plan.updates.len(),
+                        })
+                    },
+                );
+                UsbOperationOutcome {
+                    operation: outcome.operation,
+                    cleanup: outcome.cleanup,
+                    events: Vec::new(),
+                }
             }
-        }
+            request => {
+                let outcome = reink_app::with_selected_windows_native_epson_session(
+                    &native,
+                    spec,
+                    record_traffic,
+                    move |session| {
+                        let identity =
+                            session.read_identity().map_err(|error| error.to_string())?;
+                        verify_exact_model(&identity, &expected_model)?;
+                        match request {
+                            PreparedRequest::Status => {
+                                let mut response =
+                                    session.read_status().map_err(|error| error.to_string())?;
+                                reink_usb::redact_identity_serial_fields(&mut response);
+                                Ok(UsbOperationSuccess::Status {
+                                    model: expected_model,
+                                    response_bytes: response.len(),
+                                    display: display_status_response(&response),
+                                })
+                            }
+                            PreparedRequest::Dump(output_file) => {
+                                let image =
+                                    session.dump_eeprom().map_err(|error| error.to_string())?;
+                                write_new_binary_file(&output_file, &image.bytes, "EEPROM image")?;
+                                Ok(UsbOperationSuccess::Dump {
+                                    image,
+                                    output_file,
+                                    load_for_display: false,
+                                })
+                            }
+                            PreparedRequest::Mutation { .. } => unreachable!("handled above"),
+                        }
+                    },
+                );
+                UsbOperationOutcome {
+                    operation: outcome.operation,
+                    cleanup: outcome.cleanup,
+                    events: redact_native_identity_serials(outcome.events),
+                }
+            }
+        },
     }
 }
 
@@ -2486,6 +2636,14 @@ fn typed_confirmation(ui: &mut egui::Ui, confirmation: &mut String, required: &s
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn confirmation_matches(provided: &str, required: &str) -> bool {
     provided == required
+}
+
+#[cfg(target_os = "windows")]
+fn require_native_experimental_mutation_acknowledgement(acknowledged: bool) -> Result<(), String> {
+    acknowledged.then_some(()).ok_or_else(|| {
+        "experimental Windows native USBPRINT mutation requires the exact per-operation acknowledgement"
+            .to_owned()
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2979,6 +3137,11 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     use super::redact_native_identity_serials;
+    #[cfg(target_os = "windows")]
+    use super::{
+        EEPROM_WRITE_CONFIRMATION, WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+        require_native_experimental_mutation_acknowledgement,
+    };
     use super::{
         EepromFileField, eeprom_field_address_label, eeprom_field_tooltip, eeprom_field_value,
         eeprom_image_offset, source_mode_from_args,
@@ -3075,6 +3238,25 @@ mod tests {
         assert!(parse_u16_input("0x10000").is_err());
         assert_eq!(parse_u8_input("0x7F"), Ok(0x7f));
         assert!(parse_u8_input("256").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_mutation_requires_a_distinct_exact_experimental_acknowledgement() {
+        assert!(confirmation_matches(
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
+        ));
+        assert!(!confirmation_matches(
+            "I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL ",
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
+        ));
+        assert_ne!(
+            EEPROM_WRITE_CONFIRMATION,
+            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
+        );
+        assert!(require_native_experimental_mutation_acknowledgement(true).is_ok());
+        assert!(require_native_experimental_mutation_acknowledgement(false).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

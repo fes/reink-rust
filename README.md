@@ -41,7 +41,7 @@ specific gate.
 | Epson D4 application service with status and write plans | Implemented; used by explicit read workflows, confirmed CLI mutations, and gated hardware write evidence |
 | Linux, macOS, and Windows USB bulk transport, descriptor selection, and candidate enumeration | Implemented; used by explicit read workflows and gated write evidence |
 | SNMP control adapter, safe Epson status/EEPROM inspection, and mDNS discovery | Implemented with deterministic tests |
-| Windows native USB sessions | Read-only stock-driver USBPRINT backend implemented for D4 identity/status/EEPROM reads; libusb remains separate for explicit mutation/evidence workflows |
+| Windows native USB sessions | Stock-driver USBPRINT D4 reads plus explicitly gated experimental/unvalidated mutation; libusb remains separate |
 | CLI inspection, offline binary analysis, selected USB status, SNMP EEPROM inspection, and explicit EEPROM operations | Implemented with confirmation and backup safeguards |
 | Read-only terminal UI model browser | Implemented |
 | Guarded native GUI with protocol-aware traffic tracing | Implemented on Linux, macOS, and Windows; direct operations require an accessible selected USB interface |
@@ -99,7 +99,7 @@ Current workspace crates:
 | `reink-d4` | IEEE 1284.4 packet framing, revision negotiation, transaction/service channels, credits, close, and exit |
 | `reink-core` | IEEE 1284 identity parsing, Epson model database, command encoding, and EEPROM reply parsing |
 | `reink-app` | Epson D4 session, entry-probe, and validated write-plan application services |
-| `reink-usb` | Cross-platform libusb transport plus bounded read-only Windows USBPRINT enumeration and overlapped I/O |
+| `reink-usb` | Cross-platform libusb transport plus bounded Windows USBPRINT enumeration and overlapped D4 I/O |
 | `reink-snmp` | Synchronous SNMP v1/v2c/v3 Epson control-channel adapter |
 | `reink-discovery` | mDNS printer discovery and Linux read-only device-file enumeration |
 | `reink-hardware-test` | Opt-in Linux, macOS, and Windows validation driver, including a gated reversible single-byte write-evidence command |
@@ -123,8 +123,9 @@ logs, or persists them.
 ReInk does not install drivers. Windows/macOS libusb operations still require an
 already accessible explicitly selected interface. Windows stock-driver
 operations instead use bounded overlapped `WriteFile`/`ReadFile` on USBPRINT;
-they are application-level read-only and expose no generic write, restore,
-reset, write-evidence, or standard USB device-ID capability. ReInk never
+read paths are application-level read-only and type-restricted; separately
+named native mutation is experimental/unvalidated and additionally acknowledged.
+Native USBPRINT has no standard USB device-ID capability. ReInk never
 silently switches a requested backend.
 
 All concrete transports normalize their native implementation to
@@ -154,7 +155,7 @@ container ID, and retains the opaque open path only in a redacted process-local
 token. `CreateFileW` requests shared read/write access and overlapped mode.
 Every `ReadFile`/`WriteFile` has a finite wait, cancellation, and final
 completion cleanup; partial writes are rejected. This data plane is validated
-by reviewed level-C observations of one WIC/L1300 read workflow. Microsoft
+by reviewed level-C observations of one vendor-utility L1300 read workflow. Microsoft
 USBPRINT documentation does not explicitly define this direct data plane, and
 no native write/reset was observed.
 
@@ -356,7 +357,8 @@ cargo run -p reink-cli -- windows-native-eeprom-dump --vendor-id 0x04b8 --produc
 Add `--interface` only when enumeration reports a documented USB MI value.
 Selection must resolve exactly one candidate. These commands validate identity
 through D4; they do not fake the standard USB Printer Class device-ID control
-request. They expose no native write, restore, reset, or write-evidence command.
+request. Their read-only composition cannot mutate; separately named
+experimental native mutation and write-evidence commands require a second exact acknowledgement.
 
 On Linux and macOS, `usb-eeprom-write`, `usb-eeprom-restore`, and
 `usb-eeprom-reset` are confirmed CLI mutation commands. They require an exact
@@ -395,8 +397,9 @@ and native stock-driver candidates with an explicit backend label. Native
 candidates allow status, a complete private-file EEPROM dump, and opt-in
 serial-redacted status debug capture; native dumps are not loaded into the UI or
 captured because EEPROM may contain a serial. Their write, restore, and reset
-controls are disabled with a read-only explanation. Existing libusb candidates
-retain the guarded operation surfaces.
+controls are explicitly marked experimental and require a second exact native
+acknowledgement for every operation. Existing libusb candidates retain the
+validated guarded operation surfaces.
 Every connected operation requires an operator-selected expected bundled model;
 any exact VID/PID association is only a hint, and D4 identity must exactly match
 before access.
@@ -444,8 +447,9 @@ cargo run -p reink-hardware-test -- windows-native-d4-eeprom-dump --vendor-id 0x
 ```
 
 These reports omit interface paths, device-instance IDs, and identity serials.
-No native command accepts mutation or write-evidence arguments. The existing
-`d4-eeprom-write-evidence` command remains explicitly libusb-selected. The
+Native mutation and write-evidence commands are experimental/unvalidated and
+require their second acknowledgement. The existing `d4-eeprom-write-evidence`
+command remains explicitly libusb-selected. The
 hardware-test native dump validates the complete read but omits EEPROM bytes
 from stdout; use the CLI native dump to create a private binary image.
 
@@ -662,10 +666,11 @@ Raw EEPROM files remain available above persistent `Status`, `EEPROM`, and
 `--fixtures`; only that opt-in mode resolves fixture identity and runs
 deterministic fixture validation. Local raw EEPROM images are inspected
 read-only after an explicit model selection. The GUI's editing, reset, backup,
-and restore controls are guarded operations for libusb candidates: they require a selected target, exact model identity, a
-create-new synchronized backup, and the action-specific confirmation. On macOS
-and Windows they require an already libusb-accessible interface. Windows native
-USBPRINT candidates are strictly read-only and expose status/dump/debug only.
+and restore controls are guarded operations: they require a selected target,
+exact model identity, a create-new synchronized backup, and action-specific
+confirmation. Windows native USBPRINT adds an experimental/unvalidated second
+acknowledgement and never captures mutation dump traffic; its ordinary read API
+remains type-restricted.
 
 Its persistent shell and tab-specific sub-pane rules are documented in
 [UI design](docs/UI_DESIGN.md).
@@ -753,8 +758,12 @@ cargo run -p reink-gui
 `usb-id`, `usb-d4-probe`, and the read-only `usb-eeprom-dump` workflow are
 available on Windows for an explicitly selected libusb-accessible interface.
 The `windows-native-*` CLI and hardware-test commands provide D4
-identity/status/EEPROM reads without a libusb claim. They do not provide USB
-device-ID, write, restore, reset, or write-evidence.
+identity/status/EEPROM reads without a libusb claim. They do not provide the USB
+device-ID control request. Separately named `windows-native-experimental-*`
+commands provide guarded write, restore, and declared reset operations, and the
+native hardware-test command provides reversible write evidence. Every native
+mutation requires an additional exact experimental acknowledgement and remains
+physically unvalidated.
 `usb-eeprom-write`, `usb-eeprom-restore`, and `usb-eeprom-reset` remain
 unavailable on Windows.
 The cross-platform `d4-eeprom-write-evidence` command is available only as its
@@ -777,6 +786,24 @@ Xcode command-line tools and Rust toolchain, then run:
 ```bash
 cargo run -p reink-gui
 ```
+
+### Experimental Windows native USBPRINT mutation
+
+Windows native mutation is **experimental and unvalidated**. It is based only
+on observed native `WriteFile` D4 read traffic; physical mutation parity is
+pending. The explicitly named `windows-native-experimental-eeprom-write`,
+`windows-native-experimental-eeprom-restore`, and
+`windows-native-experimental-eeprom-reset` commands require both their normal
+operation confirmation and
+`I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL`. They require an exact
+native candidate and D4 identity, create a new durable full backup, and use
+read-back verification and rollback. Native mutation traffic is not captured
+by the GUI. Do not treat this as validated Windows parity.
+
+Progress only from native reads to repeated stable complete dumps and a durable
+backup, then to one explicitly acknowledged reversible single-byte evidence
+test. Restore is a separate later stage. Semantic reset is a separate manual
+command and never belongs in the ordinary progressive sequence.
 
 ### Linux: build, test, and read-only USB preflight
 

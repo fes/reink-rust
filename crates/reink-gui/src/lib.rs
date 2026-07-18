@@ -837,12 +837,24 @@ impl DescriptorCandidateBackend {
         match self {
             Self::LibUsb => "libusb",
             #[cfg(target_os = "windows")]
-            Self::WindowsNative(_) => "Windows stock driver (read-only)",
+            Self::WindowsNative(_) => "Windows USBPRINT (experimental mutation)",
         }
     }
 
     pub const fn permits_persistent_mutation(&self) -> bool {
-        matches!(self, Self::LibUsb)
+        match self {
+            Self::LibUsb => true,
+            #[cfg(target_os = "windows")]
+            Self::WindowsNative(candidate) => candidate.capabilities().persistent_mutation,
+        }
+    }
+
+    pub const fn experimental_mutation(&self) -> bool {
+        match self {
+            Self::LibUsb => false,
+            #[cfg(target_os = "windows")]
+            Self::WindowsNative(candidate) => candidate.capabilities().experimental_mutation,
+        }
     }
 }
 
@@ -862,6 +874,10 @@ pub struct DescriptorCandidate {
 impl DescriptorCandidate {
     pub const fn permits_persistent_mutation(&self) -> bool {
         self.backend.permits_persistent_mutation()
+    }
+
+    pub const fn experimental_mutation(&self) -> bool {
+        self.backend.experimental_mutation()
     }
 }
 

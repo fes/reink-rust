@@ -458,8 +458,11 @@ fn split_multi_sz(units: &[u16]) -> Vec<String> {
         .collect()
 }
 
-/// Bounded read-only-at-the-application-level D4 byte transport over USBPRINT.
-pub struct WindowsNativeReadOnlyTransport {
+/// Bounded D4 byte transport over USBPRINT.
+///
+/// Its bytes can reach `WriteFile`, but mutation is exposed only by explicitly
+/// named, experimental higher-level application APIs.
+pub struct WindowsNativeTransport {
     handle: Option<HANDLE>,
     vendor_id: u16,
     product_id: u16,
@@ -469,9 +472,9 @@ pub struct WindowsNativeReadOnlyTransport {
 
 // SAFETY: the owned Windows handle supports concurrent-thread ownership
 // transfer, while all I/O requires `&mut self` and is serialized by Rust.
-unsafe impl Send for WindowsNativeReadOnlyTransport {}
+unsafe impl Send for WindowsNativeTransport {}
 
-impl WindowsNativeReadOnlyTransport {
+impl WindowsNativeTransport {
     pub fn open(candidate: &WindowsNativePrinterCandidate) -> Result<Self, TransportError> {
         // SAFETY: the process-local token owns a valid terminated UTF-16 path
         // returned by SetupAPI; no pointer escapes this call.
@@ -648,7 +651,7 @@ impl WindowsNativeReadOnlyTransport {
     }
 }
 
-impl ByteTransport for WindowsNativeReadOnlyTransport {
+impl ByteTransport for WindowsNativeTransport {
     fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
         let (transferred, _) = self.overlapped_io(
             "write Windows stock-driver USBPRINT interface",
@@ -690,7 +693,7 @@ impl ByteTransport for WindowsNativeReadOnlyTransport {
 
     fn description(&self) -> String {
         format!(
-            "windows-native-usbprint:{:04x}:{:04x}{}:read-only",
+            "windows-native-usbprint:{:04x}:{:04x}{}:d4",
             self.vendor_id,
             self.product_id,
             self.interface_number
@@ -700,7 +703,7 @@ impl ByteTransport for WindowsNativeReadOnlyTransport {
     }
 }
 
-impl Drop for WindowsNativeReadOnlyTransport {
+impl Drop for WindowsNativeTransport {
     fn drop(&mut self) {
         let _ = self.close();
     }
@@ -776,10 +779,10 @@ fn win32_transport_error(operation: &'static str, code: u32) -> TransportError {
     TransportError::new(kind, operation, format!("{message} (Win32 error {code})"))
 }
 
-impl fmt::Debug for WindowsNativeReadOnlyTransport {
+impl fmt::Debug for WindowsNativeTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("WindowsNativeReadOnlyTransport")
+            .debug_struct("WindowsNativeTransport")
             .field("handle", &self.handle.map(|_| "<open redacted handle>"))
             .field("vendor_id", &format_args!("{:04x}", self.vendor_id))
             .field("product_id", &format_args!("{:04x}", self.product_id))

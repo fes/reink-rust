@@ -15,6 +15,9 @@ pub struct BackendCapabilities {
     pub d4_read: bool,
     pub usb_device_id: bool,
     pub persistent_mutation: bool,
+    /// Mutation is available only through an explicitly named, unvalidated
+    /// higher-level API. It must never be presented as validated parity.
+    pub experimental_mutation: bool,
 }
 
 impl PrinterBackend {
@@ -24,11 +27,13 @@ impl PrinterBackend {
                 d4_read: true,
                 usb_device_id: true,
                 persistent_mutation: true,
+                experimental_mutation: false,
             },
             Self::WindowsNativeStockDriver => BackendCapabilities {
                 d4_read: true,
                 usb_device_id: false,
-                persistent_mutation: false,
+                persistent_mutation: true,
+                experimental_mutation: true,
             },
         }
     }
@@ -311,11 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_capabilities_are_read_only_and_have_no_usb_id() {
+    fn native_backend_capabilities_are_experimental_and_have_no_usb_id() {
         let capabilities = PrinterBackend::WindowsNativeStockDriver.capabilities();
         assert!(capabilities.d4_read);
         assert!(!capabilities.usb_device_id);
-        assert!(!capabilities.persistent_mutation);
+        assert!(capabilities.persistent_mutation);
+        assert!(capabilities.experimental_mutation);
         assert!(PrinterBackend::LibUsb.capabilities().persistent_mutation);
+        assert!(!PrinterBackend::LibUsb.capabilities().experimental_mutation);
     }
 }
