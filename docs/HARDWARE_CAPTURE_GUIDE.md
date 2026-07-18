@@ -150,8 +150,7 @@ runners or use it solely to produce a capture.
 
 The GUI's connected controls are not evidence runners and never start from
 startup, candidate selection, file selection, or a typed acknowledgement alone.
-On Linux and Windows (and macOS only where the existing libusb interface claim
-is accessible), a user must select one candidate and one
+On Linux, macOS, and Windows, a user must select one candidate and one
 bundled expected model, then press an operation button. Exact VID/PID
 associations are display hints only. The worker reads the D4 identity and
 refuses any identity/model mismatch before status, dump, or model-specific
@@ -224,40 +223,53 @@ libusb workflow and is never a fallback from native access. The hardware-test
 native dump reports range/count only and deliberately omits EEPROM bytes; use
 the CLI native dump when a private binary image is required.
 
-Before any D4 interaction, use the Linux, macOS, or Windows `usb-id` command with an
-exact vendor/product/interface selection to request the standard USB Printer
+Before any D4 interaction, use the Linux, macOS, or Windows `usb-id` command
+with an exact vendor/product/interface selection to request the standard USB Printer
 Class device ID. If vendor/product IDs match more than one attached device,
 also provide the matching `--bus-number` and `--device-address`; ReInk refuses
 to select one arbitrarily. It must remain separate from Epson D4 traffic. If
-an active Linux kernel driver owns the interface, ReInk automatically detaches
-and reattaches it for each operation. On macOS and Windows, ReInk only attempts
-to claim an already libusb-accessible interface. A claim failure is a safe stop:
-do not install, detach, rebind, or otherwise change a driver.
+an active Linux or macOS kernel driver owns the selection, ReInk automatically
+detaches and reattaches it for each operation. Linux handoff is
+interface-scoped. libusb's macOS handoff captures and re-enumerates the entire
+USB device, normally requiring root or Apple's restricted device-access
+entitlement; it can change the bus/address. Windows only attempts to claim an
+already libusb-accessible interface. ReInk never installs a driver.
 
-For selected Linux read-only hardware-test commands (`read-sequence`,
+Before claiming or sending traffic, inspect the exact selection:
+
+```powershell
+cargo run -p reink-hardware-test -- usb-driver-state --vendor-id 0x04b8 --product-id <product-id> --interface <number> --bus-number <bus> --device-address <address>
+```
+
+This probe opens only enough to query driver ownership. It does not claim,
+detach, issue a control request, or send D4 traffic. It reports
+`active`, `inactive`, or `unsupported` without serials or native paths.
+
+For selected Linux and macOS read-only hardware-test commands (`read-sequence`,
 `d4-identity`, `d4-eeprom-read`, `d4-eeprom-dump`, and
 `d4-eeprom-boundary-probe`), handoff is automatic: ReInk temporarily detaches
-an active driver, then releases and reattaches only that driver for each
-operation. Schema-version-3 D4 reports record
-`linux_driver_handoff.automatic`, `.detached`, and `.reattached` outcomes
-without raw traffic. No external manual unbind is required. On failure, the
-report directs the operator to reconnect or power-cycle the printer and reboot
-the host if needed before retrying. The current macOS implementation does not
-detach a driver. Windows also never installs, detaches, rebinds, changes, or
-restores a driver. Driver handoff alone is never authorization for a write or
-reset.
+an active driver, then releases and reattaches only when it detached.
+Schema-version-3 D4 reports record generalized `driver_handoff`
+platform/scope/outcome metadata and retain `linux_driver_handoff` for
+compatibility. No external manual unbind is required. On macOS, run operations
+interactively and sequentially; after device-wide re-enumeration, rediscover
+the exact location and stop if duplicate matching printers make that ambiguous.
+On failure, reconnect or power-cycle the printer and reboot the host if needed
+before retrying. Windows never installs, detaches, rebinds, changes, or restores
+a driver. Driver handoff alone is never authorization for a write or reset.
 
 `read-sequence` includes an isolated D4 entry probe by default. That probe
 stops before D4 Init and may leave a printer awaiting D4 traffic, so the
 automated runner passes `--skip-d4-entry-probe` and lets each later D4 command
 start and close its own session.
 
-After every evidence command succeeds, the automated Linux and Windows runners
-invoke the durable `reink-cli usb-eeprom-dump` workflow and save a new private
-`eeprom-image.bin` beside the reports. It is a model-bounded read-only image,
-not a hardware-test report or write authorization. These runners never invoke
-write evidence; use only the separate explicit write-evidence runner when a
-target operation has been authorized.
+After every evidence command succeeds, the automated platform runners invoke
+the durable `reink-cli usb-eeprom-dump` workflow. Linux saves one private
+`eeprom-image.bin`; the macOS and native Windows progressive runners require
+two independently created images to match byte-for-byte. These are
+model-bounded read-only images, not hardware-test reports or write
+authorization. Read runners never invoke write evidence; use only the separate
+explicit write-evidence runner when a target operation has been authorized.
 
 ### Automated Linux run
 
@@ -278,6 +290,35 @@ hint; provide `--candidate-alias` and/or `--model` for any ambiguity. A model
 hint is still not identity confirmation: review the identity report before
 using the capture as model-specific evidence. Raw output remains private and
 must not be committed.
+
+### Automated macOS run
+
+With `reink-rust` and `reink-results` checked out as siblings, run the
+progressive read workflow with one exact descriptor selection, bundled model,
+and in-range read address:
+
+```bash
+cd ../reink-results
+./run-macos-read-evidence.sh \
+  --vendor-id 0x04b8 --product-id <product-id> \
+  --interface <interface> --alternate-setting <alternate-setting> \
+  --bus-number <bus> --device-address <address> \
+  --model <model> --read-address <in-range-address>
+```
+
+When driver capture may be required, the runner builds as the current user and
+uses `sudo` for only the printer operations. Do not invoke the whole script
+with `sudo`, which would create root-owned Cargo build artifacts.
+It re-enumerates candidates between operations because macOS device-wide
+handoff can change the address, and it proceeds only while exactly one
+VID/PID/interface/alternate-setting match exists. Its final gate creates two
+independent durable full images and requires a byte-for-byte match.
+
+Only after retaining that successful private directory may an authorized
+operator run `run-macos-write-evidence.sh` with its recorded final selector and
+both exact write/restoration acknowledgements. The separate runner performs
+one reversible byte test with a durable complete backup. Neither macOS runner
+issues reset automatically.
 
 ### Automated Windows run
 

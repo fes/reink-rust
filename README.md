@@ -10,8 +10,8 @@ ReInk is an in-progress Rust port of
 resetting waste-ink counters on selected Epson printers.
 
 The port aims to preserve the useful behavior of the Python implementation
-while making its protocol layers independently testable and supporting Linux
-and Windows through explicit OS adapters. It does **not** replace physical
+while making its protocol layers independently testable and supporting Linux,
+macOS, and Windows through explicit OS adapters. It does **not** replace physical
 waste-ink pads.
 
 > [!WARNING]
@@ -120,9 +120,11 @@ has a distinct stock-driver backend that enumerates present
 process-local token. It treats interface paths as opaque and never displays,
 logs, or persists them.
 
-ReInk does not install drivers. Windows/macOS libusb operations still require an
-already accessible explicitly selected interface. Windows stock-driver
-operations instead use bounded overlapped `WriteFile`/`ReadFile` on USBPRINT;
+ReInk does not install drivers. Linux and macOS libusb operations explicitly
+hand off an installed kernel driver when required, then restore it after the
+operation. Windows libusb requires an already accessible explicitly selected
+interface. Windows stock-driver operations instead use bounded overlapped
+`WriteFile`/`ReadFile` on USBPRINT;
 read paths are application-level read-only and type-restricted; separately
 named native mutation is experimental/unvalidated and additionally acknowledged.
 Native USBPRINT has no standard USB device-ID capability. ReInk never
@@ -141,12 +143,14 @@ than USB vendor/product attributes.
 alternate-setting-zero USB printer-class interfaces with both bulk-IN and bulk-OUT endpoints and
 implements `ByteTransport` with bounded bulk I/O. Its optional bounded exchange
 probe is protocol-neutral: callers provide request bytes, expected reply bytes,
-and a read limit. After a Linux interface is explicitly selected, ReInk
-automatically detaches an active driver for that interface, then releases and
-reattaches only the driver it detached after each operation. Reattachment
-failures report recovery guidance: reconnect or power-cycle the printer, then
-reboot the host if needed before retrying. macOS access currently uses only
-libusb's normal read/claim operations. Windows libusb uses the same normal
+and a read limit. After a Linux or macOS interface is explicitly selected,
+ReInk automatically detaches an active driver, claims and releases the
+interface, then reattaches only when it detached. Linux handoff is
+interface-scoped. libusb implements macOS detach/attach by capturing and
+re-enumerating the entire USB device, which normally requires root or Apple's
+restricted device-access entitlement and can change the device address.
+Failures report recovery guidance: reconnect or power-cycle the printer, then
+reboot the host if needed before retrying. Windows libusb uses only the normal
 read/claim/release lifecycle.
 
 The additional Windows module uses SetupAPI's two-call interface-detail pattern,
@@ -173,9 +177,10 @@ toolchain.
 For macOS development, use the stable Xcode command-line tools and Rust
 toolchain. No driver installation is part of setup. Use
 `system_profiler SPUSBDataType` to obtain the selected printer's vendor/product
-IDs and, when duplicate IDs are attached, its libusb-visible bus and address.
-On macOS and Windows, a claim failure is a safe stop: do not install or change
-a driver to work around it.
+IDs and its libusb-visible bus and address. macOS evidence runs must be
+sequential because device-wide handoff can re-enumerate the printer. When
+handoff is required, run with sufficient privilege; never install a driver.
+On Windows, a claim failure is a safe stop.
 
 ### `reink-core`
 
@@ -296,10 +301,10 @@ cargo run -p reink-cli -- local-devices
 ```
 
 For a standard USB Printer Class identity read, select the exact device and
-interface. The command never enters Epson D4 mode. On Linux, it automatically
-detaches and reattaches an active driver only for that selected interface. On
-Windows and macOS, it only claims an already libusb-accessible interface and
-never changes a driver. If multiple devices share vendor/product IDs, add both
+interface. The command never enters Epson D4 mode. On Linux and macOS, it
+automatically performs the platform handoff described above. On Windows, it
+only claims an already libusb-accessible interface and never changes a driver.
+If multiple devices share vendor/product IDs, add both
 `--bus-number` and `--device-address`; ReInk refuses to choose one arbitrarily:
 
 ```powershell
@@ -308,10 +313,9 @@ cargo run -p reink-cli -- usb-id --vendor-id 0x04b8 --product-id <product-id> --
 
 Use your platform's USB listing tool or ReInk's descriptor-only candidate
 listing to obtain the product, interface, and required location values. Do not
-guess them. On Windows and macOS, an access or claim failure is a safe stop;
-do not install, detach, rebind, or change a driver to work around it. On Linux,
-failure to detach, claim, or reattach the selected interface reports reconnect,
-power-cycle, and reboot remediation.
+guess them. On Linux and macOS, failure to detach, claim, release, or reattach
+reports reconnect, power-cycle, and reboot remediation. On Windows, an access
+or claim failure is a safe stop; never install a driver to work around it.
 
 `usb-d4-probe` is a separate, opt-in capture-only command. It sends the
 source-compatible Epson entry sequence and stops before D4 Init, service
@@ -436,6 +440,13 @@ database label/filter hints for an exact vendor/product mapping, not identity
 or automatic selection; they may be empty. A later IEEE 1284 identity read
 confirms the model.
 
+Inspect the exact selected interface's driver ownership without claiming,
+detaching, or sending protocol traffic:
+
+```powershell
+cargo run -p reink-hardware-test -- usb-driver-state --vendor-id 0x04b8 --product-id <product-id> --interface <number> --bus-number <bus> --device-address <address>
+```
+
 Windows stock-driver evidence uses a separate candidate and command family:
 
 ```powershell
@@ -467,6 +478,15 @@ one exact bundled model hint exist; otherwise it requires
 preflight, identity, selected-read, dump, and boundary-probe results in an
 ignored timestamped private directory, and never performs a write or reset.
 The identity result remains the authoritative model confirmation.
+
+For macOS, `run-macos-read-evidence.sh` performs the driver-state probe and
+progressive read gates, then requires two independently durable EEPROM images
+to match. Because macOS handoff re-enumerates the entire device, the runner
+re-resolves an unambiguous matching descriptor after every operation and
+records the final bus/address. Disconnect duplicate printers with the same
+VID/PID/interface before running it. The separate
+`run-macos-write-evidence.sh` requires that exact stable read directory and
+final selector before one reversible byte test; neither runner issues reset.
 
 For native Windows, use the same repository's
 `run-windows-read-evidence.ps1` with explicit vendor/product/interface/
@@ -556,19 +576,17 @@ safe.
 cargo run -p reink-hardware-test -- d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --interface <number> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE --report-file <outside-repository-path>
 ```
 
-For an explicitly selected Linux interface, `read-sequence`, `d4-identity`,
+For an explicitly selected Linux or macOS interface, `read-sequence`, `d4-identity`,
 `d4-eeprom-read`, `d4-eeprom-dump`, `d4-eeprom-boundary-probe`, and
 `d4-eeprom-write-evidence`
-automatically detach, claim, release, and reattach only the active driver for
-each operation. Schema-version-3 reports include
-`linux_driver_handoff` with automatic, detached, and reattached outcomes; they
-never contain raw traffic. If detach, claim, release, or reattachment fails,
-reconnect or power-cycle the printer, then reboot the host if needed before
-retrying. On Windows and macOS, these commands only claim and release an
-already libusb-accessible selected interface. The same report field remains
-present for schema compatibility, with `detached: false` and
-`reattached: null`; no driver is installed, detached, rebound, changed, or
-restored.
+automatically detach, claim, release, and reattach the active installed driver
+for each operation. Schema-version-3 reports include generalized
+`driver_handoff` platform/scope/outcome metadata and retain
+`linux_driver_handoff` for compatibility; neither contains raw traffic. macOS
+handoff is device-wide and may change bus/address. If detach, claim, release,
+or reattachment fails, reconnect or power-cycle the printer, then reboot the
+host if needed before retrying. Windows commands only claim and release an
+already libusb-accessible selected interface.
 
 Concrete commands return nonzero for operational failures. When `--report-file`
 is supplied after a D4 operation begins, they preserve a structured failure
@@ -779,9 +797,10 @@ values in ignored private evidence.
 The optional GUI can list descriptor-only USB printer candidates on macOS
 without opening or configuring a printer. After explicit selection, it supports
 guarded status, dump, write, restore, and reset operations only if that
-interface is already libusb-accessible. It never installs, detaches, rebinds,
-or changes a driver; a claim failure is a safe stop. Install the current stable
-Xcode command-line tools and Rust toolchain, then run:
+interface can be claimed. An active installed driver is handed off
+device-wide for the selected operation and restored afterward; this may require
+root and re-enumerate the printer. ReInk never installs a driver. Install the
+current stable Xcode command-line tools and Rust toolchain, then run:
 
 ```bash
 cargo run -p reink-gui
@@ -846,10 +865,11 @@ cargo run -p reink-gui
 
 For a physical USB printer, follow
 [the Linux read-only USB checklist](docs/LINUX_USB_READONLY_COMMANDS.txt).
-The opt-in hardware-test runner performs the supported read-only USB
-sequence, automatically handing off only an explicitly selected Linux driver
-for each operation. It reports detach, claim, release, and reattach failures
-clearly; reconnect or power-cycle the printer, then reboot the host if needed.
+The opt-in hardware-test runner performs the supported read-only USB sequence,
+automatically handing off the installed driver for an explicitly selected
+Linux interface or macOS device. It reports detach, claim, release, and
+reattach failures clearly; reconnect or power-cycle the printer, then reboot
+the host if needed.
 
 ### Instructions for coding agents and automation
 

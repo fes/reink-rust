@@ -32,6 +32,31 @@ pub fn list_printer_candidates() -> Result<Vec<UsbPrinterCandidate>, UsbOpenErro
     Ok(select_printer_candidates(&descriptors))
 }
 
+/// Read-only kernel-driver ownership state for one explicit USB interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbDriverState {
+    Active,
+    Inactive,
+    Unsupported,
+}
+
+/// Inspects driver ownership without claiming, detaching, or sending traffic.
+pub fn inspect_usb_driver_state(
+    device: UsbDeviceSelector,
+    interface: UsbInterfaceSelector,
+) -> Result<UsbDriverState, UsbOpenError> {
+    let context = Context::new().map_err(UsbOpenError::Context)?;
+    let usb_device = find_device(&context, device)?;
+    let selected = selected_interface(&usb_device, interface)?;
+    let handle = usb_device.open().map_err(UsbOpenError::Open)?;
+    match handle.kernel_driver_active(selected.number) {
+        Ok(true) => Ok(UsbDriverState::Active),
+        Ok(false) => Ok(UsbDriverState::Inactive),
+        Err(rusb::Error::NotSupported) => Ok(UsbDriverState::Unsupported),
+        Err(error) => Err(UsbOpenError::KernelDriverQuery(error)),
+    }
+}
+
 fn candidate_device_descriptor(
     device: Device<Context>,
 ) -> Result<UsbCandidateDeviceDescriptor, UsbOpenError> {
@@ -89,7 +114,7 @@ pub struct ReadOnlyUsbTransport {
     input_packet_size: usize,
     timeout: Duration,
     claimed: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     detached_kernel_driver: bool,
     driver_handoff: UsbDriverHandoffOutcome,
 }
@@ -97,10 +122,10 @@ pub struct ReadOnlyUsbTransport {
 impl ReadOnlyUsbTransport {
     /// Opens a selected printer interface.
     ///
-    /// On Linux, this automatically detaches an active driver for the selected
-    /// interface and reattaches it on close. On macOS and Windows, a claim is
-    /// attempted only against an existing libusb-accessible interface; no driver
-    /// is installed, detached, or rebound.
+    /// On Linux, this temporarily detaches only the selected interface driver.
+    /// On macOS, libusb capture temporarily re-enumerates the whole selected USB
+    /// device and requires root or Apple's device-access entitlement. Both paths
+    /// reattach on close. Windows only claims an already accessible interface.
     pub fn open(
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
@@ -110,10 +135,9 @@ impl ReadOnlyUsbTransport {
 
     /// Opens a selected printer interface with an explicit driver-handoff policy.
     ///
-    /// On Linux, `TemporarilyDetach` detaches an active kernel driver only for
-    /// this interface. Call [`Self::close`] to report release or reattach
-    /// failures. On macOS and Windows the policy does not change normal claim
-    /// behavior.
+    /// On Linux, `TemporarilyDetach` affects only this interface. On macOS it
+    /// requests libusb's device-wide capture/re-enumeration. Call [`Self::close`]
+    /// to report release or reattach failures. Windows does not detach.
     pub fn open_with_policy(
         device: UsbDeviceSelector,
         interface: UsbInterfaceSelector,
@@ -132,14 +156,14 @@ impl ReadOnlyUsbTransport {
     ) -> Result<Self, UsbOpenError> {
         let selected = selected_interface(&device, interface)?;
         let handle = device.open().map_err(UsbOpenError::Open)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut handle = handle;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let detached_kernel_driver =
             claim_interface_with_policy(&mut handle, selected.number, handoff, |handle| {
                 handle.claim_interface(selected.number)
             })?;
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "windows")]
         {
             let _ = handoff;
             handle
@@ -156,12 +180,12 @@ impl ReadOnlyUsbTransport {
             input_packet_size: usize::from(selected.input.max_packet_size),
             timeout: DEFAULT_TIMEOUT,
             claimed: true,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             detached_kernel_driver,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             driver_handoff: UsbDriverHandoffOutcome::requested(handoff)
                 .with_detached(detached_kernel_driver),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             driver_handoff: UsbDriverHandoffOutcome::requested(handoff),
         })
     }
@@ -180,7 +204,7 @@ impl ReadOnlyUsbTransport {
         } else {
             None
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let reattach = if self.detached_kernel_driver {
             match self.handle.attach_kernel_driver(self.interface) {
                 Ok(()) => {
@@ -196,7 +220,7 @@ impl ReadOnlyUsbTransport {
         } else {
             None
         };
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "windows")]
         let reattach: Option<UsbOpenError> = None;
 
         match (release, reattach) {
@@ -217,8 +241,8 @@ impl ReadOnlyUsbTransport {
 
 /// Reads the standard USB Printer Class device identifier without a protocol session.
 ///
-/// On Linux, an active driver for the explicitly selected interface is
-/// temporarily detached and reattached before this operation returns.
+/// On Linux or macOS, an active driver is temporarily handed off and restored
+/// before this operation returns. macOS capture is device-wide.
 pub fn read_printer_device_id(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -248,9 +272,9 @@ pub enum BoundedExchangeProbeResult {
 
 /// Sends a request and looks for an expected reply across at most `max_reads`.
 ///
-/// On Linux, an active driver for the explicitly selected interface is
-/// temporarily detached and reattached before this operation returns. This
-/// function never returns collected reply bytes.
+/// On Linux or macOS, an active driver is temporarily handed off and restored
+/// before this operation returns. macOS capture is device-wide. This function
+/// never returns collected reply bytes.
 pub fn probe_bounded_exchange(
     device: UsbDeviceSelector,
     interface: UsbInterfaceSelector,
@@ -444,14 +468,14 @@ fn selected_interface(
         .ok_or(UsbOpenError::InterfaceNotFound { selector })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 trait KernelDriver {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error>;
     fn detach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error>;
     fn attach_kernel_driver(&mut self, interface: u8) -> Result<(), rusb::Error>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl KernelDriver for DeviceHandle<Context> {
     fn kernel_driver_active(&mut self, interface: u8) -> Result<bool, rusb::Error> {
         DeviceHandle::kernel_driver_active(self, interface)
@@ -466,7 +490,7 @@ impl KernelDriver for DeviceHandle<Context> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn claim_interface_with_policy<H, F>(
     handle: &mut H,
     interface: u8,
@@ -585,6 +609,38 @@ pub enum UsbOpenError {
     },
 }
 
+#[cfg(target_os = "macos")]
+fn write_detach_error(formatter: &mut fmt::Formatter<'_>, error: &rusb::Error) -> fmt::Result {
+    write!(
+        formatter,
+        "capturing the macOS USB device failed: {error}; device-wide capture requires root or Apple's device-access entitlement, interrupts every interface on the selected device, and must not be retried while a print or scan job is active"
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_detach_error(formatter: &mut fmt::Formatter<'_>, error: &rusb::Error) -> fmt::Result {
+    write!(
+        formatter,
+        "detaching USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn write_reattach_error(formatter: &mut fmt::Formatter<'_>, error: &rusb::Error) -> fmt::Result {
+    write!(
+        formatter,
+        "releasing macOS USB device capture failed: {error}; the operating-system driver may remain unavailable for the entire device, so disconnect or power-cycle the printer, then reboot the host if needed before retrying"
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_reattach_error(formatter: &mut fmt::Formatter<'_>, error: &rusb::Error) -> fmt::Result {
+    write!(
+        formatter,
+        "reattaching the detached USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
+    )
+}
+
 impl fmt::Display for UsbOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -614,20 +670,15 @@ impl fmt::Display for UsbOpenError {
                 formatter,
                 "USB interface {interface} is owned by an active kernel driver and the selected restrictive policy will not detach it"
             ),
-            Self::DetachKernelDriver(error) => {
-                write!(
-                    formatter,
-                    "detaching USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
-                )
-            }
+            Self::DetachKernelDriver(error) => write_detach_error(formatter, error),
             Self::Claim(error) => write!(
                 formatter,
                 "claiming USB interface failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
             ),
-            Self::ClaimAndReattach { claim, reattach } => write!(
-                formatter,
-                "claiming USB interface failed: {claim}; reattaching the detached kernel driver also failed: {reattach}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
-            ),
+            Self::ClaimAndReattach { claim, reattach } => {
+                write!(formatter, "claiming USB interface failed: {claim}; ")?;
+                write_reattach_error(formatter, reattach)
+            }
             Self::ReadDeviceId(error) => {
                 write!(formatter, "reading USB printer device ID failed: {error}")
             }
@@ -647,12 +698,7 @@ impl fmt::Display for UsbOpenError {
                 formatter,
                 "releasing USB interface failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
             ),
-            Self::ReattachKernelDriver(error) => {
-                write!(
-                    formatter,
-                    "reattaching the detached USB kernel driver failed: {error}; reconnect the printer, power-cycle it if needed, then reboot the host before retrying"
-                )
-            }
+            Self::ReattachKernelDriver(error) => write_reattach_error(formatter, error),
             Self::ReleaseAndReattach { release, reattach } => {
                 write!(formatter, "{release}; {reattach}")
             }
@@ -703,17 +749,14 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
     use super::{KernelDriver, UsbDriverHandoff, claim_interface_with_policy};
 
-    #[cfg(target_os = "linux")]
     struct MockKernelDriver {
         detach_fails: bool,
         attach_fails: bool,
         events: Vec<&'static str>,
     }
 
-    #[cfg(target_os = "linux")]
     impl MockKernelDriver {
         fn active() -> Self {
             Self {
@@ -724,7 +767,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl KernelDriver for MockKernelDriver {
         fn kernel_driver_active(&mut self, _: u8) -> Result<bool, rusb::Error> {
             self.events.push("active");
@@ -751,7 +793,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn restrictive_policy_refuses_an_active_kernel_driver() {
         let mut driver = MockKernelDriver::active();
         let error =
@@ -766,7 +807,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn default_policy_detaches_before_claiming() {
         let mut driver = MockKernelDriver::active();
         let detached =
@@ -781,7 +821,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn claim_failure_reattaches_a_driver_detached_by_the_transport() {
         let mut driver = MockKernelDriver::active();
         let error = claim_interface_with_policy(
@@ -800,7 +839,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn claim_and_reattach_failures_are_both_reported() {
         let mut driver = MockKernelDriver {
             attach_fails: true,
@@ -825,7 +863,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn detach_failure_does_not_attempt_claim_or_reattach() {
         let mut driver = MockKernelDriver {
             detach_fails: true,

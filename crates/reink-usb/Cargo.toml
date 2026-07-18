@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "USB transports and read-only Windows stock-driver access for ReInk printer interfaces"
+description = "Cross-platform USB transports and Windows stock-driver access for ReInk printer interfaces"
 
 [dependencies]
 reink-platform = { path = "../reink-platform" }

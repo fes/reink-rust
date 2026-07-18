@@ -74,6 +74,21 @@ enum Command {
     },
     /// List descriptor-only USB printer candidates without opening a device.
     UsbCandidates,
+    /// Inspect kernel-driver ownership without claiming or detaching the interface.
+    UsbDriverState {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: u8,
+        #[arg(long, default_value_t = 0)]
+        alternate_setting: u8,
+        #[arg(long)]
+        bus_number: u8,
+        #[arg(long)]
+        device_address: u8,
+    },
     /// List present read-only USBPRINT interfaces through the Windows stock driver.
     #[cfg(target_os = "windows")]
     WindowsNativeCandidates,
@@ -348,6 +363,21 @@ fn run(cli: Cli) -> Result<String, String> {
             &description,
         ),
         Command::UsbCandidates => usb_candidates(),
+        Command::UsbDriverState {
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+        } => usb_driver_state(
+            vendor_id,
+            product_id,
+            interface,
+            alternate_setting,
+            bus_number,
+            device_address,
+        ),
         #[cfg(target_os = "windows")]
         Command::WindowsNativeCandidates => windows_native_candidates(),
         #[cfg(target_os = "windows")]
@@ -1220,6 +1250,82 @@ fn usb_candidates() -> Result<String, String> {
     Ok(usb_candidates_report(&candidates, &database))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn usb_driver_state(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: u8,
+    device_address: u8,
+) -> Result<String, String> {
+    let state = reink_usb::inspect_usb_driver_state(
+        reink_usb::UsbDeviceSelector::at_location(
+            vendor_id,
+            product_id,
+            bus_number,
+            device_address,
+        ),
+        reink_platform::UsbInterfaceSelector {
+            number: interface,
+            alternate_setting,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(usb_driver_state_report(
+        vendor_id,
+        product_id,
+        interface,
+        alternate_setting,
+        bus_number,
+        device_address,
+        state,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn usb_driver_state(_: u16, _: u16, _: u8, _: u8, _: u8, _: u8) -> Result<String, String> {
+    Err(
+        "USB driver-state inspection is currently supported only on Linux, macOS, or Windows"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn usb_driver_state_report(
+    vendor_id: u16,
+    product_id: u16,
+    interface: u8,
+    alternate_setting: u8,
+    bus_number: u8,
+    device_address: u8,
+    state: reink_usb::UsbDriverState,
+) -> String {
+    let state = match state {
+        reink_usb::UsbDriverState::Active => "active",
+        reink_usb::UsbDriverState::Inactive => "inactive",
+        reink_usb::UsbDriverState::Unsupported => "unsupported",
+    };
+    json!({
+        "schema_version": 1,
+        "mode": "read_only",
+        "command": "usb-driver-state",
+        "selector": {
+            "vendor_id": format!("{vendor_id:04X}"),
+            "product_id": format!("{product_id:04X}"),
+            "interface": interface,
+            "alternate_setting": alternate_setting,
+            "bus_number": bus_number,
+            "device_address": device_address,
+        },
+        "driver_state": state,
+        "device_wide_handoff_on_macos": true,
+        "traffic_sent": false,
+    })
+    .to_string()
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn usb_candidates() -> Result<String, String> {
     Err(
@@ -1614,6 +1720,7 @@ fn write_evidence_report(
             "original_value": outcome.and_then(|outcome| outcome.original_value).map(|value| format!("{value:02X}")),
         },
         "backup_file": backup_file,
+        "driver_handoff": driver_handoff.platform_json(),
         "linux_driver_handoff": driver_handoff.json(),
         "stages": stages,
         "remediation": (!completed_safely).then_some(WRITE_EVIDENCE_REMEDIATION),
@@ -2761,6 +2868,22 @@ impl DriverHandoffReport {
             "reattached": self.reattached,
         })
     }
+
+    fn platform_json(self) -> Value {
+        json!({
+            "platform": std::env::consts::OS,
+            "scope": if cfg!(target_os = "macos") {
+                "device"
+            } else if cfg!(target_os = "linux") {
+                "interface"
+            } else {
+                "none"
+            },
+            "automatic": self.automatic,
+            "detached": self.detached,
+            "reattached": self.reattached,
+        })
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -2786,6 +2909,7 @@ fn read_only_report(
         "schema_version": 3,
         "mode": "read_only",
         "command": command,
+        "driver_handoff": driver_handoff.platform_json(),
         "linux_driver_handoff": driver_handoff.json(),
         "steps": steps,
         "next_step": next_step,
@@ -2813,6 +2937,7 @@ fn d4_failure_report(
         "mode": "read_only",
         "command": command,
         "status": "failed",
+        "driver_handoff": driver_handoff.platform_json(),
         "linux_driver_handoff": driver_handoff.json(),
         "failure": failure,
         "remediation": DRIVER_RECOVERY_REMEDIATION,
@@ -2993,13 +3118,31 @@ mod tests {
         d4_eeprom_read_report, d4_failure_report, d4_identity_report, dump_progress,
         eeprom_dump_addresses, emit_report, execute_write_evidence, parse_trace_events, parse_u16,
         read_sequence_report, simulated_read_only_report, trace_json, trace_to_transcript,
-        transcript_template, usb_candidates_report, usb_device_selector, validate_boundary_probe,
-        validate_eeprom_read_addresses, validate_report_file_path, validate_trace_file_path,
-        validate_write_evidence_gates, write_evidence_report,
+        transcript_template, usb_candidates_report, usb_device_selector, usb_driver_state_report,
+        validate_boundary_probe, validate_eeprom_read_addresses, validate_report_file_path,
+        validate_trace_file_path, validate_write_evidence_gates, write_evidence_report,
     };
 
     fn report(output: String) -> Value {
         serde_json::from_str(&output).unwrap()
+    }
+
+    #[test]
+    fn driver_state_report_is_read_only_and_selector_exact() {
+        let output = report(usb_driver_state_report(
+            0x04b8,
+            0x0066,
+            0,
+            0,
+            1,
+            2,
+            reink_usb::UsbDriverState::Active,
+        ));
+        assert_eq!(output["command"], "usb-driver-state");
+        assert_eq!(output["driver_state"], "active");
+        assert_eq!(output["selector"]["vendor_id"], "04B8");
+        assert_eq!(output["traffic_sent"], false);
+        assert_eq!(output["device_wide_handoff_on_macos"], true);
     }
 
     fn assert_completed_steps(report: &Value, expected_names: &[&str]) {
