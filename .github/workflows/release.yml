@@ -39,7 +39,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p reink-cli -p reink-hardware-test -p reink-tui -p reink-gui
       - name: Upload release candidates
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reink-${{ matrix.target }}
           path: |
