@@ -492,8 +492,7 @@ fn ascii(value: &str) -> Result<&[u8], TransactionParseError> {
     }
     if !value.bytes().enumerate().all(|(index, byte)| match byte {
         b'A'..=b'Z' | b'0'..=b'9' | b'-' => {
-            !(index == 0 && !byte.is_ascii_uppercase())
-                && !(index + 1 == value.len() && byte == b'-')
+            !(index == 0 && !byte.is_ascii_uppercase() || index + 1 == value.len() && byte == b'-')
         }
         _ => false,
     }) {

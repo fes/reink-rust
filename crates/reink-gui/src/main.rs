@@ -4,18 +4,25 @@ use eframe::egui::{self, Color32, RichText};
 use regex::RegexBuilder;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_app::{
-    EepromImage, UsbCleanupStatus, UsbSessionCleanup, declared_counter_reset_updates,
-    restore_eeprom_updates, verify_exact_model, with_selected_usb_epson_session,
-    write_new_binary_file,
+    EepromImage, UsbSessionCleanup, declared_counter_reset_updates, restore_eeprom_updates,
+    verify_exact_model, with_selected_usb_epson_session, write_new_binary_file,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use reink_core::{CounterResetTarget, EpsonSpec, ModelDatabase};
 use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
 use reink_gui::{
     DebugTrafficTrace, DescriptorCandidate, DescriptorCandidateBackend, GuiState, Page, SourceMode,
-    ValidationStatus,
 };
 use reink_platform::TransportEvent;
+
+mod view_helpers;
+use view_helpers::{
+    ascii_dump_line, dump_cell, eeprom_field_address_label, eeprom_field_column_width,
+    eeprom_field_tooltip, eeprom_field_value, eeprom_image_offset, eeprom_table_row, end_truncate,
+    status_color,
+};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use view_helpers::{cleanup_is_successful, cleanup_report_lines};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::path::PathBuf;
@@ -926,10 +933,10 @@ impl ReinkGui {
                                             }
                                         }
                                     });
-                                if selected_model != current_model {
-                                    if let Some(file) = &mut self.loaded_eeprom {
-                                        file.model = selected_model;
-                                    }
+                                if selected_model != current_model
+                                    && let Some(file) = &mut self.loaded_eeprom
+                                {
+                                    file.model = selected_model;
                                 }
                             }
                         }
@@ -1072,16 +1079,14 @@ impl ReinkGui {
                     if ui
                         .add_enabled(enabled, egui::Button::new("Save complete EEPROM dump..."))
                         .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
+                        && let Some(path) = rfd::FileDialog::new()
                             .set_file_name("eeprom-image.bin")
                             .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
                             .save_file()
-                        {
-                            self.start_selected_usb_operation(UsbOperationRequest::Dump {
-                                output_file: path,
-                            });
-                        }
+                    {
+                        self.start_selected_usb_operation(UsbOperationRequest::Dump {
+                            output_file: path,
+                        });
                     }
                 });
                 ui.label(
@@ -1223,7 +1228,7 @@ impl ReinkGui {
         let mut selected_address_from_dump = None;
         let field_column_width = eeprom_field_column_width(
             ui,
-            &rows,
+            rows,
             &file_fields,
             selected_is_file,
             selected_label.as_str(),
@@ -1470,16 +1475,14 @@ impl ReinkGui {
                     if ui
                         .add_enabled(enabled, egui::Button::new("Save complete EEPROM dump..."))
                         .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
+                        && let Some(path) = rfd::FileDialog::new()
                             .set_file_name("eeprom-image.bin")
                             .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
                             .save_file()
-                        {
-                            self.start_selected_usb_operation(UsbOperationRequest::Dump {
-                                output_file: path,
-                            });
-                        }
+                    {
+                        self.start_selected_usb_operation(UsbOperationRequest::Dump {
+                            output_file: path,
+                        });
                     }
                 });
                 ui.add_space(12.0);
@@ -1822,13 +1825,12 @@ impl ReinkGui {
                         native_experimental_acknowledgement,
                     } => {
                         ui.heading("Preflight");
-                        if ui.button("Choose complete EEPROM image...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                        if ui.button("Choose complete EEPROM image...").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
                                 .pick_file()
-                            {
-                                *restore_image = Some(preflight_restore_image(&path, spec));
-                            }
+                        {
+                            *restore_image = Some(preflight_restore_image(&path, spec));
                         }
                         if let Some(preflight) = restore_image.as_ref() {
                             ui.monospace(preflight.path.display().to_string());
@@ -2597,14 +2599,13 @@ impl eframe::App for ReinkGui {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn choose_backup_file(ui: &mut egui::Ui, backup_file: &mut Option<PathBuf>, suggested_name: &str) {
-    if ui.button("Choose new complete backup...").clicked() {
-        if let Some(path) = rfd::FileDialog::new()
+    if ui.button("Choose new complete backup...").clicked()
+        && let Some(path) = rfd::FileDialog::new()
             .set_file_name(suggested_name)
             .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
             .save_file()
-        {
-            *backup_file = Some(path);
-        }
+    {
+        *backup_file = Some(path);
     }
     match backup_file {
         Some(path) => {
@@ -2785,554 +2786,5 @@ fn format_current_values(values: &[(u16, u8)]) -> String {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn cleanup_is_successful(cleanup: &UsbSessionCleanup) -> bool {
-    matches!(&cleanup.d4_shutdown, UsbCleanupStatus::Succeeded)
-        && matches!(&cleanup.usb_close, UsbCleanupStatus::Succeeded)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn cleanup_report_lines(cleanup: &UsbSessionCleanup) -> Vec<String> {
-    vec![
-        format!(
-            "D4 shutdown: {}.",
-            cleanup_status_label(&cleanup.d4_shutdown)
-        ),
-        format!("USB cleanup: {}.", cleanup_status_label(&cleanup.usb_close)),
-    ]
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn cleanup_status_label(status: &UsbCleanupStatus) -> String {
-    match status {
-        UsbCleanupStatus::NotAttempted => "not attempted".to_owned(),
-        UsbCleanupStatus::Succeeded => "succeeded".to_owned(),
-        UsbCleanupStatus::Failed(error) => format!("failed ({error})"),
-    }
-}
-
-fn eeprom_image_offset(start_address: usize, byte_count: usize, address: usize) -> Option<usize> {
-    address
-        .checked_sub(start_address)
-        .filter(|offset| *offset < byte_count)
-}
-
-fn eeprom_field_address_label(field: &EepromFileField) -> String {
-    if field.address == field.end_address {
-        format!("0x{:04X}", field.address)
-    } else {
-        format!("0x{:04X}..0x{:04X}", field.address, field.end_address)
-    }
-}
-
-fn eeprom_field_value(field: &EepromFileField, image_start_address: usize, bytes: &[u8]) -> String {
-    if field.sensitive {
-        return "Hidden (sensitive)".to_owned();
-    }
-    let Some(field_bytes) = eeprom_field_bytes(field, image_start_address, bytes) else {
-        return "Unavailable".to_owned();
-    };
-
-    match field.encoding {
-        EepromFieldEncoding::U8 => {
-            let value = field_bytes[0];
-            format!("{value} (0x{value:02X})")
-        }
-        EepromFieldEncoding::U16Le => {
-            let value = u16::from_le_bytes([field_bytes[0], field_bytes[1]]);
-            format!("{value} (0x{value:04X})")
-        }
-        EepromFieldEncoding::U32Le => {
-            let value = u32::from_le_bytes([
-                field_bytes[0],
-                field_bytes[1],
-                field_bytes[2],
-                field_bytes[3],
-            ]);
-            format!("{value} (0x{value:08X})")
-        }
-        EepromFieldEncoding::Ascii => {
-            let value = field_bytes
-                .iter()
-                .map(|byte| match byte {
-                    b' '..=b'~' => char::from(*byte),
-                    _ => '.',
-                })
-                .collect::<String>();
-            format!("{value:?}")
-        }
-        EepromFieldEncoding::RawBytes => field_bytes
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
-}
-
-fn eeprom_field_bytes<'a>(
-    field: &EepromFileField,
-    image_start_address: usize,
-    bytes: &'a [u8],
-) -> Option<&'a [u8]> {
-    let offset = eeprom_image_offset(image_start_address, bytes.len(), field.address)?;
-    let byte_len = field
-        .end_address
-        .checked_sub(field.address)?
-        .checked_add(1)?;
-    bytes.get(offset..offset.checked_add(byte_len)?)
-}
-
-fn eeprom_field_tooltip(field: &EepromFileField) -> String {
-    let mut lines = vec![
-        format!("Read-only field: {}", eeprom_field_address_label(field)),
-        format!("Encoding: {}", field.encoding.label()),
-    ];
-    if let Some(confidence) = field.confidence {
-        lines.push(format!("Confidence: {}", confidence.label()));
-    }
-    if let Some(note) = &field.evidence_note {
-        lines.push(format!("Evidence: {note}"));
-    }
-    if field.sensitive {
-        lines.push("Decoded value is hidden by default because it is sensitive.".to_owned());
-    }
-    lines.join("\n")
-}
-
-fn eeprom_table_row(
-    ui: &mut egui::Ui,
-    address_width: f32,
-    field_width: f32,
-    value_width: f32,
-    address: &str,
-    field: &str,
-    value: &str,
-    selected: bool,
-    header: bool,
-    height: f32,
-) -> egui::Response {
-    let (address_alignment, field_alignment, value_alignment) = if header {
-        (
-            egui::Align::Center,
-            egui::Align::Center,
-            egui::Align::Center,
-        )
-    } else {
-        (egui::Align::Min, egui::Align::Min, egui::Align::Max)
-    };
-    let separator_width = 8.0;
-    let row_width = address_width + field_width + value_width + 2.0 * separator_width;
-    let sense = if header {
-        egui::Sense::hover()
-    } else {
-        egui::Sense::click()
-    };
-    let (row_rect, response) = ui.allocate_exact_size(egui::vec2(row_width, height), sense);
-    let address_rect =
-        egui::Rect::from_min_size(row_rect.min, egui::vec2(address_width, row_rect.height()));
-    let first_separator_x = address_rect.right() + separator_width / 2.0;
-    let field_rect = egui::Rect::from_min_size(
-        egui::pos2(address_rect.right() + separator_width, row_rect.top()),
-        egui::vec2(field_width, row_rect.height()),
-    );
-    let second_separator_x = field_rect.right() + separator_width / 2.0;
-    let value_rect = egui::Rect::from_min_size(
-        egui::pos2(field_rect.right() + separator_width, row_rect.top()),
-        egui::vec2(value_width, row_rect.height()),
-    );
-    let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
-    paint_dashed_vertical_line(ui, first_separator_x, row_rect, stroke);
-    paint_dashed_vertical_line(ui, second_separator_x, row_rect, stroke);
-    paint_eeprom_cell(
-        ui,
-        address_rect,
-        address,
-        selected,
-        address_alignment,
-        header,
-    );
-    paint_eeprom_cell(ui, field_rect, field, selected, field_alignment, header);
-    paint_eeprom_cell(ui, value_rect, value, selected, value_alignment, header);
-    response
-}
-
-fn paint_eeprom_cell(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    value: &str,
-    selected: bool,
-    alignment: egui::Align,
-    header: bool,
-) {
-    let font = egui::FontId::monospace(14.0);
-    let color = if selected {
-        Color32::WHITE
-    } else {
-        ui.visuals().text_color()
-    };
-    let horizontal_padding = 6.0;
-    let lines = if header {
-        vec![value.to_owned()]
-    } else {
-        wrap_eeprom_cell_text(ui, value, &font, rect.width() - 2.0 * horizontal_padding)
-    };
-    let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
-    let text_height = line_height * lines.len() as f32;
-    let mut y = rect.center().y - text_height / 2.0;
-
-    if selected {
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(52, 92, 118));
-    }
-    for line in lines {
-        let galley = ui.painter().layout_no_wrap(line, font.clone(), color);
-        let x = match alignment {
-            egui::Align::Min => rect.left() + horizontal_padding,
-            egui::Align::Center => rect.center().x - galley.size().x / 2.0,
-            egui::Align::Max => rect.right() - horizontal_padding - galley.size().x,
-        };
-        let position = egui::pos2(x, y);
-        ui.painter().galley(position, galley, color);
-        y += line_height;
-    }
-}
-
-fn eeprom_field_column_width(
-    ui: &egui::Ui,
-    rows: &[reink_gui::EepromRow],
-    file_fields: &[EepromFileField],
-    selected_is_file: bool,
-    selected_label: &str,
-) -> f32 {
-    let labels = if selected_is_file && file_fields.is_empty() {
-        vec![selected_label]
-    } else if selected_is_file {
-        file_fields
-            .iter()
-            .map(|field| field.label.as_str())
-            .collect()
-    } else {
-        rows.iter().map(|row| row.label).collect()
-    };
-    let font = egui::FontId::monospace(14.0);
-    labels
-        .into_iter()
-        .map(|label| {
-            ui.painter()
-                .layout_no_wrap(label.to_owned(), font.clone(), ui.visuals().text_color())
-                .size()
-                .x
-        })
-        .fold(160.0, f32::max)
-        + 12.0
-}
-
-fn wrap_eeprom_cell_text(
-    ui: &egui::Ui,
-    value: &str,
-    font: &egui::FontId,
-    max_width: f32,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in value.split_whitespace() {
-        let candidate = if line.is_empty() {
-            word.to_owned()
-        } else {
-            format!("{line} {word}")
-        };
-        if !line.is_empty()
-            && ui
-                .painter()
-                .layout_no_wrap(candidate.clone(), font.clone(), ui.visuals().text_color())
-                .size()
-                .x
-                > max_width
-        {
-            lines.push(std::mem::take(&mut line));
-            line.push_str(word);
-        } else {
-            line = candidate;
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
-fn paint_dashed_vertical_line(ui: &egui::Ui, x: f32, rect: egui::Rect, stroke: egui::Stroke) {
-    let mut y = rect.top() + 2.0;
-    while y < rect.bottom() - 2.0 {
-        let end = (y + 3.0).min(rect.bottom() - 2.0);
-        ui.painter()
-            .line_segment([egui::pos2(x, y), egui::pos2(x, end)], stroke);
-        y += 6.0;
-    }
-}
-
-fn end_truncate(value: &str, maximum_characters: usize) -> String {
-    if value.chars().count() <= maximum_characters {
-        return value.to_owned();
-    }
-    let suffix = value
-        .chars()
-        .rev()
-        .take(maximum_characters.saturating_sub(1))
-        .collect::<Vec<_>>();
-    format!("…{}", suffix.into_iter().rev().collect::<String>())
-}
-
-fn dump_cell(value: String, highlighted: bool) -> RichText {
-    let text = RichText::new(value).monospace();
-    if highlighted {
-        text.background_color(Color32::from_rgb(239, 220, 130))
-    } else {
-        text
-    }
-}
-
-fn ascii_cell(byte: u8) -> char {
-    match byte {
-        b' '..=b'~' => byte as char,
-        _ => '.',
-    }
-}
-
-fn ascii_dump_line(
-    bytes: &[u8],
-    line_address: usize,
-    selected_address: usize,
-) -> egui::text::LayoutJob {
-    let mut line = egui::text::LayoutJob::default();
-    for (index, byte) in bytes.iter().enumerate() {
-        let highlighted = line_address + index == selected_address;
-        line.append(
-            &ascii_cell(*byte).to_string(),
-            0.0,
-            egui::TextFormat {
-                font_id: egui::FontId::monospace(14.0),
-                background: highlighted
-                    .then_some(Color32::from_rgb(239, 220, 130))
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-        );
-    }
-    line
-}
-
-fn status_color(status: ValidationStatus) -> Color32 {
-    match status {
-        ValidationStatus::Success => Color32::from_rgb(36, 130, 76),
-        ValidationStatus::Blocked => Color32::from_rgb(174, 112, 0),
-        ValidationStatus::Failure => Color32::from_rgb(181, 47, 47),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use reink_core::{EepromFieldConfidence, EepromFieldEncoding};
-    use reink_gui::SourceMode;
-
-    #[cfg(target_os = "windows")]
-    use super::redact_native_identity_serials;
-    #[cfg(target_os = "windows")]
-    use super::{
-        EEPROM_WRITE_CONFIRMATION, WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
-        require_native_experimental_mutation_acknowledgement,
-    };
-    use super::{
-        EepromFileField, eeprom_field_address_label, eeprom_field_tooltip, eeprom_field_value,
-        eeprom_image_offset, source_mode_from_args,
-    };
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    use super::{
-        confirmation_matches, display_status_response, format_current_values, parse_u8_input,
-        parse_u16_input, selected_model_for_usb_candidate, validate_restore_image_size,
-    };
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    use reink_gui::{DescriptorCandidate, DescriptorCandidateBackend, GuiState};
-    #[cfg(target_os = "windows")]
-    use reink_platform::TransportEvent;
-
-    #[test]
-    fn fixtures_require_an_explicit_flag_and_unknown_arguments_are_ignored() {
-        assert_eq!(
-            source_mode_from_args(["reink-gui".to_owned(), "--unknown".to_owned()]),
-            SourceMode::Real
-        );
-        assert_eq!(
-            source_mode_from_args(["reink-gui".to_owned(), "--fixtures".to_owned()]),
-            SourceMode::Fixtures
-        );
-    }
-
-    #[test]
-    fn model_bounded_image_fields_use_relative_offsets() {
-        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0214), Some(0x14));
-        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x01ff), None);
-        assert_eq!(eeprom_image_offset(0x0200, 0x20, 0x0220), None);
-    }
-
-    #[test]
-    fn loaded_field_values_decode_multi_byte_data_and_hide_sensitive_values() {
-        let counter = EepromFileField {
-            address: 0x26,
-            end_address: 0x27,
-            label: "Waste counter".to_owned(),
-            encoding: EepromFieldEncoding::U16Le,
-            confidence: Some(EepromFieldConfidence::Confirmed),
-            evidence_note: Some("Reviewed sanitized evidence.".to_owned()),
-            sensitive: false,
-        };
-        let pages = EepromFileField {
-            address: 0xb0,
-            end_address: 0xb3,
-            label: "Total print-page count".to_owned(),
-            encoding: EepromFieldEncoding::U32Le,
-            confidence: Some(EepromFieldConfidence::Confirmed),
-            evidence_note: Some("Reviewed sanitized evidence.".to_owned()),
-            sensitive: false,
-        };
-        let serial = EepromFileField {
-            address: 0xc2,
-            end_address: 0xcb,
-            label: "Serial number".to_owned(),
-            encoding: EepromFieldEncoding::Ascii,
-            confidence: Some(EepromFieldConfidence::Confirmed),
-            evidence_note: Some("Sensitive device-specific field.".to_owned()),
-            sensitive: true,
-        };
-        let mut image = vec![0; 0xcc];
-        image[0x26..0x28].copy_from_slice(&[0x34, 0x12]);
-        image[0xb0..0xb4].copy_from_slice(&[0x78, 0x56, 0x34, 0x12]);
-        image[0xc2..0xcc].copy_from_slice(b"PRIVATE-01");
-
-        assert_eq!(eeprom_field_address_label(&counter), "0x0026..0x0027");
-        assert_eq!(eeprom_field_value(&counter, 0, &image), "4660 (0x1234)");
-        assert_eq!(
-            eeprom_field_value(&pages, 0, &image),
-            "305419896 (0x12345678)"
-        );
-        assert_eq!(eeprom_field_value(&serial, 0, &image), "Hidden (sensitive)");
-        let tooltip = eeprom_field_tooltip(&serial);
-        assert!(tooltip.contains("Confidence: Confirmed"));
-        assert!(tooltip.contains("Sensitive device-specific field."));
-        assert!(!tooltip.contains("PRIVATE-01"));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn guarded_operation_inputs_require_exact_confirmation_and_bounded_bytes() {
-        assert!(confirmation_matches(
-            "I_CONFIRM_THIS_WILL_WRITE_EEPROM",
-            "I_CONFIRM_THIS_WILL_WRITE_EEPROM"
-        ));
-        assert!(!confirmation_matches(
-            "i_confirm_this_will_write_eeprom",
-            "I_CONFIRM_THIS_WILL_WRITE_EEPROM"
-        ));
-        assert_eq!(parse_u16_input("0x00FF"), Ok(0x00ff));
-        assert_eq!(parse_u16_input("255"), Ok(255));
-        assert!(parse_u16_input("0x10000").is_err());
-        assert_eq!(parse_u8_input("0x7F"), Ok(0x7f));
-        assert!(parse_u8_input("256").is_err());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn native_mutation_requires_a_distinct_exact_experimental_acknowledgement() {
-        assert!(confirmation_matches(
-            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT,
-            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
-        ));
-        assert!(!confirmation_matches(
-            "I_ACKNOWLEDGE_WINDOWS_NATIVE_MUTATION_IS_EXPERIMENTAL ",
-            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
-        ));
-        assert_ne!(
-            EEPROM_WRITE_CONFIRMATION,
-            WINDOWS_NATIVE_EXPERIMENTAL_MUTATION_ACKNOWLEDGEMENT
-        );
-        assert!(require_native_experimental_mutation_acknowledgement(true).is_ok());
-        assert!(require_native_experimental_mutation_acknowledgement(false).is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn unassociated_usb_candidate_accepts_only_a_known_expected_model() {
-        let state = GuiState::new().unwrap();
-        let candidate = DescriptorCandidate {
-            alias: "usb-1".to_owned(),
-            backend: DescriptorCandidateBackend::LibUsb,
-            vendor_id: 0x04b8,
-            product_id: 0x0001,
-            bus_number: Some(1),
-            device_address: Some(1),
-            interface_number: Some(0),
-            alternate_setting: Some(0),
-            model_hints: Vec::new(),
-        };
-
-        assert_eq!(
-            selected_model_for_usb_candidate(&state, Some(&candidate), Some("C90")),
-            Some("C90")
-        );
-        assert_eq!(
-            selected_model_for_usb_candidate(&state, Some(&candidate), Some("not-a-model")),
-            None
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn native_debug_capture_redacts_serials_across_read_boundaries() {
-        let events = vec![
-            TransportEvent::Tx(vec![1, 2]),
-            TransportEvent::Rx(b"MFG:EPSON;SN:PRI".to_vec()),
-            TransportEvent::Rx(b"VATE;MDL:C90;".to_vec()),
-        ];
-        let redacted = redact_native_identity_serials(events);
-        let received = redacted
-            .iter()
-            .filter_map(|event| match event {
-                TransportEvent::Rx(bytes) => Some(bytes.as_slice()),
-                TransportEvent::Tx(_) => None,
-            })
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            String::from_utf8(received).unwrap(),
-            "MFG:EPSON;SN:XXXXXXX;MDL:C90;"
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn restore_preflight_rejects_multi_gib_sizes_before_reading() {
-        let state = GuiState::new().unwrap();
-        let spec = state.model_spec("C90").unwrap();
-
-        assert!(validate_restore_image_size(spec, u64::MAX).is_err());
-        assert!(validate_restore_image_size(spec, 0).is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn operation_results_bound_private_value_and_status_displays() {
-        assert_eq!(
-            format_current_values(&[(0x0006, 0x18), (0x0007, 0x04)]),
-            "0x0006=0x18, 0x0007=0x04"
-        );
-        assert_eq!(
-            display_status_response(b"@BDC ST2\r\nREADY\r\n"),
-            "@BDC ST2\r\nREADY"
-        );
-        assert_eq!(
-            display_status_response(&[0xff]),
-            "Binary status response is not shown."
-        );
-    }
-}
+mod tests;

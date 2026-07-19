@@ -82,10 +82,10 @@ pub fn parse_eeprom_read_reply(
         .ok_or_else(|| CommandError::InvalidReadReply {
             reason: "EEPROM response has fewer than six hex digits".to_owned(),
         })?;
-    if !response
+    if response
         .as_bytes()
         .get(hex_end)
-        .is_some_and(|character| *character == b';')
+        .is_none_or(|character| *character != b';')
     {
         return Err(CommandError::InvalidReadReply {
             reason: "EEPROM response is missing terminating semicolon".to_owned(),

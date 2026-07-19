@@ -29,15 +29,9 @@ const ENTRY_REPLY_READ_LIMIT: usize = 5;
 /// A UI must obtain a backup choice before it can dispatch its first write.
 /// Selecting a backup is not enough by itself: callers only record it after
 /// the EEPROM image has been saved successfully.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FirstWriteBackupGate {
     resolved: bool,
-}
-
-impl Default for FirstWriteBackupGate {
-    fn default() -> Self {
-        Self { resolved: false }
-    }
 }
 
 impl FirstWriteBackupGate {
@@ -169,8 +163,7 @@ pub struct EepromImage {
 impl EepromImage {
     pub fn end_address(&self) -> u16 {
         self.start_address
-            .checked_add(self.bytes.len().saturating_sub(1) as u16)
-            .unwrap_or(u16::MAX)
+            .saturating_add(self.bytes.len().saturating_sub(1) as u16)
     }
 
     pub fn value_at(&self, address: u16) -> Option<u8> {
@@ -922,10 +915,7 @@ mod tests {
 
         let result = write_new_binary_file_with_parent_sync(&path, b"test", "test file", |_| {
             sync_attempted.set(true);
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "parent directory sync failed",
-            ))
+            Err(io::Error::other("parent directory sync failed"))
         });
 
         assert!(sync_attempted.get());

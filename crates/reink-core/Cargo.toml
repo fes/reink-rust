@@ -2,6 +2,7 @@
 name = "reink-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Protocol-independent ReInk identity, Epson model, and command logic"

@@ -2,6 +2,7 @@
 name = "reink-d4"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "IEEE 1284.4 packet and transaction protocol for ReInk"
@@ -11,4 +12,3 @@ reink-platform = { path = "../reink-platform" }
 
 [dev-dependencies]
 reink-platform-test = { path = "../reink-platform-test" }
-

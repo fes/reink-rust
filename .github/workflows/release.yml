@@ -22,16 +22,22 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable_suffix: '.exe'
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            executable_suffix: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            executable_suffix: ''
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
       - name: Install Linux USB build headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev pkg-config
-      - name: Build read-only binaries
-        run: cargo build --release --target ${{ matrix.target }} -p reink-cli -p reink-hardware-test -p reink-tui
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p reink-cli -p reink-hardware-test -p reink-tui -p reink-gui
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
@@ -40,4 +46,5 @@ jobs:
             target/${{ matrix.target }}/release/reink${{ matrix.executable_suffix }}
             target/${{ matrix.target }}/release/reink-hardware-test${{ matrix.executable_suffix }}
             target/${{ matrix.target }}/release/reink-tui${{ matrix.executable_suffix }}
+            target/${{ matrix.target }}/release/reink-gui${{ matrix.executable_suffix }}
           if-no-files-found: error

@@ -2,6 +2,7 @@
 name = "reink-usb"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Cross-platform USB transports and Windows stock-driver access for ReInk printer interfaces"
