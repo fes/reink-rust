@@ -9,5 +9,5 @@ description = "Read-only terminal user interface for ReInk"
 
 [dependencies]
 crossterm = "0.28"
-ratatui = "0.29"
+ratatui = "0.30"
 reink-core = { path = "../reink-core" }
