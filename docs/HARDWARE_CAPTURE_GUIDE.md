@@ -1,8 +1,8 @@
 # Hardware capture and fixture guide
 
-This guide prepares read-only evidence collection and the separately explicit
-reversible write-evidence workflow. It never makes a printer write automatic.
-It applies when a device is available and supplements
+This guide prepares read-only evidence collection and separately explicit
+maintenance-evidence workflows. It never makes a printer write automatic. It
+applies when a device is available and supplements
 [protocol provenance](PROTOCOL_PROVENANCE.md).
 
 ## Capture rules
@@ -125,14 +125,26 @@ confirmations plus
 report only after cleanup, restores the test byte, and independently verifies
 the restoration. Its selector reports only VID, PID, and optional interface;
 it does not invent bus, address, or alternate setting. Restore is a separate
-later stage. Never add reset to this progressive evidence sequence.
+later stage.
+
+The read-only `windows-native-d4-eeprom-boundary-probe` command provides the
+same one-read, exact-acknowledgement boundary observation as the libusb
+command. It validates that the supplied address is outside the selected
+model's declared range before opening the native device and labels any reply
+as observation only, never as write authorization:
+
+```powershell
+cargo run -p reink-hardware-test -- windows-native-d4-eeprom-boundary-probe --vendor-id 0x04b8 --product-id <product-id> --model <model> --address 0xffff --confirm-out-of-range-read I_CONFIRM_THIS_IS_A_READ_ONLY_BOUNDARY_PROBE
+```
 
 ## Confirmed semantic counter reset
 
 `reink-cli usb-eeprom-reset` is a separate, explicit maintenance operation; it
-is not a hardware-evidence command and no evidence runner invokes it. It
-requires an exact selected model identity, a new complete private backup, and
-the exact acknowledgement
+is not a hardware-evidence command. Read-evidence runners never invoke it. The
+full-surface runners can invoke it only as a separately included terminal stage
+after all read evidence and stable-baseline checks pass; they then restore and
+compare the original baseline. It requires an exact selected model identity, a
+new complete private backup, and the exact acknowledgement
 `I_CONFIRM_THIS_WILL_RESET_DECLARED_COUNTERS` before USB is opened. Its
 `--target waste` and `--target platen-pad` options are semantically separate.
 The command merges only matching model-TOML operations with an explicitly
@@ -271,6 +283,43 @@ model-bounded read-only images, not hardware-test reports or write
 authorization. Read runners never invoke write evidence; use only the separate
 explicit write-evidence runner when a target operation has been authorized.
 
+### Full progressive platform runs
+
+For a new diagnosis, prefer the companion `reink-results` full runner for the
+host:
+
+```text
+run-linux-full-evidence.sh
+run-macos-full-evidence.sh
+run-windows-full-evidence.ps1
+```
+
+Each requires an explicit backend selector and model, runs all independent
+safe read stages despite individual read failures, and writes redacted
+per-stage logs plus text and JSON summaries under the ignored
+`reink-results/private-evidence/` directory. The default run is entirely
+read-only. It covers exact candidate/model selection, driver preflight where
+applicable, identity, status, representative reads, a reported dump, the
+acknowledged boundary probe, and two independently durable complete images
+that must match byte-for-byte and by SHA-256.
+
+Persistent stages require separate inclusion switches, explicit address/value
+or reset target, and all exact acknowledgements before candidate enumeration.
+They are blocked unless the complete read-only baseline passes. The reversible
+hardware-test stage contains its own guarded restoration lifecycle. After any
+mutation command fails, the runner starts no later mutation command; it
+continues only safe read-only diagnostics. A separately requested semantic
+reset is terminal and, after success, is followed by restoration and exact
+comparison with the original baseline. Windows USBPRINT mutation additionally
+requires its experimental acknowledgement. No runner installs a driver or
+silently changes backend.
+
+macOS builds unprivileged, elevates only printer operations, and re-resolves
+exactly one matching VID/PID/interface/alternate-setting descriptor after
+each device operation because device-wide capture can change its location.
+Windows libusb requires an already accessible interface; Windows native uses
+the installed USBPRINT driver.
+
 ### Automated Linux run
 
 For the standard complete evidence sequence, use the companion
@@ -334,11 +383,13 @@ cd ..\reink-results
   -VendorId 0x04b8 -ProductId <product-id> -Model L1300
 ```
 
-The native run collects candidates, exact D4 identity, status, selected
+The older native read run collects candidates, exact D4 identity, status, selected
 non-sensitive EEPROM reads, a range/count-only hardware-test dump report, and a
 private durable EEPROM image. It does not issue the libusb preflight or
 out-of-range boundary probe because those are not validated stock-driver
-operations. Add `-Interface <mi>` when the candidate report includes an
+operations in that compatibility runner. The full native runner includes the
+separately acknowledged native boundary probe. Add `-Interface <mi>` when the
+candidate report includes an
 interface number or VID/PID alone is ambiguous. Do not silently substitute one
 backend for the other. Neither route installs, detaches, rebinds, or changes a
 Windows driver.

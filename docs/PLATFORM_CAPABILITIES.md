@@ -19,7 +19,14 @@ should link here rather than restating platform status.
 | `reink-cli` | Inspection, durable dumps, and explicit maintenance operations | Exact selection, backup, acknowledgement, and verification |
 | `reink-tui` | Read-only model and workflow browser | No mutation |
 | `reink-gui` | Guarded selected-printer workflows and trace inspection | Per-operation acknowledgement; no startup or selection side effects |
-| `reink-hardware-test` | Progressive physical evidence | Separate read and reversible-write commands; never automatic reset |
+| `reink-hardware-test` | Progressive physical evidence | Separate read and reversible-write commands; no automatic mutation |
+
+The companion `reink-results` repository provides one progressive full-surface
+runner per operating system. Each runner is read-only by default. Reversible
+write, public CLI write/restore, and terminal semantic-reset stages require
+separate inclusion switches and every exact acknowledgement before candidate
+enumeration. Availability is not a physical-validation claim; the matrix above
+remains authoritative.
 
 ## Known evidence gaps
 

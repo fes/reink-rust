@@ -188,6 +188,36 @@ fn parses_native_write_evidence_with_the_third_acknowledgement() {
 
 #[cfg(target_os = "windows")]
 #[test]
+fn parses_native_boundary_probe_with_the_same_exact_read_acknowledgement() {
+    let cli = Cli::try_parse_from([
+        "reink-hardware-test",
+        "windows-native-d4-eeprom-boundary-probe",
+        "--vendor-id",
+        "0x04b8",
+        "--product-id",
+        "0x1234",
+        "--interface",
+        "0",
+        "--model",
+        "C90",
+        "--address",
+        "0xffff",
+        "--confirm-out-of-range-read",
+        OUT_OF_RANGE_READ_CONFIRMATION,
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::WindowsNativeD4EepromBoundaryProbe {
+            address: 0xffff,
+            confirm_out_of_range_read: Some(ref confirmation),
+            ..
+        } if confirmation == OUT_OF_RANGE_READ_CONFIRMATION
+    ));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
 fn native_evidence_cleanup_reports_success_as_completed() {
     let cleanup = native_write_evidence_cleanup(&reink_app::UsbSessionCleanup {
         d4_shutdown: reink_app::UsbCleanupStatus::Succeeded,

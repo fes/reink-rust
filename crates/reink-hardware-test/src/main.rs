@@ -139,6 +139,22 @@ enum Command {
         #[arg(long, required = true, value_parser = parse_u16)]
         address: Vec<u16>,
     },
+    /// Make one explicitly acknowledged out-of-model-range read through Windows USBPRINT.
+    #[cfg(target_os = "windows")]
+    WindowsNativeD4EepromBoundaryProbe {
+        #[arg(long, value_parser = parse_u16)]
+        vendor_id: u16,
+        #[arg(long, value_parser = parse_u16)]
+        product_id: u16,
+        #[arg(long)]
+        interface: Option<u8>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, value_parser = parse_u16)]
+        address: u16,
+        #[arg(long)]
+        confirm_out_of_range_read: Option<String>,
+    },
     /// Read the complete model-bounded EEPROM range through Windows USBPRINT.
     #[cfg(target_os = "windows")]
     WindowsNativeD4EepromDump {
@@ -411,6 +427,22 @@ fn run(cli: Cli) -> Result<String, String> {
             model,
             address,
         } => windows_native_d4_eeprom_read(vendor_id, product_id, interface, &model, &address),
+        #[cfg(target_os = "windows")]
+        Command::WindowsNativeD4EepromBoundaryProbe {
+            vendor_id,
+            product_id,
+            interface,
+            model,
+            address,
+            confirm_out_of_range_read,
+        } => windows_native_d4_eeprom_boundary_probe(
+            vendor_id,
+            product_id,
+            interface,
+            &model,
+            address,
+            confirm_out_of_range_read.as_deref(),
+        ),
         #[cfg(target_os = "windows")]
         Command::WindowsNativeD4EepromDump {
             vendor_id,
@@ -1264,6 +1296,46 @@ fn windows_native_d4_eeprom_read(
             "address": format!("{:04X}", reading.address),
             "value": reading.value,
         })).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_d4_eeprom_boundary_probe(
+    vendor_id: u16,
+    product_id: u16,
+    interface: Option<u8>,
+    model: &str,
+    address: u16,
+    confirmation: Option<&str>,
+) -> Result<String, String> {
+    let spec = ModelDatabase::builtin()
+        .map_err(|error| error.to_string())?
+        .get(model)
+        .cloned()
+        .ok_or_else(|| format!("unknown model: {model}"))?;
+    validate_boundary_probe(&spec, address, confirmation)?;
+    let mut readings =
+        with_windows_native_hardware_session(vendor_id, product_id, interface, model, |session| {
+            let identity = session.read_identity().map_err(|error| error.to_string())?;
+            reink_app::verify_exact_model(&identity, model)?;
+            session
+                .read_eeprom(&[address])
+                .map_err(|error| error.to_string())
+        })?;
+    let value = readings
+        .pop()
+        .expect("a successful single-address EEPROM read has one reply")
+        .value;
+    Ok(json!({
+        "schema_version": 4,
+        "mode": "read_only",
+        "backend": "windows_native_usbprint",
+        "command": "windows-native-d4-eeprom-boundary-probe",
+        "model": model,
+        "address": format!("{address:04X}"),
+        "value": value,
+        "interpretation": "Observed out-of-model-range response only; this is not a safety or write-authorization claim.",
     })
     .to_string())
 }
