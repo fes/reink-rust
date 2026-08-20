@@ -284,17 +284,12 @@ impl ReinkGui {
     fn usb_scan_status_label(&self) -> String {
         match &self.usb_scan_status {
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            UsbScanStatus::Scanning => "Scanning USB printer descriptors…".to_owned(),
+            UsbScanStatus::Scanning => "Scanning…".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            UsbScanStatus::Ready => format!(
-                "{} USB descriptor candidate(s) found",
-                self.usb_candidates.len()
-            ),
+            UsbScanStatus::Ready => format!("{} candidate(s)", self.usb_candidates.len()),
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            UsbScanStatus::Failed(error) => format!("USB descriptor scan failed: {error}"),
-            UsbScanStatus::Unavailable => {
-                "USB descriptor enumeration is unavailable on Windows.".to_owned()
-            }
+            UsbScanStatus::Failed(error) => format!("Scan failed: {error}"),
+            UsbScanStatus::Unavailable => "Enumeration unavailable on Windows.".to_owned(),
         }
     }
 
@@ -568,10 +563,9 @@ impl ReinkGui {
                     },
                     lines: [
                         vec![
-                            "Exact D4 identity/model match confirmed before EEPROM access."
-                                .to_owned(),
+                            "Identity/model match confirmed.".to_owned(),
                             format!(
-                                "Saved a complete {}-byte model-bounded image (0x{:04X}..=0x{:04X}) to {}.",
+                                "Saved {} bytes (0x{:04X}..=0x{:04X}) to {}.",
                                 image_byte_count,
                                 image_start_address,
                                 image_end_address,
@@ -580,7 +574,8 @@ impl ReinkGui {
                             if load_for_display {
                                 "The saved image is available in the EEPROM pane.".to_owned()
                             } else {
-                                "Native dumps are not loaded into the UI and their traffic is not captured, preventing device serial bytes from entering the UI or debug pane.".to_owned()
+                                "Native dumps are not loaded into the UI and their traffic is not captured."
+                                    .to_owned()
                             },
                         ],
                         cleanup_lines,
@@ -604,17 +599,14 @@ impl ReinkGui {
                     },
                     lines: [
                         vec![
-                            format!("Exact D4 identity/model match confirmed for {model}."),
+                            format!("Identity/model match confirmed for {model}."),
+                            format!("Backup written to {}.", backup_file.display()),
                             format!(
-                                "Created and synchronized complete pre-operation backup: {}.",
-                                backup_file.display()
-                            ),
-                            format!(
-                                "Current values captured before the write: {}.",
+                                "Values before the write: {}.",
                                 format_current_values(&current_values)
                             ),
                             format!(
-                                "Read-back verification succeeded for all {update_count} written byte(s); rollback was not needed."
+                                "Read-back verified all {update_count} byte(s); no rollback needed."
                             ),
                         ],
                         cleanup_lines,
@@ -629,7 +621,7 @@ impl ReinkGui {
                     lines: [
                         vec![
                             error,
-                            "If a write reached EEPROM, the guarded write plan attempted read-back verification and rollback; the operation error reports any rollback failure."
+                            "If a write reached EEPROM, read-back verification and rollback were attempted; any rollback failure is reported above."
                                 .to_owned(),
                         ],
                         cleanup_lines,
@@ -653,8 +645,7 @@ impl ReinkGui {
                 success: false,
                 headline: "Selected-printer operation blocked".to_owned(),
                 lines: vec![
-                    "Wait for USB candidate enumeration to finish before starting an operation."
-                        .to_owned(),
+                    "Wait for USB enumeration to finish before starting an operation.".to_owned(),
                 ],
             });
             return;
@@ -752,92 +743,123 @@ impl ReinkGui {
                                     target_os = "windows"
                                 )))]
                                 let source_changes_allowed = true;
-                                ui.strong("USB descriptor candidates");
+                                ui.strong("USB candidates");
                                 if !source_changes_allowed {
-                                    ui.label(
-                                        "Source selection is locked until the selected-printer operation finishes.",
-                                    );
+                                    ui.label("Locked while an operation runs.");
                                 }
                                 ui.add_enabled_ui(source_changes_allowed, |ui| {
-                                if self.usb_candidates.is_empty() {
-                                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                                    ui.label(match &self.usb_scan_status {
-                                        UsbScanStatus::Scanning => "Scanning…",
-                                        _ => "No USB descriptor candidates",
-                                    });
-                                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-                                    ui.label("No USB descriptor candidates");
-                                }
-                                for (index, candidate) in self.usb_candidates.iter().enumerate() {
-                                    let selector = match (candidate.bus_number, candidate.device_address) {
-                                        (Some(bus), Some(address)) => format!(
-                                            "bus {bus}, address {address}, interface {} alt {}",
-                                            candidate.interface_number.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
-                                            candidate.alternate_setting.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
-                                        ),
-                                        _ => format!(
-                                            "interface {}",
-                                            candidate.interface_number.map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
-                                        ),
-                                    };
-                                    let label = format!(
-                                        "{} — {}, {:04X}:{:04X}, {}",
-                                        candidate.alias,
-                                        candidate.backend.label(),
-                                        candidate.vendor_id,
-                                        candidate.product_id,
-                                        selector,
-                                    );
-                                    if ui
-                                        .selectable_label(selected_usb_candidate == Some(index), label)
-                                        .clicked()
-                                    {
-                                        self.selected_usb_candidate = Some(index);
-                                        self.selected_usb_model = (candidate.model_hints.len() == 1)
-                                            .then(|| candidate.model_hints[0].clone());
-                                        self.loaded_eeprom = None;
-                                        self.selected_fixture = None;
-                                        self.show_validation_report = false;
-                                        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                                        {
-                                            self.usb_operation_result = None;
-                                            self.pending_usb_operation = None;
-                                        }
+                                    if self.usb_candidates.is_empty() {
+                                        #[cfg(any(
+                                            target_os = "linux",
+                                            target_os = "macos",
+                                            target_os = "windows"
+                                        ))]
+                                        ui.label(match &self.usb_scan_status {
+                                            UsbScanStatus::Scanning => "Scanning…",
+                                            _ => "None found",
+                                        });
+                                        #[cfg(not(any(
+                                            target_os = "linux",
+                                            target_os = "macos",
+                                            target_os = "windows"
+                                        )))]
+                                        ui.label("None found");
                                     }
-                                }
-                                if self.source_mode.fixtures_enabled() {
-                                    ui.separator();
-                                    ui.strong("Fixtures");
-                                    for (index, fixture) in
-                                        reink_gui::FIXTURE_DEVICES.iter().enumerate()
+                                    for (index, candidate) in self.usb_candidates.iter().enumerate()
                                     {
+                                        let selector = match (
+                                            candidate.bus_number,
+                                            candidate.device_address,
+                                        ) {
+                                            (Some(bus), Some(address)) => format!(
+                                                "bus {bus}, address {address}, interface {} alt {}",
+                                                candidate.interface_number.map_or_else(
+                                                    || "n/a".to_owned(),
+                                                    |value| value.to_string()
+                                                ),
+                                                candidate.alternate_setting.map_or_else(
+                                                    || "n/a".to_owned(),
+                                                    |value| value.to_string()
+                                                ),
+                                            ),
+                                            _ => format!(
+                                                "interface {}",
+                                                candidate.interface_number.map_or_else(
+                                                    || "n/a".to_owned(),
+                                                    |value| value.to_string()
+                                                ),
+                                            ),
+                                        };
+                                        let label = format!(
+                                            "{} — {}, {:04X}:{:04X}, {}",
+                                            candidate.alias,
+                                            candidate.backend.label(),
+                                            candidate.vendor_id,
+                                            candidate.product_id,
+                                            selector,
+                                        );
                                         if ui
                                             .selectable_label(
-                                                self.loaded_eeprom.is_none()
-                                                    && self.selected_usb_candidate.is_none()
-                                                    && selected_fixture == Some(index),
-                                                fixture.label,
+                                                selected_usb_candidate == Some(index),
+                                                label,
                                             )
                                             .clicked()
                                         {
+                                            self.selected_usb_candidate = Some(index);
+                                            self.selected_usb_model = (candidate.model_hints.len()
+                                                == 1)
+                                                .then(|| candidate.model_hints[0].clone());
                                             self.loaded_eeprom = None;
-                                            self.selected_usb_candidate = None;
-                                            self.selected_usb_model = None;
-                                            self.selected_fixture = Some(index);
-                                            self.state.select_fixture(index);
+                                            self.selected_fixture = None;
                                             self.show_validation_report = false;
-                                            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                                            #[cfg(any(
+                                                target_os = "linux",
+                                                target_os = "macos",
+                                                target_os = "windows"
+                                            ))]
                                             {
                                                 self.usb_operation_result = None;
                                                 self.pending_usb_operation = None;
                                             }
                                         }
                                     }
-                                }
-                                ui.separator();
-                                if ui.button("Open EEPROM file...").clicked() {
-                                    open_file = true;
-                                }
+                                    if self.source_mode.fixtures_enabled() {
+                                        ui.separator();
+                                        ui.strong("Fixtures");
+                                        for (index, fixture) in
+                                            reink_gui::FIXTURE_DEVICES.iter().enumerate()
+                                        {
+                                            if ui
+                                                .selectable_label(
+                                                    self.loaded_eeprom.is_none()
+                                                        && self.selected_usb_candidate.is_none()
+                                                        && selected_fixture == Some(index),
+                                                    fixture.label,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.loaded_eeprom = None;
+                                                self.selected_usb_candidate = None;
+                                                self.selected_usb_model = None;
+                                                self.selected_fixture = Some(index);
+                                                self.state.select_fixture(index);
+                                                self.show_validation_report = false;
+                                                #[cfg(any(
+                                                    target_os = "linux",
+                                                    target_os = "macos",
+                                                    target_os = "windows"
+                                                ))]
+                                                {
+                                                    self.usb_operation_result = None;
+                                                    self.pending_usb_operation = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("Open EEPROM file...").clicked() {
+                                        open_file = true;
+                                    }
                                 });
                             });
                         source_response.response.on_hover_text(source_label);
@@ -845,7 +867,11 @@ impl ReinkGui {
                             self.open_eeprom_file();
                         }
                         ui.label("Printer");
-                        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "windows"
+                        ))]
                         if ui
                             .add_enabled(
                                 !matches!(&self.usb_scan_status, UsbScanStatus::Scanning)
@@ -856,7 +882,11 @@ impl ReinkGui {
                         {
                             self.refresh_usb_candidates();
                         }
-                        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                        #[cfg(not(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "windows"
+                        )))]
                         ui.add_enabled(false, egui::Button::new("Refresh USB candidates"));
                         ui.label(self.usb_scan_status_label());
 
@@ -887,8 +917,7 @@ impl ReinkGui {
                                 let combo_id = ui.make_persistent_id("eeprom-model");
                                 let focus_filter = selected_model.is_none()
                                     && !egui::ComboBox::is_open(ui.ctx(), combo_id);
-                                let model_popup_height =
-                                    72.0 + 5.0 * ui.spacing().interact_size.y;
+                                let model_popup_height = 72.0 + 5.0 * ui.spacing().interact_size.y;
                                 egui::ComboBox::from_id_salt("eeprom-model")
                                     .selected_text(
                                         selected_model.as_deref().unwrap_or("Select model..."),
@@ -968,23 +997,23 @@ impl ReinkGui {
                     ui.label("Bus/address");
                     ui.label(match (candidate.bus_number, candidate.device_address) {
                         (Some(bus), Some(address)) => format!("{bus} / {address}"),
-                        _ => "Not applicable to this backend".to_owned(),
+                        _ => "n/a".to_owned(),
                     });
                     ui.end_row();
-                    ui.label("Interface/alternate setting");
+                    ui.label("Interface / alt");
                     ui.label(format!(
                         "{} / {}",
                         candidate
                             .interface_number
-                            .map_or_else(|| "not reported".to_owned(), |value| value.to_string()),
+                            .map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
                         candidate
                             .alternate_setting
-                            .map_or_else(|| "not applicable".to_owned(), |value| value.to_string())
+                            .map_or_else(|| "n/a".to_owned(), |value| value.to_string())
                     ));
                     ui.end_row();
-                    ui.label("Bundled model hints");
+                    ui.label("Model hints");
                     ui.label(if candidate.model_hints.is_empty() {
-                        "No exact VID/PID associations in the bundled model database".to_owned()
+                        "None".to_owned()
                     } else {
                         candidate.model_hints.join(", ")
                     });
@@ -992,7 +1021,7 @@ impl ReinkGui {
                 });
             ui.add_space(8.0);
             ui.label(
-                "Select an expected model as an operator-supplied guard. VID/PID associations are hints, not printer identity confirmation; every explicit operation reads the D4 identity and requires an exact model match before access.",
+                "VID/PID hints are not identity. Every operation reads the D4 identity and requires an exact match to the model you choose here.",
             );
             let selected_model = self.selected_usb_model.clone();
             let model_names = self
@@ -1065,9 +1094,9 @@ impl ReinkGui {
                 let enabled =
                     self.selected_usb_model().is_some() && !self.usb_operation_in_progress();
                 if self.usb_operation_in_progress() {
-                    ui.strong("A selected-printer operation is running on a worker thread.");
+                    ui.strong("Operation running…");
                 } else {
-                    ui.label("No printer connection has been opened until one of these buttons is pressed.");
+                    ui.label("No connection is opened until you press a button below.");
                 }
                 ui.horizontal(|ui| {
                     if ui
@@ -1090,7 +1119,7 @@ impl ReinkGui {
                     }
                 });
                 ui.label(
-                    "Raw identity fields are not retained in the GUI result. The explicitly requested status response is shown in the result pane; EEPROM images are private device-specific files.",
+                    "Status appears in the result pane. Raw identity fields are not retained; EEPROM images are private device files.",
                 );
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1102,13 +1131,13 @@ impl ReinkGui {
             if self.selected_usb_model().is_none() {
                 ui.colored_label(
                     Color32::from_rgb(174, 112, 0),
-                    "Choose one expected model before opening the selected USB interface. It is confirmed only by the exact D4 identity read for the operation.",
+                    "Choose an expected model before connecting.",
                 );
             }
             if let Some(file) = &self.loaded_eeprom {
                 ui.add_space(8.0);
                 ui.label(format!(
-                    "Most recent connected image: {} bytes, 0x{:04X}..=0x{:04X}.",
+                    "Last saved image: {} bytes, 0x{:04X}..=0x{:04X}.",
                     file.bytes.len(),
                     file.start_address,
                     file.start_address + file.bytes.len().saturating_sub(1)
@@ -1144,12 +1173,8 @@ impl ReinkGui {
 
         if !self.fixture_selected() {
             ui.strong("No printer selected");
-            ui.label(
-                "Default real mode has no fixture source. Select a descriptor-only candidate or open a raw EEPROM file.",
-            );
-            ui.label(
-                "No printer connection, claim, driver handoff, control request, or protocol traffic has occurred.",
-            );
+            ui.label("Select a USB candidate or open an EEPROM file.");
+            ui.label("No connection, claim, or traffic has occurred.");
             return;
         }
 
@@ -1187,31 +1212,27 @@ impl ReinkGui {
     fn eeprom_viewer(&mut self, ui: &mut egui::Ui) {
         ui.heading("EEPROM");
         if self.selected_usb_candidate().is_some() && self.loaded_eeprom.is_none() {
-            ui.label("No EEPROM data is available for the selected descriptor-only candidate.");
-            ui.label(
-                "No printer connection has been opened; use the Status tab to explicitly save a complete EEPROM dump first.",
-            );
+            ui.label("No EEPROM data yet.");
+            ui.label("Save a complete EEPROM dump from the Status tab first.");
             return;
         }
         if self.loaded_eeprom.is_none() && !self.fixture_selected() {
-            ui.label("No EEPROM data is available because no printer source is selected.");
-            ui.label(
-                "Select a descriptor-only candidate or open a raw EEPROM file. Fixtures require launching with --fixtures.",
-            );
+            ui.label("No printer source selected.");
+            ui.label("Select a USB candidate or open an EEPROM file. Fixtures require --fixtures.");
             return;
         }
         if self.loaded_eeprom.is_some() {
             if self.selected_usb_candidate().is_some() {
                 ui.label(
-                    "The most recently saved connected EEPROM image is shown below. It is a private device-specific file; displayed values are not a substitute for the pre-write backup taken by a persistent operation.",
+                    "Last saved image from this printer. Not a substitute for the pre-write backup.",
                 );
             } else {
-                ui.label("The selected raw EEPROM image is shown below. Choose a model in the tab bar to label known model-specific fields.");
+                ui.label(
+                    "Loaded EEPROM file. Choose a model in the tab bar to label known fields.",
+                );
             }
         } else {
-            ui.label(
-                "The full 256-byte fixture EEPROM is shown below; no physical EEPROM is read, written, backed up, restored, or reset.",
-            );
+            ui.label("256-byte fixture EEPROM. No physical device is accessed.");
         }
         ui.add_space(8.0);
         let rows = self.state.selected_fixture().eeprom_rows;
@@ -1357,11 +1378,11 @@ impl ReinkGui {
                         }
                         if permits_mutation {
                             ui.label(format!(
-                                "Selected cached field: {selected_label} at 0x{selected_address:04X}. The worker reads a complete fresh backup and reports the current value before writing."
+                                "Selected: {selected_label} at 0x{selected_address:04X}. A fresh backup reports the current value before writing."
                             ));
                         } else {
                             ui.label(
-                                "Windows native USBPRINT mutation is experimental/unvalidated and requires a second exact acknowledgement in the confirmation dialog.",
+                                "Windows native USBPRINT mutation is experimental; the dialog requires a second acknowledgement.",
                             );
                         }
                     } else {
@@ -1370,7 +1391,7 @@ impl ReinkGui {
                             egui::Button::new("Prepare guarded write of selected byte..."),
                         );
                         ui.label(
-                            "Writing requires an explicit selected USB candidate, exact identity/model match, a create-new backup, and a typed confirmation.",
+                            "Writing requires a selected USB candidate, a matching model, a new backup, and a typed confirmation.",
                         );
                     }
                     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1446,9 +1467,7 @@ impl ReinkGui {
     fn tools(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         if self.selected_usb_candidate().is_some() {
-            ui.label(
-                "Selected-printer operations are explicit, run on a worker thread, and never run when selecting this candidate.",
-            );
+            ui.label("Operations run only when you press a button, on a worker thread.");
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
                 let enabled =
@@ -1460,18 +1479,16 @@ impl ReinkGui {
                 if self.selected_usb_model().is_none() {
                     ui.colored_label(
                         Color32::from_rgb(174, 112, 0),
-                        "Choose an expected model on the Status tab before enabling connected operations.",
+                        "Choose an expected model on the Status tab first.",
                     );
                 }
                 if self.usb_operation_in_progress() {
-                    ui.strong("A selected-printer operation is running on a worker thread.");
+                    ui.strong("Operation running…");
                 }
                 ui.add_space(12.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Durable EEPROM dump");
-                    ui.label(
-                        "Reads a complete model-bounded image only after an exact D4 identity/model match, then creates a new user-selected private file.",
-                    );
+                    ui.label("Reads the model-bounded image after an exact identity match and saves it to a new file.");
                     if ui
                         .add_enabled(enabled, egui::Button::new("Save complete EEPROM dump..."))
                         .clicked()
@@ -1488,9 +1505,7 @@ impl ReinkGui {
                 ui.add_space(12.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Generic EEPROM byte write");
-                    ui.label(
-                        "The confirmation dialog validates one model-bounded address/value, requires a create-new full backup, then uses read-back verification and rollback-on-failure.",
-                    );
+                    ui.label("One address/value, a new full backup, then read-back verification with rollback on failure.");
                     if ui
                         .add_enabled(
                             mutation_enabled,
@@ -1510,9 +1525,7 @@ impl ReinkGui {
                 ui.add_space(12.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("EEPROM restore");
-                    ui.label(
-                        "Select a complete image and a separate new rollback backup. The model range and image length are validated before USB opens.",
-                    );
+                    ui.label("Needs a complete image plus a separate rollback backup. Range and length are validated before USB opens.");
                     if ui
                         .add_enabled(
                             mutation_enabled,
@@ -1531,9 +1544,7 @@ impl ReinkGui {
                 ui.add_space(12.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Model-aware counter reset");
-                    ui.label(
-                        "Only explicitly declared model reset bytes are eligible; missing reset metadata is never substituted with zero.",
-                    );
+                    ui.label("Only bytes declared by the model are eligible; missing metadata is never assumed to be zero.");
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
@@ -1591,24 +1602,21 @@ impl ReinkGui {
             return;
         }
         if self.loaded_eeprom.is_none() && !self.fixture_selected() {
-            ui.label(
-                "No printer selected; fixture validation is unavailable in default real mode.",
-            );
-            ui.label("Launch with --fixtures to select a deterministic fixture.");
+            ui.label("No printer selected. Launch with --fixtures to use a deterministic fixture.");
             ui.add_enabled(false, egui::Button::new("Run validation"));
             return;
         }
-        ui.label("Fixture-only maintenance and validation workflows.");
+        ui.label("Fixture-only workflows.");
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.heading("Run validation");
             if self.loaded_eeprom.is_some() {
-                ui.label("Unavailable for a raw EEPROM file: no printer model or protocol session is present.");
+                ui.label("Unavailable for a raw EEPROM file: no model or protocol session.");
                 ui.add_enabled(false, egui::Button::new("Run validation"));
             } else if ui.button("Run validation").clicked() {
                 self.show_validation_report = true;
             } else {
-                ui.label("Runs the selected fixture's deterministic validation scenario.");
+                ui.label("Runs the fixture's deterministic validation scenario.");
             }
             if self.loaded_eeprom.is_none() && self.show_validation_report {
                 ui.add_space(8.0);
@@ -1637,7 +1645,7 @@ impl ReinkGui {
             ui.heading("Waste-ink counter");
             ui.label("Fixture value: 1,048");
             ui.add_enabled(false, egui::Button::new("Reset to zero"));
-            ui.label("Fixture resets are intentionally unavailable; selected-printer resets require the guarded controls for a real USB candidate.");
+            ui.label("Unavailable for fixtures; use the guarded controls with a real candidate.");
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1646,19 +1654,14 @@ impl ReinkGui {
                 ui.add_enabled(false, egui::Button::new("Back up EEPROM"));
                 ui.add_enabled(false, egui::Button::new("Restore EEPROM"));
             });
-            ui.label("Backup and restore remain unavailable in fixture-only mode.");
+            ui.label("Unavailable in fixture-only mode.");
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.heading("First-write backup");
-            ui.label(
-                "Persistent writes require a complete backup and command-specific confirmations.",
-            );
-            ui.label(
-                "Fixtures cannot select a USB target or create a backup. Use a real selected candidate for the separately gated controls.",
-            );
+            ui.label("Persistent writes require a complete backup and a typed confirmation.");
+            ui.label("Fixtures cannot select a USB target or create a backup.");
             ui.add_enabled(false, egui::Button::new("Choose EEPROM backup..."));
-            ui.label("GUI backup selection is intentionally unavailable.");
         });
     }
 
@@ -1697,27 +1700,27 @@ impl ReinkGui {
             .show(context, |ui| {
                 ui.strong("This dialog does not start an operation by itself.");
                 ui.label(
-                    "The worker will re-read the exact D4 identity, require it to match this expected model, create and sync a new complete backup, then perform the confirmed action.",
+                    "On confirmation the worker re-reads the D4 identity, requires an exact model match, writes a full backup, then acts.",
                 );
                 ui.add_space(8.0);
                 ui.label(format!(
-                    "Selected target: {}",
+                    "Target: {}",
                     self.selected_usb_candidate()
-                        .map_or("no selected USB candidate", |candidate| candidate.alias.as_str())
+                        .map_or("none selected", |candidate| candidate.alias.as_str())
                 ));
                 ui.label(format!(
-                    "Expected model: {}",
+                    "Model: {}",
                     expected_model.as_deref().unwrap_or("not selected")
                 ));
                 let Some(spec) = spec.as_ref() else {
                     ui.colored_label(
                         Color32::from_rgb(181, 47, 47),
-                        "The expected model is no longer valid for this candidate. Close this dialog and select it again on Status.",
+                        "The expected model is no longer valid. Close this dialog and reselect it on Status.",
                     );
                     return;
                 };
                 ui.label(format!(
-                    "Model EEPROM range: 0x{:04X}..=0x{:04X}",
+                    "EEPROM range: 0x{:04X}..=0x{:04X}",
                     spec.memory_low, spec.memory_high
                 ));
                 ui.separator();
@@ -1761,7 +1764,7 @@ impl ReinkGui {
                         match &update {
                             Ok((address, value)) => {
                                 ui.label(format!(
-                                    "Requested update: 0x{address:04X} = 0x{value:02X}. The fresh complete backup provides the current value immediately before writing."
+                                    "Will write 0x{address:04X} = 0x{value:02X}. The fresh backup captures the current value first."
                                 ));
                             }
                             Err(error) => {
@@ -1779,7 +1782,7 @@ impl ReinkGui {
                         if native_mutation_selected {
                             ui.colored_label(
                                 Color32::from_rgb(181, 47, 47),
-                                "Windows native USBPRINT mutation is experimental and unvalidated on physical hardware.",
+                                "Windows native USBPRINT mutation is experimental and unvalidated on hardware.",
                             );
                             typed_confirmation(
                                 ui,
@@ -1840,7 +1843,7 @@ impl ReinkGui {
                         match restore_image.as_ref().map(|preflight| &preflight.result) {
                             Some(Ok(image)) => {
                                 ui.label(format!(
-                                    "Image validation succeeded: {} model-bounded byte(s) will be restored. A separate fresh current-value backup is still required.",
+                                    "Image valid: {} byte(s) will be restored. A separate rollback backup is still required.",
                                     image.update_count
                                 ));
                             }
@@ -1922,7 +1925,7 @@ impl ReinkGui {
                             }
                         }
                         ui.label(
-                            "The worker captures the current values for these bytes from a fresh full backup before applying this semantic reset.",
+                            "Current values for these bytes are captured from a fresh full backup first.",
                         );
                         choose_backup_file(ui, backup_file, "eeprom-reset-backup.bin");
                         typed_confirmation(
@@ -2003,22 +2006,19 @@ impl ReinkGui {
                 });
                 let mut capture_enabled = self.debug_traffic.capture_enabled();
                 if ui
-                    .checkbox(
-                        &mut capture_enabled,
-                        "Capture traffic for this session (opt-in)",
-                    )
+                    .checkbox(&mut capture_enabled, "Capture traffic this session")
                     .changed()
                 {
                     self.debug_traffic.set_capture_enabled(capture_enabled);
                 }
                 ui.label(
-                    "Selecting a candidate alone produces no traffic. Transfers are recorded only for an explicit selected-printer operation that starts while this opt-in is enabled; the GUI exports them only through an explicit copy action.",
+                    "Records transfers only for operations started while this is enabled. Nothing leaves the app except through Copy.",
                 );
                 ui.add_space(6.0);
                 if self.debug_traffic.count() == 0 {
-                    ui.label("No traffic captured in this session.");
+                    ui.label("Nothing captured yet.");
                 } else {
-                    ui.strong("Recorded requests and responses");
+                    ui.strong("Requests and responses");
                     for entry in self.debug_traffic.entries() {
                         let response = egui::CollapsingHeader::new(entry.summary())
                             .id_salt(("debug-traffic-entry", entry.id()))
@@ -2599,7 +2599,7 @@ impl eframe::App for ReinkGui {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn choose_backup_file(ui: &mut egui::Ui, backup_file: &mut Option<PathBuf>, suggested_name: &str) {
-    if ui.button("Choose new complete backup...").clicked()
+    if ui.button("Choose backup file...").clicked()
         && let Some(path) = rfd::FileDialog::new()
             .set_file_name(suggested_name)
             .add_filter("EEPROM image", &["bin", "eeprom", "eep", "rom"])
@@ -2609,13 +2609,13 @@ fn choose_backup_file(ui: &mut egui::Ui, backup_file: &mut Option<PathBuf>, sugg
     }
     match backup_file {
         Some(path) => {
-            ui.monospace(format!("New backup path: {}", path.display()));
-            ui.label("The worker uses create-new semantics and rejects an existing path.");
+            ui.monospace(format!("Backup: {}", path.display()));
+            ui.label("The path must not already exist.");
         }
         None => {
             ui.colored_label(
                 Color32::from_rgb(174, 112, 0),
-                "Choose a new complete backup path before this persistent operation can run.",
+                "Choose a new backup path before this operation can run.",
             );
         }
     };
@@ -2623,14 +2623,11 @@ fn choose_backup_file(ui: &mut egui::Ui, backup_file: &mut Option<PathBuf>, sugg
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn typed_confirmation(ui: &mut egui::Ui, confirmation: &mut String, required: &str, action: &str) {
-    ui.label(format!("Type this exact confirmation for the {action}:"));
+    ui.label(format!("Type this exactly to confirm the {action}:"));
     ui.monospace(required);
     ui.add(egui::TextEdit::singleline(confirmation).desired_width(430.0));
     if !confirmation.is_empty() && !confirmation_matches(confirmation, required) {
-        ui.colored_label(
-            Color32::from_rgb(181, 47, 47),
-            "Confirmation does not exactly match.",
-        );
+        ui.colored_label(Color32::from_rgb(181, 47, 47), "Does not match.");
     }
 }
 
